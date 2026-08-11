@@ -21,6 +21,14 @@ import { CardFace } from "./CardFace";
 import { GameTableCanvas } from "./GameTableCanvas";
 import { SignedOutLanding } from "./SignedOutLanding";
 import {
+  createGameAudioController,
+  type AudioCapabilities,
+  type AudioDebugState,
+  type AudioSettings,
+  type GameAudioController,
+  type GameAudioEvent,
+} from "./game-audio";
+import {
   CHAT_MESSAGE_LIMIT,
   CHAT_PHRASES,
   CHAT_REACTIONS,
@@ -80,6 +88,20 @@ type EventLine = { type: string; message: string };
 type RequestFailure = Error & { code?: string };
 type ConnectionState = "live" | "syncing" | "reconnecting" | "offline";
 type GuideTopic = "rules" | "actions";
+type AudioTransitionSnapshot = {
+  canDeclareUno: boolean;
+  currentPlayerId: string | null;
+  gameId: string;
+  handCount: number;
+  pendingDrawTotal: number;
+  phase: GameView["phase"];
+  revision: number;
+  selfPlayerId: string | null;
+  selfStatus: string | null;
+  topDiscardId: string | null;
+  turnNumber: number;
+};
+type AudioFxMarker = { gameId: string; revision: number };
 type PresencePlayer = {
   playerId: string;
   lastSeenAt: number;
@@ -184,6 +206,29 @@ export function GameShell({
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [shareFeedback, setShareFeedback] = useState<string | null>(null);
   const [guideTopic, setGuideTopic] = useState<GuideTopic | null>(null);
+  const [soundDialogOpen, setSoundDialogOpen] = useState(false);
+  const [soundSettings, setSoundSettings] = useState<AudioSettings>({
+    enabled: false,
+    spokenCallouts: true,
+    volume: 65,
+  });
+  const [soundDebug, setSoundDebug] = useState<AudioDebugState>({
+    enabled: false,
+    lastCallout: null,
+    lastCue: null,
+    lastRevision: null,
+    speechSupported: false,
+    supported: false,
+    unlocked: false,
+  });
+  const [soundCapabilities, setSoundCapabilities] = useState<AudioCapabilities>({
+    effects: false,
+    speech: false,
+  });
+  const [soundStatus, setSoundStatus] = useState<string | null>(null);
+  const [playedCardFxRevision, setPlayedCardFxRevision] = useState<AudioFxMarker | null>(null);
+  const [turnFxRevision, setTurnFxRevision] = useState<AudioFxMarker | null>(null);
+  const [reducedMotion, setReducedMotion] = useState(false);
   const [bugReportOpen, setBugReportOpen] = useState(false);
   const [bugReportCategory, setBugReportCategory] =
     useState<BugReportCategory>("turn_stuck");
@@ -237,6 +282,11 @@ export function GameShell({
   const testPlayerSwitchingRef = useRef(false);
   const utilityDialogRef = useRef<HTMLDivElement>(null);
   const utilityTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const soundDialogRef = useRef<HTMLDivElement>(null);
+  const soundTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const audioControllerRef = useRef<GameAudioController | null>(null);
+  const audioTransitionRef = useRef<AudioTransitionSnapshot | null>(null);
+  const audioInterruptedRef = useRef(false);
   const bugReportDialogRef = useRef<HTMLDivElement>(null);
   const bugReportDescriptionRef = useRef<HTMLTextAreaElement>(null);
   const bugReportTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -255,6 +305,14 @@ export function GameShell({
   const chatLogRef = useRef<HTMLDivElement>(null);
   const testClock = useRef(0);
   const [reconnectTick, setReconnectTick] = useState(0);
+
+  const syncSoundState = useCallback(() => {
+    const controller = audioControllerRef.current;
+    if (!controller) return;
+    setSoundSettings(controller.getSettings());
+    setSoundDebug(controller.getDebugState());
+    setSoundCapabilities(controller.getCapabilities());
+  }, []);
 
   const request = useCallback(async <T,>(path: string, options?: RequestInit) => {
     const headers = new Headers(options?.headers);
@@ -304,6 +362,27 @@ export function GameShell({
       window.clearTimeout(timeout);
       sourceSignal?.removeEventListener("abort", abortFromSource);
     }
+  }, []);
+
+  useEffect(() => {
+    const controller = createGameAudioController();
+    audioControllerRef.current = controller;
+    const frame = window.requestAnimationFrame(() => {
+      if (audioControllerRef.current !== controller) return;
+      setSoundSettings(controller.getSettings());
+      setSoundDebug(controller.getDebugState());
+      setSoundCapabilities(controller.getCapabilities());
+    });
+    const stopForegroundAudioWhenHidden = () => {
+      if (document.hidden) controller.cancel();
+    };
+    document.addEventListener("visibilitychange", stopForegroundAudioWhenHidden);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("visibilitychange", stopForegroundAudioWhenHidden);
+      if (audioControllerRef.current === controller) audioControllerRef.current = null;
+      void controller.dispose();
+    };
   }, []);
 
   const loadLobbies = useCallback(async () => {
@@ -551,6 +630,202 @@ export function GameShell({
   useEffect(() => {
     gameRef.current = game;
   }, [game]);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReducedMotion(query.matches);
+    update();
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", update);
+      return () => query.removeEventListener("change", update);
+    }
+    query.addListener(update);
+    return () => query.removeListener(update);
+  }, []);
+
+  useEffect(() => {
+    if (connectionState === "reconnecting" || connectionState === "offline") {
+      audioInterruptedRef.current = true;
+    }
+  }, [connectionState]);
+
+  useEffect(() => {
+    if (!game) {
+      audioTransitionRef.current = null;
+      audioInterruptedRef.current = false;
+      audioControllerRef.current?.resetTransitionHistory();
+      const frame = window.requestAnimationFrame(() => {
+        setPlayedCardFxRevision(null);
+        setTurnFxRevision(null);
+        syncSoundState();
+      });
+      return () => window.cancelAnimationFrame(frame);
+    }
+
+    const selfPlayer = game.players.find((player) => player.isSelf) ?? null;
+    const current: AudioTransitionSnapshot = {
+      canDeclareUno: game.legalActions.canDeclareUno,
+      currentPlayerId: game.currentPlayerId,
+      gameId: game.gameId,
+      handCount: game.hand.length,
+      pendingDrawTotal: game.pendingDraw?.total ?? 0,
+      phase: game.phase,
+      revision: game.revision,
+      selfPlayerId: selfPlayer?.playerId ?? null,
+      selfStatus: selfPlayer?.status ?? null,
+      topDiscardId: game.topDiscard?.id ?? null,
+      turnNumber: game.turnNumber,
+    };
+    const previous = audioTransitionRef.current;
+
+    // Entering or re-opening a table hydrates the baseline without replaying old cues.
+    if (
+      !previous ||
+      previous.gameId !== current.gameId ||
+      current.revision <= previous.revision
+    ) {
+      if (!previous || previous.gameId !== current.gameId) {
+        audioControllerRef.current?.resetTransitionHistory();
+        audioTransitionRef.current = current;
+        audioInterruptedRef.current = false;
+        const frame = window.requestAnimationFrame(() => {
+          setPlayedCardFxRevision(null);
+          setTurnFxRevision(null);
+          syncSoundState();
+        });
+        return () => window.cancelAnimationFrame(frame);
+      }
+      return;
+    }
+
+    audioTransitionRef.current = current;
+    const revisionDelta = current.revision - previous.revision;
+    if (audioInterruptedRef.current || revisionDelta > 1) {
+      audioInterruptedRef.current = false;
+      return;
+    }
+    const canPresentLiveTransition =
+      connectionState === "live" || connectionState === "syncing";
+    if (!canPresentLiveTransition) return;
+
+    const becameSelfTurn = Boolean(
+      current.phase === "playing" &&
+        current.selfPlayerId &&
+        current.currentPlayerId === current.selfPlayerId &&
+        (previous.currentPlayerId !== current.selfPlayerId ||
+          current.turnNumber > previous.turnNumber),
+    );
+    const playedCardChanged = Boolean(
+      previous.phase === "playing" &&
+        current.phase === "playing" &&
+        current.topDiscardId &&
+        current.topDiscardId !== previous.topDiscardId,
+    );
+
+    const fxFrame = !document.hidden && (playedCardChanged || becameSelfTurn)
+      ? window.requestAnimationFrame(() => {
+          if (playedCardChanged) {
+            setPlayedCardFxRevision({ gameId: current.gameId, revision: current.revision });
+          }
+          if (becameSelfTurn) {
+            setTurnFxRevision({ gameId: current.gameId, revision: current.revision });
+          }
+        })
+      : null;
+
+    const controller = audioControllerRef.current;
+    if (!controller) {
+      return () => {
+        if (fxFrame !== null) window.cancelAnimationFrame(fxFrame);
+      };
+    }
+    const visible = !document.hidden;
+    const eventBase = {
+      revision: current.revision,
+      visible,
+      connected: true,
+      hydrating: false,
+    } as const;
+    let audioEvent: GameAudioEvent | null = null;
+    if (previous.phase !== "complete" && current.phase === "complete") {
+      audioEvent = {
+        ...eventBase,
+        kind: "win",
+        dedupeId: `win:${current.revision}`,
+      };
+    } else if (previous.phase === "lobby" && current.phase === "playing") {
+      audioEvent = {
+        ...eventBase,
+        kind: "game_start",
+        dedupeId: `game_start:${current.revision}`,
+      };
+    } else if (playedCardChanged && game.topDiscard) {
+      audioEvent = {
+        ...eventBase,
+        kind: "card_played",
+        card: game.topDiscard,
+        activeColor: game.activeColor,
+        dedupeId: `card_played:${current.revision}`,
+      };
+    } else if (current.handCount > previous.handCount) {
+      audioEvent = {
+        ...eventBase,
+        kind: "draw",
+        dedupeId: `draw:${current.revision}`,
+      };
+    } else if (current.pendingDrawTotal > previous.pendingDrawTotal) {
+      audioEvent = {
+        ...eventBase,
+        kind: "penalty",
+        amount: current.pendingDrawTotal,
+        dedupeId: `penalty:${current.revision}`,
+      };
+    } else if (!previous.canDeclareUno && current.canDeclareUno) {
+      audioEvent = {
+        ...eventBase,
+        kind: "uno",
+        dedupeId: `uno:${current.revision}`,
+      };
+    } else if (
+      previous.selfStatus !== "eliminated" &&
+      current.selfStatus === "eliminated"
+    ) {
+      audioEvent = {
+        ...eventBase,
+        kind: "mercy",
+        dedupeId: `mercy:${current.revision}`,
+      };
+    }
+    if (audioEvent) controller.notifyEvent(audioEvent);
+    if (becameSelfTurn) {
+      controller.notifyTurn({
+        revision: current.revision,
+        isSelfTurn: true,
+        phase: current.phase,
+        visible,
+        connected: true,
+        hydrating: false,
+      });
+    }
+    const soundFrame = window.requestAnimationFrame(syncSoundState);
+    return () => {
+      if (fxFrame !== null) window.cancelAnimationFrame(fxFrame);
+      window.cancelAnimationFrame(soundFrame);
+    };
+  }, [connectionState, game, syncSoundState]);
+
+  useEffect(() => {
+    if (playedCardFxRevision === null) return;
+    const timeout = window.setTimeout(() => setPlayedCardFxRevision(null), 760);
+    return () => window.clearTimeout(timeout);
+  }, [playedCardFxRevision]);
+
+  useEffect(() => {
+    if (turnFxRevision === null) return;
+    const timeout = window.setTimeout(() => setTurnFxRevision(null), 900);
+    return () => window.clearTimeout(timeout);
+  }, [turnFxRevision]);
 
   useEffect(() => {
     const query = window.matchMedia("(max-width: 720px)");
@@ -903,6 +1178,25 @@ export function GameShell({
         coordinateSystem: "Canvas origin is top-left; x increases right and y increases down.",
         mode: game?.phase ?? (session?.signedIn ? "lobby-browser" : "signed-out"),
         connection: connectionState,
+        effects: {
+          reducedMotion,
+          playedCardPulse:
+            playedCardFxRevision?.gameId === game?.gameId &&
+            playedCardFxRevision?.revision === game?.revision,
+          selfTurnPulse:
+            turnFxRevision?.gameId === game?.gameId &&
+            turnFxRevision?.revision === game?.revision,
+        },
+        audio: {
+          enabled: soundSettings.enabled,
+          unlocked: soundDebug.unlocked,
+          capabilities: soundCapabilities,
+          volume: soundSettings.volume,
+          spokenCallouts: soundSettings.spokenCallouts,
+          lastCue: soundDebug.lastCue,
+          lastCallout: soundDebug.lastCallout,
+          lastRevision: soundDebug.lastRevision,
+        },
         savedAction: storedCommand
           ? { gameId: storedCommand.gameId, type: storedCommand.command.type }
           : null,
@@ -976,10 +1270,16 @@ export function GameShell({
     chatUnread,
     connectionState,
     game,
+    playedCardFxRevision,
     presence,
+    reducedMotion,
     session,
     sidebarTab,
+    soundCapabilities,
+    soundDebug,
+    soundSettings,
     storedCommand,
+    turnFxRevision,
     visibleChatMessages,
   ]);
 
@@ -1552,6 +1852,89 @@ export function GameShell({
     window.requestAnimationFrame(() => utilityTriggerRef.current?.focus());
   }, []);
 
+  const openSoundDialog = (trigger: HTMLButtonElement) => {
+    soundTriggerRef.current = trigger;
+    syncSoundState();
+    setSoundStatus(null);
+    setSoundDialogOpen(true);
+  };
+
+  const closeSoundDialog = useCallback(() => {
+    setSoundDialogOpen(false);
+    window.requestAnimationFrame(() => soundTriggerRef.current?.focus());
+  }, []);
+
+  const changeSoundEnabled = async () => {
+    const controller = audioControllerRef.current;
+    if (!controller) return;
+    try {
+      const current = controller.getSettings();
+      if (current.enabled && controller.getDebugState().unlocked) {
+        await controller.setEnabled(false);
+        setSoundStatus("Game sound muted.");
+      } else {
+        const unlocked = current.enabled
+          ? await controller.resumeFromGesture()
+          : await controller.setEnabled(true);
+        const previewed = unlocked ? await controller.preview() : false;
+        setSoundStatus(
+          unlocked
+            ? previewed
+              ? "Sound enabled. Preview played."
+              : "Sound enabled. Preview is unavailable with the current options."
+            : "The browser did not allow audio yet. Tap Enable now to try again.",
+        );
+      }
+    } catch {
+      setSoundStatus("Sound could not be changed in this browser.");
+    }
+    syncSoundState();
+  };
+
+  const turnSoundOff = async () => {
+    const controller = audioControllerRef.current;
+    if (!controller) return;
+    await controller.setEnabled(false);
+    setSoundStatus("Game sound turned off.");
+    syncSoundState();
+  };
+
+  const changeSoundVolume = (volume: number) => {
+    const controller = audioControllerRef.current;
+    if (!controller) return;
+    controller.setVolume(volume);
+    syncSoundState();
+  };
+
+  const changeSpokenCallouts = () => {
+    const controller = audioControllerRef.current;
+    if (!controller) return;
+    const enabled = !controller.getSettings().spokenCallouts;
+    controller.setSpokenCallouts(enabled);
+    setSoundStatus(enabled ? "Spoken card callouts enabled." : "Spoken card callouts muted.");
+    syncSoundState();
+  };
+
+  const previewSound = async () => {
+    const controller = audioControllerRef.current;
+    if (!controller) return;
+    try {
+      const current = controller.getSettings();
+      const unlocked = current.enabled
+        ? await controller.resumeFromGesture()
+        : await controller.setEnabled(true);
+      const previewed = unlocked ? await controller.preview() : false;
+      setSoundStatus(
+        previewed
+          ? "Preview played."
+          : "The browser could not play the preview. Tap again or check device volume.",
+      );
+    } catch {
+      setSoundStatus("The preview could not play in this browser.");
+    }
+    syncSoundState();
+  };
+
   const privateBugReportValues = (current: GameView | null) => {
     return createPrivateBugReportTerms({
       names: [
@@ -1998,6 +2381,20 @@ export function GameShell({
   };
 
   const self = game?.players.find((player) => player.isSelf) ?? null;
+  const soundAvailable = soundCapabilities.effects || soundCapabilities.speech;
+  const soundControlState = !soundSettings.enabled
+    ? "off"
+    : soundDebug.unlocked
+      ? "on"
+      : "ready";
+  const soundControlLabel = soundControlState === "off"
+    ? "Sound off"
+    : soundControlState === "ready"
+      ? "Sound ready"
+      : "Sound on";
+  const isSelfTurn = Boolean(
+    game?.phase === "playing" && self && game.currentPlayerId === self.playerId,
+  );
   const activeOpponents =
     game?.players.filter((player) => !player.isSelf && player.status === "active") ?? [];
   const activePlayers = game?.players.filter((player) => player.status === "active") ?? [];
@@ -2051,6 +2448,7 @@ export function GameShell({
   const modalOpen =
     Boolean(pendingCard) ||
     testPlayerDialogOpen ||
+    soundDialogOpen ||
     bugReportOpen ||
     inviteDialogOpen ||
     Boolean(publicJoinIntent) ||
@@ -2275,6 +2673,52 @@ export function GameShell({
   }, [chatDialog, closeChatDialog]);
 
   useEffect(() => {
+    if (!soundDialogOpen) return;
+    const dialog = soundDialogRef.current;
+    if (!dialog) return;
+    const focusables = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hidden);
+    const frame = window.requestAnimationFrame(() => {
+      (focusables()[0] ?? dialog).focus();
+    });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeSoundDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (!items.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items.at(-1)!;
+      if (
+        event.shiftKey &&
+        (document.activeElement === first || !dialog.contains(document.activeElement))
+      ) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeSoundDialog, soundDialogOpen]);
+
+  useEffect(() => {
     if (!bugReportOpen) return;
     const dialog = bugReportDialogRef.current;
     if (!dialog) return;
@@ -2349,17 +2793,31 @@ export function GameShell({
           <button
             className="text-button header-guide-button"
             disabled={busy || Boolean(pendingCard)}
+            aria-label="Rules and cards"
             onClick={(event) => openGuide("rules", event.currentTarget)}
           >
-            Rules &amp; cards
+            <span className="header-mobile-long">Rules &amp; cards</span>
+            <span className="header-mobile-short">Rules</span>
+          </button>
+          <button
+            className="text-button sound-control-button"
+            data-state={soundControlState}
+            disabled={busy || Boolean(pendingCard)}
+            aria-haspopup="dialog"
+            aria-label={`${soundControlLabel}. Open sound settings.`}
+            onClick={(event) => openSoundDialog(event.currentTarget)}
+          >
+            {soundControlLabel}
           </button>
           <button
             className="text-button header-issue-button"
             disabled={busy || Boolean(pendingCard)}
             aria-haspopup="dialog"
+            aria-label="Report an issue"
             onClick={(event) => openBugReport(event.currentTarget)}
           >
-            Report issue
+            <span className="header-mobile-long">Report issue</span>
+            <span className="header-mobile-short">Report</span>
           </button>
           {session.development ? (
             <button
@@ -2371,7 +2829,14 @@ export function GameShell({
               Switch test player
             </button>
           ) : (
-            <a className="text-button" href="/signout-with-chatgpt?return_to=/">Sign out</a>
+            <a
+              className="text-button"
+              href="/signout-with-chatgpt?return_to=/"
+              aria-label="Sign out"
+            >
+              <span className="header-mobile-long">Sign out</span>
+              <span className="header-mobile-short">Exit</span>
+            </a>
           )}
         </div>
       </header>
@@ -2430,10 +2895,16 @@ export function GameShell({
             aria-label="Current multiplayer game"
           >
           <div className="table-column">
-            <div className={`table-status coach-${turnCoach?.tone ?? "neutral"}`} aria-live="polite">
+            <div
+              className={`table-status coach-${turnCoach?.tone ?? "neutral"} ${isSelfTurn ? "is-self-turn" : ""} ${turnFxRevision?.gameId === game.gameId && turnFxRevision.revision === game.revision ? "has-turn-pulse" : ""}`.trim()}
+              aria-live="polite"
+            >
               <span className="eyebrow">{game.phase === "lobby" ? "Lobby" : game.phase === "complete" ? "Result" : "Current turn"}</span>
               <strong>{turnCoach?.title}</strong>
-              <span>{game.phase === "lobby" ? lobbyReadiness : turnCoach?.detail}</span>
+              <div className="table-status-side">
+                {isSelfTurn ? <span className="turn-alert-chip">Your turn</span> : null}
+                <span>{game.phase === "lobby" ? lobbyReadiness : turnCoach?.detail}</span>
+              </div>
             </div>
 
             {game.phase === "lobby" && game.isHost && listing ? (
@@ -2557,7 +3028,11 @@ export function GameShell({
                 </div>
               </section>
             ) : (
-              <GameTableCanvas game={game} />
+              <div
+                className={`table-vfx ${playedCardFxRevision?.gameId === game.gameId && playedCardFxRevision.revision === game.revision ? "has-played-card-pulse" : ""}`.trim()}
+              >
+                <GameTableCanvas game={game} />
+              </div>
             )}
 
             {game.phase === "lobby" ? (
@@ -3192,6 +3667,131 @@ export function GameShell({
               </div>
             </div>
           ) : null}
+        </div>
+      ) : null}
+
+      {soundDialogOpen ? (
+        <div
+          ref={soundDialogRef}
+          className="choice-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="sound-settings-title"
+          aria-describedby="sound-settings-intro sound-settings-disclosure"
+          tabIndex={-1}
+        >
+          <div className="choice-panel sound-panel">
+            <span className="eyebrow">Table audio</span>
+            <h2 id="sound-settings-title">Sound settings</h2>
+            <p id="sound-settings-intro" className="dialog-copy">
+              Sound never starts automatically. Enable it with a tap or click, then choose
+              how lively the table should feel.
+            </p>
+
+            <div className="sound-settings">
+              <div className="sound-setting-row">
+                <span className="sound-setting-copy">
+                  <strong>Game sound</strong>
+                  <span>
+                    {soundControlState === "on"
+                      ? "Ready for card effects and turn chimes in this session."
+                      : soundControlState === "ready"
+                        ? "Your preference is saved. Tap to enable audio in this browser session."
+                        : "Muted. No game sounds or spoken callouts will play."}
+                  </span>
+                </span>
+                <span className="sound-master-actions">
+                  <button
+                    type="button"
+                    className="sound-toggle"
+                    aria-pressed={soundControlState === "on"}
+                    disabled={!soundAvailable}
+                    onClick={() => void changeSoundEnabled()}
+                  >
+                    {soundControlState === "on"
+                      ? "Mute"
+                      : soundControlState === "ready"
+                        ? "Enable now"
+                        : "Enable sound"}
+                  </button>
+                  {soundControlState === "ready" ? (
+                    <button
+                      type="button"
+                      className="text-button sound-turn-off"
+                      onClick={() => void turnSoundOff()}
+                    >
+                      Turn sound off
+                    </button>
+                  ) : null}
+                </span>
+              </div>
+
+              <div className="sound-setting-row">
+                <span className="sound-setting-copy">
+                  <strong>Volume</strong>
+                  <span>Controls effects, turn chimes, and spoken callouts.</span>
+                </span>
+                <label className="sound-volume" htmlFor="sound-volume">
+                  <span className="sr-only">Game sound volume</span>
+                  <input
+                    id="sound-volume"
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="5"
+                    value={soundSettings.volume}
+                    disabled={!soundAvailable}
+                    onChange={(event) => changeSoundVolume(Number(event.target.value))}
+                  />
+                  <output htmlFor="sound-volume">{soundSettings.volume}%</output>
+                </label>
+              </div>
+
+              <div className="sound-setting-row">
+                <span className="sound-setting-copy">
+                  <strong>Spoken card callouts</strong>
+                  <span>Calls the public card color and value after a visible play.</span>
+                </span>
+                <button
+                  type="button"
+                  className="sound-toggle"
+                  role="switch"
+                  aria-checked={soundSettings.spokenCallouts}
+                  disabled={!soundCapabilities.speech}
+                  onClick={changeSpokenCallouts}
+                >
+                  {soundSettings.spokenCallouts ? "Callouts on" : "Callouts off"}
+                </button>
+              </div>
+            </div>
+
+            <p id="sound-settings-disclosure" className="sound-disclosure">
+              Spoken callouts use your device&apos;s synthesized voice; the voice varies by
+              browser and device. Open Shed sends no microphone or voice recording to the
+              game server. Turn chimes may sound while this table is in the background.
+              Card sounds and spoken callouts play only while you&apos;re viewing it.
+            </p>
+            <div className="sound-feedback" aria-live="polite">
+              {!soundAvailable
+                ? "This browser does not provide the audio features this table needs."
+                : !soundCapabilities.speech
+                  ? "Game sounds are available, but spoken callouts are not supported here."
+                  : soundStatus}
+            </div>
+            <div className="dialog-actions">
+              <button type="button" className="secondary-button" onClick={closeSoundDialog}>
+                Back to the table
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                disabled={!soundAvailable}
+                onClick={() => void previewSound()}
+              >
+                {soundControlState === "off" ? "Enable & preview" : "Preview sound"}
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
