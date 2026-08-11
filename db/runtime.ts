@@ -57,6 +57,17 @@ async function initialize(database: D1Database): Promise<void> {
       ON game_members(game_id, seat)`,
     `CREATE INDEX IF NOT EXISTS idx_game_members_profile
       ON game_members(profile_id)`,
+    `CREATE TABLE IF NOT EXISTS game_presence (
+      game_id TEXT NOT NULL,
+      player_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      PRIMARY KEY (game_id, player_id)
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_game_presence_profile
+      ON game_presence(game_id, profile_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_game_presence_activity
+      ON game_presence(game_id, last_seen_at)`,
     `CREATE TABLE IF NOT EXISTS game_events (
       game_id TEXT NOT NULL,
       version INTEGER NOT NULL,

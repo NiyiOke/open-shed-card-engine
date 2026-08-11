@@ -16,6 +16,12 @@ import type {
 import { GAME_PROTOCOL_VERSION, RULES_VERSION } from "../game/types";
 import type { AuthenticatedUser } from "./auth";
 import { cleanNickname } from "./auth";
+import {
+  assertInactiveRemovalPolicy,
+  PRESENCE_THRESHOLDS,
+  presencePlayer,
+  type PresenceSnapshot,
+} from "./presence-policy";
 
 type ProfileRow = {
   id: string;
@@ -48,6 +54,24 @@ type CommandReceiptRow = {
 type EventRow = {
   version: number;
   public_payload_json: string;
+};
+
+type PresenceRosterRow = {
+  auth_subject: string;
+  joined_at: number;
+  player_id: string | null;
+  last_seen_at: number | null;
+};
+
+type InactiveRemovalCommand = {
+  type: "remove_inactive_player";
+  targetPlayerId: string;
+};
+
+type InactiveRemovalGuard = {
+  targetPlayerId: string;
+  targetUserId: string;
+  staleCutoff: number;
 };
 
 export type LobbySummary = {
@@ -150,6 +174,13 @@ export async function createGame(
             ) VALUES (?, ?, 0, 'host', 'active', ?)`,
           )
           .bind(gameId, profile.id, now),
+        presenceUpsertStatement(
+          database,
+          gameId,
+          playerId,
+          profile.id,
+          now,
+        ),
         database
           .prepare(
             `INSERT INTO game_events (
@@ -270,6 +301,14 @@ export async function joinGame(
             current.players.find((player) => player.userId === user.userId)!,
             now,
           ),
+          presenceUpsertStatement(
+            database,
+            row.id,
+            current.players.find((player) => player.userId === user.userId)!
+              .playerId,
+            profile.id,
+            now,
+          ),
           receiptStatement(
             database,
             profile.id,
@@ -345,6 +384,16 @@ export async function joinGame(
           requestHash,
           result.state.hostUserId,
         ),
+        guardedPresenceUpsertStatement(
+          database,
+          row.id,
+          joined.playerId,
+          profile.id,
+          now,
+          profile.id,
+          commandId,
+          requestHash,
+        ),
         guardedGameUpdateStatement(
           database,
           row,
@@ -402,7 +451,12 @@ export async function getGame(
   user: AuthenticatedUser,
   gameId: string,
   afterRevision?: number,
-): Promise<{ view: GameView; events: GameEvent[]; eventCursor: number }> {
+): Promise<{
+  view: GameView;
+  events: GameEvent[];
+  eventCursor: number;
+  presence: PresenceSnapshot;
+}> {
   const database = await ensureDatabaseSchema();
   const row = await getGameRow(database, gameId);
   const state = await parseAndValidateState(row);
@@ -415,11 +469,65 @@ export async function getGame(
     403,
   );
   const feed = await readPublicEventFeed(database, gameId, afterRevision);
+  const presence = await buildPresenceSnapshot(database, state, Date.now());
   return {
     view: projectGameForUser(state, user.userId),
     events: feed.events,
     eventCursor: feed.cursor,
+    presence,
   };
+}
+
+export async function getGamePresence(
+  user: AuthenticatedUser,
+  gameId: string,
+): Promise<PresenceSnapshot> {
+  const database = await ensureDatabaseSchema();
+  const row = await getGameRow(database, gameId);
+  const state = await parseAndValidateState(row);
+  requireCurrentMember(state, user.userId);
+  return buildPresenceSnapshot(database, state, Date.now());
+}
+
+export async function heartbeatGamePresence(
+  user: AuthenticatedUser,
+  gameId: string,
+): Promise<PresenceSnapshot> {
+  const database = await ensureDatabaseSchema();
+  const now = Date.now();
+  await maybePurgeExpiredGames(database, now);
+  const row = await getGameRow(database, gameId);
+  const state = await parseAndValidateState(row);
+  const player = requireCurrentMember(state, user.userId);
+  const profile = await getOrCreateProfile(
+    user,
+    user.suggestedName,
+    database,
+    now,
+  );
+  await enforceMutationQuota(database, now, [
+    {
+      scope: `user:${profile.id}:presence`,
+      windowMs: 60_000,
+      // Multiple tabs for the same identity should not make presence flaky.
+      limit: 60,
+    },
+    { scope: `room:${gameId}:presence`, windowMs: 60_000, limit: 360 },
+  ]);
+  const result = await presenceUpsertStatement(
+    database,
+    gameId,
+    player.playerId,
+    profile.id,
+    now,
+  ).run();
+  requireRule(
+    (result.meta.changes ?? 0) === 1,
+    "NOT_A_MEMBER",
+    "You are not an active member of this game.",
+    403,
+  );
+  return buildPresenceSnapshot(database, state, now);
 }
 
 export async function executeGameCommand(
@@ -472,6 +580,18 @@ export async function executeGameCommand(
   ]);
   const row = await getGameRow(database, gameId);
   const current = await parseAndValidateState(row);
+  const currentActor = current.players.find(
+    (player) => player.userId === user.userId && player.status !== "left",
+  );
+  if (currentActor) {
+    await presenceUpsertStatement(
+      database,
+      gameId,
+      currentActor.playerId,
+      profile.id,
+      now,
+    ).run();
+  }
 
   if (
     current.processedCommands.some(
@@ -496,8 +616,27 @@ export async function executeGameCommand(
         now,
       )
       .run();
+    const recoveredReceipt = await findCommandReceipt(
+      database,
+      profile.id,
+      commandId,
+    );
+    requireRule(
+      recoveredReceipt,
+      "RECEIPT_RECOVERY_FAILED",
+      "The accepted command could not be recovered safely.",
+      500,
+    );
     return {
-      view: commandViewForUser(current, user.userId),
+      view: await commandViewFromReceipt(
+        database,
+        recoveredReceipt,
+        user,
+        operation,
+        requestHash,
+        gameId,
+        command.type === "leave_game",
+      ),
       events: [],
       replayed: true,
     };
@@ -511,11 +650,21 @@ export async function executeGameCommand(
     );
   }
   requireRule(
-    current.phase !== "complete",
+    current.phase !== "complete" || command.type === "rematch",
     "GAME_COMPLETE",
-    "This game is already complete.",
+    "This game is already complete. Start a rematch to play again.",
     409,
   );
+  const inactiveRemoval = readInactiveRemovalCommand(command);
+  const inactiveRemovalGuard = inactiveRemoval
+    ? await assertInactiveRemovalAllowed(
+        database,
+        current,
+        user.userId,
+        inactiveRemoval.targetPlayerId,
+        now,
+      )
+    : null;
   const result = transitionGame(current, command, {
     actorUserId: user.userId,
     commandId,
@@ -555,19 +704,58 @@ export async function executeGameCommand(
       ),
     );
   }
+  const remainingPlayerIds = new Set(
+    result.state.players
+      .filter((player) => player.status !== "left")
+      .map((player) => player.playerId),
+  );
+  const departedPlayerIds = current.players
+    .filter(
+      (player) =>
+        player.status !== "left" && !remainingPlayerIds.has(player.playerId),
+    )
+    .map((player) => player.playerId)
+    .concat(
+      result.state.players
+        .filter((player) => player.status === "left")
+        .map((player) => player.playerId),
+    );
+  const presenceCleanupStatements = [...new Set(departedPlayerIds)].map(
+    (playerId) =>
+      guardedPresenceDeleteStatement(
+        database,
+        gameId,
+        playerId,
+        profile.id,
+        commandId,
+        requestHash,
+      ),
+  );
 
   try {
     const batch = await database.batch([
-      guardedReceiptStatement(
-        database,
-        row,
-        profile.id,
-        commandId,
-        operation,
-        requestHash,
-        result.state.revision,
-        now,
-      ),
+      inactiveRemovalGuard
+        ? guardedInactiveRemovalReceiptStatement(
+            database,
+            row,
+            profile.id,
+            commandId,
+            operation,
+            requestHash,
+            result.state.revision,
+            now,
+            inactiveRemovalGuard,
+          )
+        : guardedReceiptStatement(
+            database,
+            row,
+            profile.id,
+            commandId,
+            operation,
+            requestHash,
+            result.state.revision,
+            now,
+          ),
       guardedEventStatement(
         database,
         row,
@@ -580,6 +768,7 @@ export async function executeGameCommand(
         requestHash,
       ),
       ...memberStatements,
+      ...presenceCleanupStatements,
       guardedGameUpdateStatement(
         database,
         row,
@@ -609,6 +798,31 @@ export async function executeGameCommand(
           events: [],
           replayed: true,
         };
+      }
+      if (inactiveRemoval) {
+        try {
+          await assertInactiveRemovalAllowed(
+            database,
+            current,
+            user.userId,
+            inactiveRemoval.targetPlayerId,
+            Date.now(),
+          );
+        } catch (recheckError) {
+          if (
+            recheckError instanceof GameRuleError &&
+            ["CORRUPT_MEMBERSHIP", "PLAYER_NOT_ACTIVE", "PLAYER_NOT_FOUND"].includes(
+              recheckError.code,
+            )
+          ) {
+            throw new GameRuleError(
+              "VERSION_CONFLICT",
+              "That player's state changed before removal completed. Refreshing will show the latest table.",
+              409,
+            );
+          }
+          throw recheckError;
+        }
       }
       throw new GameRuleError(
         "VERSION_CONFLICT",
@@ -673,6 +887,119 @@ export async function listLobbies(
     mine: await Promise.all(
       mineRows.results.map((row) => summarize(row, user.userId)),
     ),
+  };
+}
+
+function readInactiveRemovalCommand(
+  command: GameCommand,
+): InactiveRemovalCommand | null {
+  if (command.type !== "remove_inactive_player") return null;
+  requireRule(
+    typeof command.targetPlayerId === "string" &&
+      command.targetPlayerId.length > 0 &&
+      command.targetPlayerId.length <= 100,
+    "INVALID_FIELD",
+    "targetPlayerId must identify a player in this game.",
+    400,
+  );
+  return command;
+}
+
+function requireCurrentMember(
+  state: GameState,
+  userId: string,
+): GameState["players"][number] {
+  const player = state.players.find(
+    (candidate) =>
+      candidate.userId === userId && candidate.status !== "left",
+  );
+  requireRule(
+    player,
+    "NOT_A_MEMBER",
+    "You are not a member of this game.",
+    403,
+  );
+  return player;
+}
+
+async function buildPresenceSnapshot(
+  database: D1Database,
+  state: GameState,
+  now: number,
+): Promise<PresenceSnapshot> {
+  const rows = await database
+    .prepare(
+      `SELECT p.auth_subject, m.joined_at, gp.player_id, gp.last_seen_at
+       FROM game_members m
+       JOIN profiles p ON p.id = m.profile_id
+       LEFT JOIN game_presence gp
+         ON gp.game_id = m.game_id AND gp.profile_id = m.profile_id
+       WHERE m.game_id = ? AND m.status <> 'left'`,
+    )
+    .bind(state.gameId)
+    .all<PresenceRosterRow>();
+  const byUserId = new Map(
+    rows.results.map((row) => [row.auth_subject, row] as const),
+  );
+  return {
+    serverTime: now,
+    thresholds: PRESENCE_THRESHOLDS,
+    players: state.players
+      .filter((player) => player.status !== "left")
+      .sort((left, right) => left.seat - right.seat)
+      .map((player) => {
+        const roster = byUserId.get(player.userId);
+        const lastSeenAt = Number(
+          roster?.last_seen_at ?? roster?.joined_at ?? state.createdAt,
+        );
+        return presencePlayer(player.playerId, lastSeenAt, now);
+      }),
+  };
+}
+
+async function assertInactiveRemovalAllowed(
+  database: D1Database,
+  state: GameState,
+  actorUserId: string,
+  targetPlayerId: string,
+  now: number,
+): Promise<InactiveRemovalGuard> {
+  const target = state.players.find(
+    (player) => player.playerId === targetPlayerId,
+  );
+  requireRule(target, "PLAYER_NOT_FOUND", "That player is no longer in this game.", 404);
+  const row = await database
+    .prepare(
+      `SELECT m.joined_at, gp.last_seen_at
+       FROM game_members m
+       JOIN profiles p ON p.id = m.profile_id
+       LEFT JOIN game_presence gp
+         ON gp.game_id = m.game_id
+        AND gp.profile_id = m.profile_id
+        AND gp.player_id = ?
+       WHERE m.game_id = ? AND p.auth_subject = ? AND m.status = 'active'
+       LIMIT 1`,
+    )
+    .bind(targetPlayerId, state.gameId, target.userId)
+    .first<Pick<PresenceRosterRow, "joined_at" | "last_seen_at">>();
+  requireRule(
+    row,
+    "CORRUPT_MEMBERSHIP",
+    "The target player's membership record is unavailable.",
+    500,
+  );
+  const lastSeenAt = Number(row.last_seen_at ?? row.joined_at);
+  const verifiedTarget = assertInactiveRemovalPolicy(
+    state,
+    actorUserId,
+    targetPlayerId,
+    lastSeenAt,
+    now,
+  );
+  return {
+    targetPlayerId,
+    targetUserId: verifiedTarget.userId,
+    staleCutoff: now - PRESENCE_THRESHOLDS.removableAfterMs,
   };
 }
 
@@ -886,6 +1213,60 @@ function guardedReceiptStatement(
     );
 }
 
+function guardedInactiveRemovalReceiptStatement(
+  database: D1Database,
+  row: GameRow,
+  profileId: string,
+  commandId: string,
+  operation: string,
+  requestHash: string,
+  resultVersion: number,
+  now: number,
+  guard: InactiveRemovalGuard,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO command_receipts (
+        actor_profile_id, command_id, game_id, operation,
+        request_hash, result_version, created_at
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM games
+        WHERE id = ? AND version = ? AND state_hash = ?
+      )
+        AND EXISTS (
+          SELECT 1
+          FROM game_members m
+          JOIN profiles p ON p.id = m.profile_id
+          LEFT JOIN game_presence gp
+            ON gp.game_id = m.game_id
+           AND gp.profile_id = m.profile_id
+           AND gp.player_id = ?
+          WHERE m.game_id = ?
+            AND p.auth_subject = ?
+            AND m.status = 'active'
+            AND COALESCE(gp.last_seen_at, m.joined_at) <= ?
+        )`,
+    )
+    .bind(
+      profileId,
+      commandId,
+      row.id,
+      operation,
+      requestHash,
+      resultVersion,
+      now,
+      row.id,
+      row.version,
+      row.state_hash,
+      guard.targetPlayerId,
+      row.id,
+      guard.targetUserId,
+      guard.staleCutoff,
+    );
+}
+
 function guardedEventStatement(
   database: D1Database,
   row: GameRow,
@@ -959,6 +1340,101 @@ function membershipUpsertStatement(
       player.status,
       now,
       player.status === "left" ? now : null,
+    );
+}
+
+function presenceUpsertStatement(
+  database: D1Database,
+  gameId: string,
+  playerId: string,
+  profileId: string,
+  now: number,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO game_presence (
+        game_id, player_id, profile_id, last_seen_at
+      )
+      SELECT ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM game_members
+        WHERE game_id = ? AND profile_id = ? AND status <> 'left'
+      )
+      ON CONFLICT(game_id, player_id) DO UPDATE SET
+        profile_id = excluded.profile_id,
+        last_seen_at = excluded.last_seen_at`,
+    )
+    .bind(gameId, playerId, profileId, now, gameId, profileId);
+}
+
+function guardedPresenceUpsertStatement(
+  database: D1Database,
+  gameId: string,
+  playerId: string,
+  profileId: string,
+  now: number,
+  receiptProfileId: string,
+  commandId: string,
+  requestHash: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO game_presence (
+        game_id, player_id, profile_id, last_seen_at
+      )
+      SELECT ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM game_members
+        WHERE game_id = ? AND profile_id = ? AND status <> 'left'
+      )
+        AND EXISTS (
+          SELECT 1 FROM command_receipts
+          WHERE actor_profile_id = ? AND command_id = ?
+            AND game_id = ? AND request_hash = ?
+        )
+      ON CONFLICT(game_id, player_id) DO UPDATE SET
+        profile_id = excluded.profile_id,
+        last_seen_at = excluded.last_seen_at`,
+    )
+    .bind(
+      gameId,
+      playerId,
+      profileId,
+      now,
+      gameId,
+      profileId,
+      receiptProfileId,
+      commandId,
+      gameId,
+      requestHash,
+    );
+}
+
+function guardedPresenceDeleteStatement(
+  database: D1Database,
+  gameId: string,
+  playerId: string,
+  receiptProfileId: string,
+  commandId: string,
+  requestHash: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `DELETE FROM game_presence
+       WHERE game_id = ? AND player_id = ?
+         AND EXISTS (
+           SELECT 1 FROM command_receipts
+           WHERE actor_profile_id = ? AND command_id = ?
+             AND game_id = ? AND request_hash = ?
+         )`,
+    )
+    .bind(
+      gameId,
+      playerId,
+      receiptProfileId,
+      commandId,
+      gameId,
+      requestHash,
     );
 }
 
@@ -1403,6 +1879,17 @@ async function purgeExpiredRows(
   await database.batch([
     database
       .prepare(
+        `DELETE FROM game_presence WHERE rowid IN (
+          SELECT p.rowid FROM game_presence p
+          JOIN games g ON g.id = p.game_id
+          WHERE g.expires_at <= ?
+          ORDER BY g.expires_at, p.game_id, p.player_id
+          LIMIT 128
+        )`,
+      )
+      .bind(now),
+    database
+      .prepare(
         `DELETE FROM game_events WHERE rowid IN (
           SELECT e.rowid FROM game_events e
           JOIN games g ON g.id = e.game_id
@@ -1442,6 +1929,7 @@ async function purgeExpiredRows(
             AND NOT EXISTS (SELECT 1 FROM game_events e WHERE e.game_id = g.id)
             AND NOT EXISTS (SELECT 1 FROM command_receipts r WHERE r.game_id = g.id)
             AND NOT EXISTS (SELECT 1 FROM game_members m WHERE m.game_id = g.id)
+            AND NOT EXISTS (SELECT 1 FROM game_presence p WHERE p.game_id = g.id)
           ORDER BY g.expires_at, g.id
           LIMIT ?
         )`,

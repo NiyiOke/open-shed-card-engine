@@ -53,6 +53,21 @@ export const gameMembers = sqliteTable(
   ],
 );
 
+export const gamePresence = sqliteTable(
+  "game_presence",
+  {
+    gameId: text("game_id").notNull(),
+    playerId: text("player_id").notNull(),
+    profileId: text("profile_id").notNull(),
+    lastSeenAt: integer("last_seen_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.gameId, table.playerId] }),
+    uniqueIndex("idx_game_presence_profile").on(table.gameId, table.profileId),
+    index("idx_game_presence_activity").on(table.gameId, table.lastSeenAt),
+  ],
+);
+
 export const gameEvents = sqliteTable(
   "game_events",
   {

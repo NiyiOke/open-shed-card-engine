@@ -23,6 +23,7 @@ The client never submits an actor ID, decides whether a card is legal, sees anot
 - `game_members` provides membership lookup and stable seats.
 - `game_events` records one public event bundle and resulting state hash per accepted revision.
 - `command_receipts` makes create, join, and gameplay mutations durably idempotent for each actor.
+- `game_presence` stores each active member's last server-observed heartbeat without mixing transient connectivity into rules state.
 - `mutation_quotas` bounds authenticated create/join/command churn in fixed, expiring windows.
 
 Local runtime initialization is idempotent and mirrors the generated Drizzle migrations. Hosted deployments use the migrations under `drizzle/` and the logical `DB` binding in `.openai/hosting.json`. Normal requests perform bounded lazy deletion of expired games, related audit rows, receipts, memberships, and quota buckets.
@@ -42,7 +43,9 @@ Local runtime initialization is idempotent and mirrors the generated Drizzle mig
 
 ## Synchronization baseline
 
-The browser adaptively polls every 1.5 seconds while visible and backs off while hidden. It refreshes on focus, reconnect, and visibility changes, aborts stale-room requests, and keeps the active game in a durable URL. Mutation responses contain the new projection, avoiding a redundant immediate read. Stale commands receive a conflict and trigger resynchronization.
+The browser adaptively polls every 1.5 seconds while a visible round is active, uses a low-rate five-second poll on complete tables so rematches propagate, and backs off while hidden. It refreshes on focus, reconnect, and visibility changes, aborts stale-room requests, and keeps the active game in a durable URL. A single in-flight mutation envelope is stored in the browser session and retried with the same command ID after a lost response. Mutation responses contain the new projection, avoiding a redundant immediate read. Stale commands receive a conflict and trigger resynchronization.
+
+Presence uses a separate heartbeat path and server clock: players progress from live to reconnecting to disconnected, while host removal is unavailable until the server revalidates a two-minute inactive grace period. Completed tables continue low-rate heartbeats so a waiting player can observe a rematch without being falsely classified as removable.
 
 Short polling is intentional because the Sites binding contract currently exposes D1 and R2, not Durable Objects. Stateless Worker memory is never used as room authority.
 

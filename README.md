@@ -6,7 +6,7 @@ The project deliberately starts with the difficult foundation: server-authoritat
 
 ## What works
 
-- 2–6 player online lobbies with shareable six-character codes
+- 2–6 player online lobbies with one-tap invitation URLs and shareable six-character codes
 - ChatGPT sign-in on hosted Sites deployments and isolated local test identities in development
 - A versioned 168-card physical deck manifest with unique card instances
 - Match-by-color, number, or symbol and mandatory draw-until-playable flow
@@ -19,6 +19,7 @@ The project deliberately starts with the difficult foundation: server-authoritat
 - Viewer-specific state: your hand and forced drawn card are returned only to you; opponent hands and draw order never leave the server
 - Atomic optimistic writes, durable actor-scoped command receipts, append-only public events, bounded mutation quotas, expiry cleanup, and D1 persistence
 - Responsive keyboard/touch UI, durable game deep links, a live public event feed, and deterministic `render_game_to_text` / `advanceTime` test hooks
+- V1.1 game-night recovery: player presence, explicit connection state, reconnect-safe saved commands, contextual turn guidance, in-game rules, inactive-player grace handling, results, and same-room rematches
 
 ## Architecture
 
@@ -34,6 +35,7 @@ Browser clients
                  ├─ profiles and memberships
                  ├─ public event audit records
                  ├─ durable command receipts
+                 ├─ ephemeral player presence
                  └─ bounded mutation quotas
 ```
 
@@ -63,6 +65,7 @@ npm run test:unit
 npm run typecheck
 npm run lint
 npm run build
+npm run test:v11-browser
 npm test
 ```
 
@@ -81,6 +84,7 @@ Inspect every generated SQL migration before committing it. Sites applies commit
 - `POST /api/games/join` — code-based join
 - `GET /api/games/:gameId` — current viewer-safe snapshot
 - `POST /api/games/:gameId/commands` — typed, versioned game mutation
+- `GET|POST /api/games/:gameId/presence` — viewer-safe presence snapshot and authenticated heartbeat
 
 Every command supplies a unique `commandId` and `expectedRevision`. Actor identity comes from Sites' trusted server headers, never from the command body. A self-hosted deployment must replace this Sites-specific identity adapter at its ingress boundary.
 

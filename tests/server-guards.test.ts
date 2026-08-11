@@ -54,3 +54,33 @@ test("command parser rejects unknown privileged command shapes", () => {
       error instanceof GameRuleError && error.code === "UNSUPPORTED_COMMAND",
   );
 });
+
+test("command parser accepts the exact V1.1 room-management commands", () => {
+  assert.deepEqual(parseGameCommand({ type: "rematch" }), {
+    type: "rematch",
+  });
+  assert.deepEqual(
+    parseGameCommand({
+      type: "remove_inactive_player",
+      targetPlayerId: "player-b",
+    }),
+    {
+      type: "remove_inactive_player",
+      targetPlayerId: "player-b",
+    },
+  );
+});
+
+test("inactive-player removal parser requires a bounded target player id", () => {
+  for (const targetPlayerId of [undefined, "", "x".repeat(101)]) {
+    assert.throws(
+      () =>
+        parseGameCommand({
+          type: "remove_inactive_player",
+          targetPlayerId,
+        }),
+      (error: unknown) =>
+        error instanceof GameRuleError && error.code === "INVALID_FIELD",
+    );
+  }
+});

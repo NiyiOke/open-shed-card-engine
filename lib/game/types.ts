@@ -112,6 +112,8 @@ export type GameCommand =
   | { type: "choose_roulette_color"; color: CardColor }
   | { type: "declare_uno" }
   | { type: "catch_uno"; offenderPlayerId: string }
+  | { type: "rematch" }
+  | { type: "remove_inactive_player"; targetPlayerId: string }
   | { type: "leave_game" };
 
 export type CommandEnvelope = {
@@ -148,6 +150,7 @@ export type LegalActions = {
   canChooseRouletteColor: boolean;
   canDeclareUno: boolean;
   catchablePlayerIds: string[];
+  canRematch: boolean;
   canLeave: boolean;
 };
 

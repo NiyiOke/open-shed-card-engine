@@ -150,12 +150,14 @@ export function transitionGame(
     (player) => player.userId === context.actorUserId,
   );
   requireRule(actor, "NOT_A_MEMBER", "You are not a member of this game.", 403);
-  requireRule(
-    state.phase !== "complete",
-    "GAME_COMPLETE",
-    "This game is complete and no longer accepts commands.",
-    409,
-  );
+  if (command.type !== "rematch") {
+    requireRule(
+      state.phase !== "complete",
+      "GAME_COMPLETE",
+      "This game is complete and no longer accepts commands.",
+      409,
+    );
+  }
 
   const events: GameEvent[] = [];
   switch (command.type) {
@@ -170,6 +172,12 @@ export function transitionGame(
       break;
     case "catch_uno":
       catchUno(state, actor, command.offenderPlayerId, events);
+      break;
+    case "rematch":
+      startRematchLobby(state, actor, events);
+      break;
+    case "remove_inactive_player":
+      removeInactivePlayer(state, actor, command.targetPlayerId, events);
       break;
     case "leave_game":
       leaveGame(state, actor, events);
@@ -739,23 +747,84 @@ function leaveGame(
   actor: PlayerState,
   events: GameEvent[],
 ): void {
+  removePlayer(state, actor, events);
+  events.push({
+    type: "player_left",
+    actorPlayerId: actor.playerId,
+    message: `${actor.displayName} left the game.`,
+  });
+}
+
+function removeInactivePlayer(
+  state: GameState,
+  actor: PlayerState,
+  targetPlayerId: string,
+  events: GameEvent[],
+): void {
+  requireRule(
+    state.phase === "lobby" || state.phase === "playing",
+    "GAME_NOT_ACTIVE",
+    "Inactive players can only be removed from a lobby or active game.",
+  );
+  requireRule(
+    actor.userId === state.hostUserId,
+    "HOST_ONLY",
+    "Only the host can remove an inactive player.",
+    403,
+  );
+  requireRule(
+    actor.status === "active",
+    "PLAYER_NOT_ACTIVE",
+    "Only an active host can remove a player.",
+    403,
+  );
+  requireRule(
+    actor.playerId !== targetPlayerId,
+    "CANNOT_REMOVE_SELF",
+    "The host cannot remove themselves.",
+  );
+  const target = state.players.find(
+    (player) => player.playerId === targetPlayerId,
+  );
+  requireRule(target, "PLAYER_NOT_FOUND", "That player is not in this game.", 404);
+  requireRule(
+    target.status === "active",
+    "PLAYER_NOT_ACTIVE",
+    "That player is no longer active.",
+    409,
+  );
+
+  removePlayer(state, target, events);
+  events.push({
+    type: "inactive_player_removed",
+    actorPlayerId: actor.playerId,
+    message: `${actor.displayName} removed inactive player ${target.displayName}.`,
+    data: { targetPlayerId: target.playerId },
+  });
+}
+
+function removePlayer(
+  state: GameState,
+  player: PlayerState,
+  events: GameEvent[],
+): void {
   if (state.phase === "lobby") {
-    actor.status = "left";
-    actor.ready = false;
+    player.status = "left";
+    player.ready = false;
     const remaining = activePlayers(state);
-    if (actor.userId === state.hostUserId && remaining.length > 0) {
+    if (player.userId === state.hostUserId && remaining.length > 0) {
       state.hostUserId = remaining[0].userId;
     }
     if (remaining.length === 0) {
       state.phase = "complete";
     }
   } else if (state.phase === "playing") {
-    const ownedForcedCard = actor.hand.some((card) => card.id === state.forcedCardId);
-    state.mercyReserve.push(...actor.hand);
-    actor.hand = [];
-    actor.status = "left";
-    actor.ready = false;
-    if (state.currentPlayerId === actor.playerId) {
+    const ownedForcedCard = player.hand.some((card) => card.id === state.forcedCardId);
+    state.mercyReserve.push(...player.hand);
+    player.hand = [];
+    player.status = "left";
+    player.ready = false;
+    if (state.currentPlayerId === player.playerId) {
       state.pendingDraw = null;
       state.rouletteTargetId = null;
       state.forcedCardId = null;
@@ -763,14 +832,63 @@ function leaveGame(
       state.forcedCardId = null;
     }
     state.unoLiabilities = state.unoLiabilities.filter(
-      (entry) => entry.playerId !== actor.playerId,
+      (entry) => entry.playerId !== player.playerId,
     );
-    repairTurnAfterRemoval(state, actor, events);
+    repairTurnAfterRemoval(state, player, events);
   }
+}
+
+function startRematchLobby(
+  state: GameState,
+  actor: PlayerState,
+  events: GameEvent[],
+): void {
+  requireRule(
+    state.phase === "complete",
+    "REMATCH_NOT_AVAILABLE",
+    "A rematch is available only after the game is complete.",
+    409,
+  );
+  requireRule(
+    actor.userId === state.hostUserId,
+    "HOST_ONLY",
+    "Only the host can start a rematch.",
+    403,
+  );
+  requireRule(
+    actor.status !== "left",
+    "PLAYER_NOT_ACTIVE",
+    "A host who left the room cannot start a rematch.",
+    403,
+  );
+
+  state.players = state.players
+    .filter((player) => player.status !== "left")
+    .sort((left, right) => left.seat - right.seat);
+  for (const player of state.players) {
+    player.ready = false;
+    player.status = "active";
+    player.hand = [];
+    player.knockedOutBy = null;
+  }
+  state.phase = "lobby";
+  state.dealerSeat = null;
+  state.currentPlayerId = null;
+  state.direction = 1;
+  state.activeColor = null;
+  state.drawPile = [];
+  state.discardPile = [];
+  state.mercyReserve = [];
+  state.pendingDraw = null;
+  state.rouletteTargetId = null;
+  state.forcedCardId = null;
+  state.unoLiabilities = [];
+  state.winner = null;
+  state.turnNumber = 0;
   events.push({
-    type: "player_left",
+    type: "rematch_started",
     actorPlayerId: actor.playerId,
-    message: `${actor.displayName} left the game.`,
+    message: `${actor.displayName} opened a rematch lobby.`,
   });
 }
 

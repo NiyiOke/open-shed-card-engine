@@ -826,6 +826,263 @@ test("leaving during a forced play clears turn-owned transient state", () => {
   assert.equal(state.currentPlayerId, B.playerId);
 });
 
+test("the host can open an idempotent rematch lobby from a completed game", () => {
+  const completed = completedGameWithEliminatedAndLeftPlayers();
+  const completedSnapshot = structuredClone(completed);
+  const completedRevision = completed.revision;
+  const completedRngState = completed.rngState;
+  const completedCommandHistory = structuredClone(completed.processedCommands);
+
+  const hostView = projectGameForUser(completed, HOST.userId);
+  const opponentView = projectGameForUser(completed, B.userId);
+  assert.equal(hostView.legalActions.canRematch, true);
+  assert.equal(opponentView.legalActions.canRematch, false);
+
+  const context: TransitionContext = {
+    actorUserId: HOST.userId,
+    commandId: "stable-rematch-command",
+    now: completed.updatedAt + 10,
+  };
+  const first = transitionGame(completed, { type: "rematch" }, context);
+
+  assert.equal(first.replayed, false);
+  assert.deepEqual(completed, completedSnapshot);
+  assert.equal(first.state.phase, "lobby");
+  assert.equal(first.state.gameId, completed.gameId);
+  assert.equal(first.state.joinCode, completed.joinCode);
+  assert.equal(first.state.hostUserId, completed.hostUserId);
+  assert.equal(first.state.createdAt, completed.createdAt);
+  assert.equal(first.state.rngState, completedRngState);
+  assert.equal(first.state.revision, completedRevision + 1);
+  assert.equal(first.state.updatedAt, context.now);
+  assert.deepEqual(
+    first.state.processedCommands,
+    [
+      ...completedCommandHistory,
+      { actorUserId: HOST.userId, commandId: context.commandId },
+    ].slice(-64),
+  );
+  assert.deepEqual(
+    first.state.players.map((player) => ({
+      playerId: player.playerId,
+      seat: player.seat,
+      ready: player.ready,
+      status: player.status,
+      handSize: player.hand.length,
+      knockedOutBy: player.knockedOutBy,
+    })),
+    [
+      {
+        playerId: HOST.playerId,
+        seat: 0,
+        ready: false,
+        status: "active",
+        handSize: 0,
+        knockedOutBy: null,
+      },
+      {
+        playerId: B.playerId,
+        seat: 1,
+        ready: false,
+        status: "active",
+        handSize: 0,
+        knockedOutBy: null,
+      },
+    ],
+  );
+  assert.equal(
+    first.state.players.some((player) => player.playerId === C.playerId),
+    false,
+  );
+  assert.equal(first.state.dealerSeat, null);
+  assert.equal(first.state.currentPlayerId, null);
+  assert.equal(first.state.direction, 1);
+  assert.equal(first.state.activeColor, null);
+  assert.deepEqual(first.state.drawPile, []);
+  assert.deepEqual(first.state.discardPile, []);
+  assert.deepEqual(first.state.mercyReserve, []);
+  assert.equal(first.state.pendingDraw, null);
+  assert.equal(first.state.rouletteTargetId, null);
+  assert.equal(first.state.forcedCardId, null);
+  assert.deepEqual(first.state.unoLiabilities, []);
+  assert.equal(first.state.winner, null);
+  assert.equal(first.state.turnNumber, 0);
+  assert.deepEqual(first.events, [
+    {
+      type: "rematch_started",
+      actorPlayerId: HOST.playerId,
+      message: "Ada opened a rematch lobby.",
+    },
+  ]);
+  assert.equal(
+    projectGameForUser(first.state, HOST.userId).legalActions.canRematch,
+    false,
+  );
+
+  const replay = transitionGame(first.state, { type: "rematch" }, context);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.state, first.state);
+  assert.deepEqual(replay.events, []);
+
+  let restarted = first.state;
+  restarted = run(restarted, HOST.userId, { type: "set_ready", ready: true });
+  restarted = run(restarted, B.userId, { type: "set_ready", ready: true });
+  restarted = run(restarted, HOST.userId, { type: "start_game" });
+  assert.equal(restarted.phase, "playing");
+  assert.deepEqual(
+    restarted.players.map((player) => player.hand.length),
+    [7, 7],
+  );
+  assert.equal(allCards(restarted).length, 168);
+});
+
+test("rematch rejects non-hosts and games that are not complete", () => {
+  const playing = startedGame([HOST, B]);
+  expectRuleError(
+    () => run(playing, HOST.userId, { type: "rematch" }),
+    "REMATCH_NOT_AVAILABLE",
+  );
+
+  const completed = completedGameWithEliminatedAndLeftPlayers();
+  const snapshot = structuredClone(completed);
+  expectRuleError(
+    () => run(completed, B.userId, { type: "rematch" }),
+    "HOST_ONLY",
+  );
+  assert.deepEqual(completed, snapshot);
+  expectRuleError(
+    () => run(completed, HOST.userId, { type: "set_ready", ready: true }),
+    "GAME_COMPLETE",
+  );
+  assert.deepEqual(completed, snapshot);
+});
+
+test("the host can remove an inactive current player with leave-safe turn repair", () => {
+  let state = forceTurn(startedGame([HOST, B, C]), HOST.playerId);
+  setTopDiscard(
+    state,
+    moveCard(state, (card) => card.color === "red" && card.number === 5),
+  );
+  const plusTwo = moveCard(
+    state,
+    (card) => card.color === "red" && card.kind === "draw_two",
+  );
+  giveOnlyAdditionalCard(state, HOST.playerId, plusTwo);
+  state = run(state, HOST.userId, {
+    type: "play_card",
+    cardId: plusTwo.id,
+  });
+  assert.equal(state.currentPlayerId, B.playerId);
+  assert.equal(state.pendingDraw?.total, 2);
+  const targetHandSize = handIds(state, B.playerId).length;
+  const cardsBefore = sortedCardIds(state);
+  const context: TransitionContext = {
+    actorUserId: HOST.userId,
+    commandId: "stable-remove-command",
+    now: state.updatedAt + 5,
+  };
+
+  const result = transitionGame(
+    state,
+    { type: "remove_inactive_player", targetPlayerId: B.playerId },
+    context,
+  );
+
+  assert.equal(result.state.phase, "playing");
+  assert.equal(
+    result.state.players.find((player) => player.playerId === B.playerId)?.status,
+    "left",
+  );
+  assert.deepEqual(handIds(result.state, B.playerId), []);
+  assert.equal(result.state.mercyReserve.length >= targetHandSize, true);
+  assert.equal(result.state.pendingDraw, null);
+  assert.equal(result.state.rouletteTargetId, null);
+  assert.equal(result.state.forcedCardId, null);
+  assert.equal(result.state.currentPlayerId, C.playerId);
+  assert.deepEqual(sortedCardIds(result.state), cardsBefore);
+  assert.deepEqual(result.events, [
+    {
+      type: "inactive_player_removed",
+      actorPlayerId: HOST.playerId,
+      message: "Ada removed inactive player Ben.",
+      data: { targetPlayerId: B.playerId },
+    },
+  ]);
+
+  const replay = transitionGame(
+    result.state,
+    { type: "remove_inactive_player", targetPlayerId: B.playerId },
+    context,
+  );
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.state, result.state);
+  assert.deepEqual(replay.events, []);
+});
+
+test("inactive-player removal enforces host, membership, active target, and self guards", () => {
+  let state = createLobbyState({
+    gameId: "removal-guards",
+    joinCode: "REMOVE",
+    hostUserId: HOST.userId,
+    hostPlayerId: HOST.playerId,
+    hostDisplayName: HOST.name,
+    now: 1,
+    seed: 9,
+  });
+  state = joinLobbyState(state, {
+    userId: B.userId,
+    playerId: B.playerId,
+    displayName: B.name,
+    commandId: "join-removal-target",
+    now: 2,
+  }).state;
+  const snapshot = structuredClone(state);
+
+  expectRuleError(
+    () =>
+      run(state, B.userId, {
+        type: "remove_inactive_player",
+        targetPlayerId: HOST.playerId,
+      }),
+    "HOST_ONLY",
+  );
+  expectRuleError(
+    () =>
+      run(state, HOST.userId, {
+        type: "remove_inactive_player",
+        targetPlayerId: HOST.playerId,
+      }),
+    "CANNOT_REMOVE_SELF",
+  );
+  expectRuleError(
+    () =>
+      run(state, HOST.userId, {
+        type: "remove_inactive_player",
+        targetPlayerId: "missing-player",
+      }),
+    "PLAYER_NOT_FOUND",
+  );
+  assert.deepEqual(state, snapshot);
+
+  state = run(state, HOST.userId, {
+    type: "remove_inactive_player",
+    targetPlayerId: B.playerId,
+  });
+  assert.equal(state.phase, "lobby");
+  assert.equal(
+    state.players.find((player) => player.playerId === B.playerId)?.status,
+    "left",
+  );
+  expectRuleError(
+    () =>
+      run(state, HOST.userId, {
+        type: "remove_inactive_player",
+        targetPlayerId: B.playerId,
+      }),
+    "PLAYER_NOT_ACTIVE",
+  );
+});
+
 test("an empty lobby closes cleanly while returning a final viewer projection", () => {
   let state = createLobbyState({
     gameId: "abandoned-game",
@@ -847,6 +1104,36 @@ test("an empty lobby closes cleanly while returning a final viewer projection", 
     "GAME_COMPLETE",
   );
 });
+
+function completedGameWithEliminatedAndLeftPlayers(): GameState {
+  let state = forceTurn(startedGame([HOST, B, C]), HOST.playerId);
+  setTopDiscard(
+    state,
+    moveCard(state, (card) => card.color === "red" && card.number === 5),
+  );
+  const plusTwo = moveCard(
+    state,
+    (card) => card.color === "red" && card.kind === "draw_two",
+  );
+  giveOnlyAdditionalCard(state, HOST.playerId, plusTwo);
+  setHandSize(state, B.playerId, 24);
+  state = run(state, C.userId, { type: "leave_game" });
+  state = run(state, HOST.userId, {
+    type: "play_card",
+    cardId: plusTwo.id,
+  });
+  state = run(state, B.userId, { type: "accept_penalty" });
+  assert.equal(state.phase, "complete");
+  assert.equal(
+    state.players.find((player) => player.playerId === B.playerId)?.status,
+    "eliminated",
+  );
+  assert.equal(
+    state.players.find((player) => player.playerId === C.playerId)?.status,
+    "left",
+  );
+  return state;
+}
 
 function startedGame(
   players: Array<{ userId: string; playerId: string; name: string }>,

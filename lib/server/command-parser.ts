@@ -52,6 +52,17 @@ export function parseGameCommand(value: unknown): GameCommand {
           100,
         ),
       };
+    case "rematch":
+      return { type: "rematch" };
+    case "remove_inactive_player":
+      return {
+        type: "remove_inactive_player",
+        targetPlayerId: requireShortString(
+          input.targetPlayerId,
+          "targetPlayerId",
+          100,
+        ),
+      };
     case "leave_game":
       return { type: "leave_game" };
     default:

@@ -11,7 +11,15 @@ export default async function Home({
   const user = await getChatGPTUser();
   const params = await searchParams;
   const linkedGameId = typeof params.game === "string" ? params.game : null;
-  const returnTo = linkedGameId ? `/?game=${encodeURIComponent(linkedGameId)}` : "/";
+  const linkedJoinCode =
+    typeof params.join === "string" && /^[a-z0-9]{6}$/i.test(params.join)
+      ? params.join.toUpperCase()
+      : null;
+  const returnTo = linkedGameId
+    ? `/?game=${encodeURIComponent(linkedGameId)}`
+    : linkedJoinCode
+      ? `/?join=${encodeURIComponent(linkedJoinCode)}`
+      : "/";
   return (
     <GameShell
       signInPath={chatGPTSignInPath(returnTo)}

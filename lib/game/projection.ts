@@ -109,6 +109,10 @@ export function legalActionsFor(
     catchablePlayerIds: state.unoLiabilities
       .filter((entry) => entry.playerId !== viewer.playerId)
       .map((entry) => entry.playerId),
+    canRematch:
+      state.phase === "complete" &&
+      state.hostUserId === viewer.userId &&
+      viewer.status !== "left",
     canLeave: state.phase !== "complete",
   };
 }
