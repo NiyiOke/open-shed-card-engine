@@ -1195,6 +1195,210 @@ button:disabled {
   accent-color: var(--red);
 }
 
+.header-issue-button {
+  color: #8f241b;
+}
+
+.bug-report-panel {
+  width: min(700px, 100%);
+}
+
+.bug-report-privacy-note,
+.bug-report-github-note,
+.bug-report-security-note {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bug-report-privacy-note {
+  border-left: 5px solid var(--red);
+  background: rgba(223, 53, 35, 0.08);
+}
+
+.bug-report-categories {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 0 !important;
+}
+
+.bug-report-categories legend {
+  margin-left: 10px;
+}
+
+.bug-report-categories label {
+  min-height: 48px;
+  padding: 9px 11px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.bug-report-categories label:nth-of-type(odd) {
+  border-right: 1px solid var(--line);
+}
+
+.bug-report-categories input {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  accent-color: var(--red);
+}
+
+.bug-report-description {
+  display: grid;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.bug-report-description textarea {
+  width: 100%;
+  min-height: 138px;
+  padding: 12px;
+  resize: vertical;
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.bug-report-description textarea:focus-visible {
+  outline: 3px solid var(--acid);
+  outline-offset: 2px;
+}
+
+.bug-report-description-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  color: var(--muted);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.bug-report-description-meta > span:last-child {
+  flex: 0 0 auto;
+}
+
+.bug-report-diagnostics {
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.bug-report-diagnostics summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.bug-report-diagnostics > p {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.bug-report-diagnostics dl {
+  margin: 0 0 12px;
+  border-top: 1px solid var(--line);
+}
+
+.bug-report-diagnostics dl > div {
+  min-height: 36px;
+  display: grid;
+  grid-template-columns: minmax(120px, 0.7fr) minmax(0, 1.3fr);
+  gap: 12px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+}
+
+.bug-report-diagnostics dt {
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.bug-report-diagnostics dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.bug-report-github-note {
+  margin-top: 16px;
+  border-left: 5px solid var(--acid);
+  background: rgba(190, 255, 46, 0.13);
+}
+
+.bug-report-security-note {
+  margin-top: 8px;
+  border-left: 5px solid var(--red);
+}
+
+.bug-report-security-note a {
+  color: var(--ink);
+  font-weight: 800;
+  text-underline-offset: 3px;
+}
+
+.bug-report-feedback:empty {
+  display: none;
+}
+
+.bug-report-feedback p {
+  margin: 12px 0 0;
+  padding: 9px 10px;
+  border-left: 4px solid var(--acid);
+  background: rgba(190, 255, 46, 0.12);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.bug-report-feedback p.field-error {
+  border-color: var(--red);
+  background: rgba(223, 53, 35, 0.08);
+  color: #8d1b14;
+}
+
+.bug-report-actions {
+  flex-wrap: wrap;
+}
+
+.bug-report-actions .primary-button {
+  max-width: 290px;
+  line-height: 1.25;
+  text-align: center;
+}
+
+.roulette-choice-note {
+  margin: -8px 0 18px;
+  padding: 12px 14px;
+  border-left: 5px solid var(--yellow);
+  background: var(--paper);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .leave-button {
   margin-top: auto;
 }
@@ -2896,6 +3100,12 @@ button:disabled {
   .app-header {
     height: 64px;
     padding: 0 14px;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .wordmark {
+    font-size: 18px;
   }
 
   .header-account > span {
@@ -2903,11 +3113,13 @@ button:disabled {
   }
 
   .header-account {
-    gap: 9px;
+    min-width: 0;
+    gap: 5px;
   }
 
-  .header-guide-button {
-    font-size: 10px;
+  .header-account .text-button {
+    padding-inline: 2px;
+    font-size: 9px;
   }
 
   .lobby-browser {
@@ -3096,6 +3308,38 @@ button:disabled {
 
   .chat-moderation-panel .dialog-actions > * {
     width: 100%;
+  }
+
+  .bug-report-categories {
+    grid-template-columns: 1fr;
+  }
+
+  .bug-report-categories label:nth-of-type(odd) {
+    border-right: 0;
+  }
+
+  .bug-report-description-meta {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .bug-report-diagnostics dl > div {
+    grid-template-columns: 1fr;
+    gap: 3px;
+    padding: 8px 0;
+  }
+
+  .bug-report-actions {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+
+  .bug-report-actions > *,
+  .bug-report-actions .primary-button {
+    width: 100%;
+    max-width: none;
+    min-height: 44px;
   }
 
   .leave-button {

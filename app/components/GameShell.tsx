@@ -32,6 +32,19 @@ import {
   type ChatReportReason,
 } from "./chat-ui";
 import {
+  BUG_REPORT_CATEGORIES,
+  BUG_REPORT_DESCRIPTION_MAX_LENGTH,
+  buildBugReportDraft,
+  buildBugReportIssueUrl,
+  createPrivateBugReportTerms,
+  createSafeBugReportDiagnostics,
+  createSafeBugReportLegalActions,
+  validateBugReportDescription,
+  viewportBucket,
+  type BugReportCategory,
+  type SafeBugReportDiagnostics,
+} from "./bug-report";
+import {
   listingFailureMessage,
   listingUnavailableReason,
   isValidRoomAlias,
@@ -171,6 +184,15 @@ export function GameShell({
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [shareFeedback, setShareFeedback] = useState<string | null>(null);
   const [guideTopic, setGuideTopic] = useState<GuideTopic | null>(null);
+  const [bugReportOpen, setBugReportOpen] = useState(false);
+  const [bugReportCategory, setBugReportCategory] =
+    useState<BugReportCategory>("turn_stuck");
+  const [bugReportDescription, setBugReportDescription] = useState("");
+  const [bugReportDiagnostics, setBugReportDiagnostics] =
+    useState<SafeBugReportDiagnostics | null>(null);
+  const [bugReportPrivateCanaries, setBugReportPrivateCanaries] = useState<string[]>([]);
+  const [bugReportError, setBugReportError] = useState<string | null>(null);
+  const [bugReportStatus, setBugReportStatus] = useState<string | null>(null);
   const [removeTargetId, setRemoveTargetId] = useState<string | null>(null);
   const [storedCommand, setStoredCommand] = useState<StoredCommand | null>(null);
   const [sidebarDetailsOpen, setSidebarDetailsOpen] = useState(false);
@@ -215,6 +237,9 @@ export function GameShell({
   const testPlayerSwitchingRef = useRef(false);
   const utilityDialogRef = useRef<HTMLDivElement>(null);
   const utilityTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const bugReportDialogRef = useRef<HTMLDivElement>(null);
+  const bugReportDescriptionRef = useRef<HTMLTextAreaElement>(null);
+  const bugReportTriggerRef = useRef<HTMLButtonElement | null>(null);
   const publicAliasInputRef = useRef<HTMLInputElement>(null);
   const storedRetryKeyRef = useRef<string | null>(null);
   const presenceAvailableRef = useRef(true);
@@ -881,6 +906,15 @@ export function GameShell({
         savedAction: storedCommand
           ? { gameId: storedCommand.gameId, type: storedCommand.command.type }
           : null,
+        issueReport: {
+          modal: bugReportOpen ? "open" : "closed",
+          category: bugReportOpen ? bugReportCategory : null,
+          descriptionLength: bugReportOpen
+            ? Array.from(bugReportDescription.normalize("NFKC")).length
+            : 0,
+          diagnostics: bugReportOpen ? bugReportDiagnostics : null,
+          outboundAction: bugReportOpen ? "awaiting_explicit_user_click" : null,
+        },
         game: game
           ? {
               id: game.gameId,
@@ -932,6 +966,10 @@ export function GameShell({
       delete window.advanceTime;
     };
   }, [
+    bugReportCategory,
+    bugReportDescription,
+    bugReportDiagnostics,
+    bugReportOpen,
     chatAnnouncements,
     chatEnabled,
     chatPanelVisible,
@@ -1514,6 +1552,116 @@ export function GameShell({
     window.requestAnimationFrame(() => utilityTriggerRef.current?.focus());
   }, []);
 
+  const privateBugReportValues = (current: GameView | null) => {
+    return createPrivateBugReportTerms({
+      names: [
+        session?.displayName ?? "",
+        nickname,
+        ...(current?.players.map((player) => player.displayName) ?? []),
+      ],
+      secrets: [
+        current?.gameId ?? "",
+        current?.joinCode ?? "",
+        current?.currentPlayerId ?? "",
+        current?.rouletteTargetId ?? "",
+        current?.forcedCardId ?? "",
+        current?.topDiscard?.id ?? "",
+        ...(current?.players.map((player) => player.playerId) ?? []),
+        ...(current?.hand.map((card) => card.id) ?? []),
+      ],
+    });
+  };
+
+  const currentBugReportDraft = () => {
+    if (!bugReportDiagnostics) {
+      return { ok: false as const, error: "Safe diagnostics are not ready. Close and reopen the report." };
+    }
+    const validation = validateBugReportDescription(
+      bugReportDescription,
+      bugReportPrivateCanaries,
+    );
+    if (!validation.ok) return validation;
+    return {
+      ok: true as const,
+      input: {
+        category: bugReportCategory,
+        description: validation.value,
+        diagnostics: bugReportDiagnostics,
+      },
+    };
+  };
+
+  const openBugReport = (trigger: HTMLButtonElement) => {
+    const current = gameRef.current;
+    const selfPlayerId = current?.players.find((player) => player.isSelf)?.playerId;
+    bugReportTriggerRef.current = trigger;
+    setBugReportCategory("turn_stuck");
+    setBugReportDescription("");
+    setBugReportError(null);
+    setBugReportStatus(null);
+    setBugReportPrivateCanaries(privateBugReportValues(current));
+    setBugReportDiagnostics(createSafeBugReportDiagnostics({
+      phase: current?.phase ?? "lobby-browser",
+      revision: current?.revision ?? null,
+      connection: connectionState,
+      currentTurnIsSelf: current?.currentPlayerId
+        ? current.currentPlayerId === selfPlayerId
+        : null,
+      activeColor: current?.activeColor ?? null,
+      pendingDraw: current?.pendingDraw
+        ? { total: current.pendingDraw.total, minimum: current.pendingDraw.minimum }
+        : null,
+      direction: current ? (current.direction === 1 ? "clockwise" : "counterclockwise") : null,
+      playerCount: current?.players.filter((player) => player.status !== "left").length ?? 0,
+      viewportBucket: viewportBucket(window.innerWidth),
+      rouletteChoice: current?.rouletteTargetId
+        ? current.rouletteTargetId === selfPlayerId
+          ? "self"
+          : "other"
+        : "none",
+      legalActions: createSafeBugReportLegalActions({
+        canSetReady: current?.legalActions.canSetReady ?? false,
+        canStart: current?.legalActions.canStart ?? false,
+        canPlayCard: Boolean(current?.legalActions.playableCardIds.length),
+        canDrawUntilPlayable: current?.legalActions.canDrawUntilPlayable ?? false,
+        canAcceptPenalty: current?.legalActions.canAcceptPenalty ?? false,
+        canChooseRouletteColor: current?.legalActions.canChooseRouletteColor ?? false,
+        canDeclareUno: current?.legalActions.canDeclareUno ?? false,
+        canCatchUno: Boolean(current?.legalActions.catchablePlayerIds.length),
+        canRematch: current?.legalActions.canRematch ?? false,
+        canLeave: current?.legalActions.canLeave ?? false,
+      }),
+      recentEventKinds: events.map((event) => event.type),
+    }));
+    setBugReportOpen(true);
+  };
+
+  const closeBugReport = useCallback(() => {
+    setBugReportOpen(false);
+    setBugReportPrivateCanaries([]);
+    setBugReportError(null);
+    setBugReportStatus(null);
+    window.requestAnimationFrame(() => bugReportTriggerRef.current?.focus());
+  }, []);
+
+  const copyBugReport = async () => {
+    const draft = currentBugReportDraft();
+    if (!draft.ok) {
+      setBugReportError(draft.error);
+      bugReportDescriptionRef.current?.focus();
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(buildBugReportDraft(draft.input).text);
+      setBugReportError(null);
+      setBugReportStatus(
+        "Privacy-safe draft copied. Nothing has been submitted.",
+      );
+    } catch {
+      setBugReportError("This browser could not copy the report. Use Review on GitHub instead.");
+    }
+  };
+
   const requestInactiveRemoval = (playerId: string, trigger: HTMLButtonElement) => {
     utilityTriggerRef.current = trigger;
     setRemoveTargetId(playerId);
@@ -1903,12 +2051,29 @@ export function GameShell({
   const modalOpen =
     Boolean(pendingCard) ||
     testPlayerDialogOpen ||
+    bugReportOpen ||
     inviteDialogOpen ||
     Boolean(publicJoinIntent) ||
     Boolean(listingDialogAction) ||
     Boolean(guideTopic) ||
     Boolean(removeTargetId) ||
     Boolean(chatDialog);
+  const bugReportIssueLink = (() => {
+    if (!bugReportOpen) return { href: null, error: null };
+    const draft = currentBugReportDraft();
+    if (!draft.ok) return { href: null, error: draft.error };
+    try {
+      return { href: buildBugReportIssueUrl(draft.input), error: null };
+    } catch (failure) {
+      return {
+        href: null,
+        error:
+          failure instanceof Error && failure.message === "BUG_REPORT_URL_TOO_LONG"
+            ? "This draft is too long for a safe GitHub link. Shorten the description or use Copy report."
+            : "The public GitHub draft could not be prepared. Use Copy report instead.",
+      };
+    }
+  })();
 
   useEffect(() => {
     if (!pendingCard) return;
@@ -2109,6 +2274,52 @@ export function GameShell({
     };
   }, [chatDialog, closeChatDialog]);
 
+  useEffect(() => {
+    if (!bugReportOpen) return;
+    const dialog = bugReportDialogRef.current;
+    if (!dialog) return;
+    const focusables = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), textarea:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hidden);
+    const frame = window.requestAnimationFrame(() => {
+      (bugReportDescriptionRef.current ?? focusables()[0] ?? dialog).focus();
+    });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeBugReport();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (!items.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items.at(-1)!;
+      if (
+        event.shiftKey &&
+        (document.activeElement === first || !dialog.contains(document.activeElement))
+      ) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [bugReportOpen, closeBugReport]);
+
   if (!session) {
     return (
       <main className="loading-screen" role="status">
@@ -2141,6 +2352,14 @@ export function GameShell({
             onClick={(event) => openGuide("rules", event.currentTarget)}
           >
             Rules &amp; cards
+          </button>
+          <button
+            className="text-button header-issue-button"
+            disabled={busy || Boolean(pendingCard)}
+            aria-haspopup="dialog"
+            onClick={(event) => openBugReport(event.currentTarget)}
+          >
+            Report issue
           </button>
           {session.development ? (
             <button
@@ -2281,7 +2500,7 @@ export function GameShell({
                 ) : null}
                 {game.legalActions.canDrawUntilPlayable ? (
                   <button className="primary-button" disabled={actionPending} onClick={() => void sendCommand({ type: "draw_until_playable" })}>
-                    Draw until playable
+                    Your turn — draw until playable
                   </button>
                 ) : null}
                 {game.legalActions.canDeclareUno ? (
@@ -2976,6 +3195,154 @@ export function GameShell({
         </div>
       ) : null}
 
+      {bugReportOpen ? (
+        <div
+          ref={bugReportDialogRef}
+          className="choice-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="bug-report-title"
+          aria-describedby="bug-report-privacy-note"
+          tabIndex={-1}
+        >
+          <div className="choice-panel bug-report-panel">
+            <span className="eyebrow">Game issue report</span>
+            <h2 id="bug-report-title">Tell us what went wrong</h2>
+            <p id="bug-report-privacy-note" className="bug-report-privacy-note">
+              Do not include personal information, account or player names, table codes,
+              game links or IDs, chat messages, screenshots, private cards, or card IDs.
+              Describe cards by their visible label, such as Wild Color Roulette.
+            </p>
+
+            <fieldset className="bug-report-categories">
+              <legend>What kind of issue is this?</legend>
+              {BUG_REPORT_CATEGORIES.map((category) => (
+                <label key={category.id}>
+                  <input
+                    type="radio"
+                    name="bug-report-category"
+                    value={category.id}
+                    checked={bugReportCategory === category.id}
+                    onChange={() => {
+                      setBugReportCategory(category.id);
+                      setBugReportError(null);
+                    }}
+                  />
+                  <span>{category.label}</span>
+                </label>
+              ))}
+            </fieldset>
+
+            <label className="bug-report-description" htmlFor="bug-report-description">
+              <span>What happened, and what did you expect?</span>
+              <textarea
+                ref={bugReportDescriptionRef}
+                id="bug-report-description"
+                value={bugReportDescription}
+                minLength={10}
+                rows={6}
+                required
+                aria-invalid={Boolean(bugReportError)}
+                aria-describedby="bug-report-description-hint bug-report-feedback"
+                placeholder="Example: After I played Wild Color Roulette, both players appeared to be waiting. I expected the other player to choose a color."
+                onChange={(event) => {
+                  setBugReportDescription(
+                    Array.from(event.target.value.normalize("NFKC"))
+                      .slice(0, BUG_REPORT_DESCRIPTION_MAX_LENGTH)
+                      .join(""),
+                  );
+                  setBugReportError(null);
+                  setBugReportStatus(null);
+                }}
+              />
+              <span id="bug-report-description-hint" className="bug-report-description-meta">
+                <span>Use general terms—never paste a link, table code, or identifier.</span>
+                <span>{Array.from(bugReportDescription.normalize("NFKC")).length}/{BUG_REPORT_DESCRIPTION_MAX_LENGTH}</span>
+              </span>
+            </label>
+
+            <details className="bug-report-diagnostics">
+              <summary>Safe diagnostics included</summary>
+              <p>
+                Only game phase, rules/protocol versions, connection and turn flags, public
+                counts/colors, fixed action IDs, viewport size, and up to three event kinds.
+                No names, table/game/card IDs, messages, screenshots, or private hand data.
+              </p>
+              {bugReportDiagnostics ? (
+                <dl>
+                  <div><dt>Phase</dt><dd>{bugReportDiagnostics.phase}</dd></div>
+                  <div><dt>Revision</dt><dd>{bugReportDiagnostics.revision ?? "none"}</dd></div>
+                  <div><dt>Connection</dt><dd>{bugReportDiagnostics.connection}</dd></div>
+                  <div><dt>Current turn is yours</dt><dd>{bugReportDiagnostics.currentTurnIsSelf === null ? "not applicable" : bugReportDiagnostics.currentTurnIsSelf ? "yes" : "no"}</dd></div>
+                  <div><dt>Roulette choice</dt><dd>{bugReportDiagnostics.rouletteChoice}</dd></div>
+                  <div><dt>Available actions</dt><dd>{bugReportDiagnostics.legalActions.join(", ") || "none"}</dd></div>
+                </dl>
+              ) : null}
+            </details>
+
+            <p className="bug-report-github-note">
+              A GitHub issue is public, and your GitHub identity will be visible if you submit.
+              Review opens a prefilled draft in a new tab. Nothing is submitted until you
+              review it on GitHub and choose Submit new issue.
+            </p>
+            <p className="bug-report-security-note">
+              Security, privacy, sign-in, authentication, or private-hand vulnerabilities
+              must not be posted as public issues. Use the repository&apos;s{" "}
+              <a
+                href="https://github.com/NiyiOke/open-shed-card-engine/security/policy"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                private security policy <span aria-hidden="true">↗</span>
+              </a>
+              .
+            </p>
+            <div id="bug-report-feedback" className="bug-report-feedback" aria-live="polite">
+              {bugReportError ? <p className="field-error" role="alert">{bugReportError}</p> : null}
+              {bugReportStatus ? <p role="status">{bugReportStatus}</p> : null}
+            </div>
+            <div className="dialog-actions bug-report-actions">
+              <button type="button" className="secondary-button" onClick={closeBugReport}>
+                Cancel
+              </button>
+              <button type="button" className="secondary-button" onClick={() => void copyBugReport()}>
+                Copy report
+              </button>
+              {bugReportIssueLink.href ? (
+                <a
+                  className="primary-button acid"
+                  href={bugReportIssueLink.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => {
+                    setBugReportError(null);
+                    setBugReportStatus(
+                      "Public GitHub draft requested. Nothing has been submitted by Open Shed.",
+                    );
+                  }}
+                >
+                  Review public draft on GitHub (opens in new tab)
+                </a>
+              ) : (
+                <button
+                  type="button"
+                  className="primary-button acid"
+                  onClick={() => {
+                    setBugReportStatus(null);
+                    setBugReportError(
+                      bugReportIssueLink.error ?? "Complete the report before opening GitHub.",
+                    );
+                    bugReportDescriptionRef.current?.focus();
+                  }}
+                >
+                  Review public draft on GitHub (opens in new tab)
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {chatDialog ? (
         <div
           ref={chatDialogRef}
@@ -3119,6 +3486,12 @@ export function GameShell({
           <div className="choice-panel">
             <span className="eyebrow">Complete your play</span>
             <h2 id="play-choice-title">{cardLabel(pendingCard)}</h2>
+            {pendingCard.kind === "wild_color_roulette" ? (
+              <p className="roulette-choice-note">
+                The next player—not you—chooses the color and draws until it appears. Their
+                turn is skipped.
+              </p>
+            ) : null}
             {isWild(pendingCard) && pendingCard.kind !== "wild_color_roulette" ? (
               <fieldset>
                 <legend>Continuing color</legend>
@@ -3479,10 +3852,20 @@ function getTurnCoach(
   }
 
   const isSelfTurn = game.currentPlayerId === selfPlayerId;
-  if (game.legalActions.canChooseRouletteColor) {
+  if (game.rouletteTargetId) {
+    if (game.legalActions.canChooseRouletteColor) {
+      return {
+        title: "Choose your Roulette color",
+        detail: "Cards reveal until that color appears. You take the full revealed batch and lose this turn.",
+        tone: "urgent",
+      };
+    }
+    const rouletteTarget = game.players.find(
+      (player) => player.playerId === game.rouletteTargetId,
+    );
     return {
-      title: "Choose your Roulette color",
-      detail: "Cards reveal until that color appears. You take the full revealed batch.",
+      title: `${rouletteTarget?.displayName ?? "The next player"} must choose the Roulette color`,
+      detail: "The player who played Color Roulette does not choose. The target draws until that color appears and loses this turn.",
       tone: "urgent",
     };
   }
@@ -3502,8 +3885,10 @@ function getTurnCoach(
   }
   if (game.legalActions.canDrawUntilPlayable) {
     return {
-      title: "No match — draw to a playable card",
-      detail: "The server stops at the first playable card, then asks you to play it.",
+      title: "Your turn — draw until playable",
+      detail: game.activeColor
+        ? `No card in your hand matches ${game.activeColor}. The server stops at the first playable card, then asks you to play it.`
+        : "No card in your hand matches. The server stops at the first playable card, then asks you to play it.",
       tone: "active",
     };
   }
