@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { cardLabel, isWild } from "../../lib/game/deck";
 import {
   COLORS,
@@ -10,6 +17,7 @@ import {
   type GameView,
 } from "../../lib/game/types";
 import type { LobbySummary } from "../../lib/server/game-store";
+import { CardFace } from "./CardFace";
 import { GameTableCanvas } from "./GameTableCanvas";
 
 type Session = {
@@ -61,12 +69,20 @@ export function GameShell({
   const [chosenColor, setChosenColor] = useState<CardColor | null>(null);
   const [swapTargetId, setSwapTargetId] = useState<string | null>(null);
   const [declareWithPlay, setDeclareWithPlay] = useState(false);
+  const [testPlayerDialogOpen, setTestPlayerDialogOpen] = useState(false);
+  const [testPlayerName, setTestPlayerName] = useState("");
+  const [testPlayerNameError, setTestPlayerNameError] = useState<string | null>(null);
+  const [switchingTestPlayer, setSwitchingTestPlayer] = useState(false);
   const gameRef = useRef<GameView | null>(null);
   const eventCursorRef = useRef<{ gameId: string; revision: number } | null>(null);
   const pollRequestRef = useRef<PollRequest | null>(null);
   const deepLinkInFlight = useRef<string | null>(null);
   const choiceDialogRef = useRef<HTMLDivElement>(null);
   const choiceTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const testPlayerDialogRef = useRef<HTMLDivElement>(null);
+  const testPlayerInputRef = useRef<HTMLInputElement>(null);
+  const testPlayerTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const testPlayerSwitchingRef = useRef(false);
   const testClock = useRef(0);
   const [reconnectTick, setReconnectTick] = useState(0);
 
@@ -480,14 +496,44 @@ export function GameShell({
     if (left) openLobbyBrowser();
   };
 
-  const switchLocalPlayer = () => {
-    const name = window.prompt("Local test player name", nickname || "Player");
-    if (!name) return;
-    localStorage.setItem(
-      "open-shed-dev-identity",
-      JSON.stringify({ id: crypto.randomUUID(), name: name.slice(0, 28) }),
-    );
-    window.location.reload();
+  const openTestPlayerDialog = (trigger: HTMLButtonElement) => {
+    if (pendingCard || testPlayerDialogOpen || busy) return;
+    testPlayerTriggerRef.current = trigger;
+    setTestPlayerName(nickname || session?.displayName || "Player");
+    setTestPlayerNameError(null);
+    setTestPlayerDialogOpen(true);
+  };
+
+  const closeTestPlayerDialog = useCallback(() => {
+    setTestPlayerDialogOpen(false);
+    setTestPlayerNameError(null);
+    window.requestAnimationFrame(() => testPlayerTriggerRef.current?.focus());
+  }, []);
+
+  const switchLocalPlayer = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (testPlayerSwitchingRef.current) return;
+    const name = testPlayerName.trim().replace(/\s+/g, " ");
+    if (!name) {
+      setTestPlayerNameError("Enter a player name.");
+      testPlayerInputRef.current?.focus();
+      return;
+    }
+    testPlayerSwitchingRef.current = true;
+    setSwitchingTestPlayer(true);
+    setTestPlayerNameError(null);
+    try {
+      localStorage.setItem(
+        "open-shed-dev-identity",
+        JSON.stringify({ id: crypto.randomUUID(), name: name.slice(0, 28) }),
+      );
+      window.location.reload();
+    } catch {
+      testPlayerSwitchingRef.current = false;
+      setSwitchingTestPlayer(false);
+      setTestPlayerNameError("This browser could not save the test player. Try again.");
+      testPlayerInputRef.current?.focus();
+    }
   };
 
   const completePendingPlay = () => {
@@ -549,6 +595,7 @@ export function GameShell({
       : false,
     [game, pendingCard, swapTargetId],
   );
+  const modalOpen = Boolean(pendingCard) || testPlayerDialogOpen;
 
   useEffect(() => {
     if (!pendingCard) return;
@@ -593,6 +640,50 @@ export function GameShell({
     };
   }, [closePendingChoice, pendingCard]);
 
+  useEffect(() => {
+    if (!testPlayerDialogOpen) return;
+    const dialog = testPlayerDialogRef.current;
+    if (!dialog) return;
+    const focusables = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hidden);
+    const frame = window.requestAnimationFrame(() => {
+      testPlayerInputRef.current?.focus();
+      testPlayerInputRef.current?.select();
+    });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeTestPlayerDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (!items.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items.at(-1)!;
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeTestPlayerDialog, testPlayerDialogOpen]);
+
   if (!session) {
     return (
       <main className="loading-screen" role="status">
@@ -608,7 +699,7 @@ export function GameShell({
 
   return (
     <main className="open-shed-app">
-      <header className="app-header" inert={pendingCard ? true : undefined}>
+      <header className="app-header" inert={modalOpen ? true : undefined}>
         <button className="wordmark" onClick={openLobbyBrowser} aria-label="Open lobby browser">
           <span>OPEN</span>
           <span>SHED</span>
@@ -620,7 +711,14 @@ export function GameShell({
         <div className="header-account">
           <span>{nickname || session.displayName}</span>
           {session.development ? (
-            <button className="text-button" onClick={switchLocalPlayer}>Switch test player</button>
+            <button
+              id="switch-test-player-button"
+              className="text-button"
+              disabled={busy || Boolean(pendingCard)}
+              onClick={(event) => openTestPlayerDialog(event.currentTarget)}
+            >
+              Switch test player
+            </button>
           ) : (
             <a className="text-button" href="/signout-with-chatgpt?return_to=/">Sign out</a>
           )}
@@ -628,31 +726,31 @@ export function GameShell({
       </header>
 
       {error ? (
-        <div className="error-banner" role="alert" inert={pendingCard ? true : undefined}>
+        <div className="error-banner" role="alert" inert={modalOpen ? true : undefined}>
           <span>{error}</span>
           <button onClick={() => setError(null)} aria-label="Dismiss error">×</button>
         </div>
       ) : null}
 
-      {!game ? (
-        <LobbyBrowser
-          nickname={nickname}
-          setNickname={setNickname}
-          joinCode={joinCode}
-          setJoinCode={setJoinCode}
-          lobbies={lobbies}
-          busy={busy}
-          createLobby={() => void createLobby()}
-          joinLobby={(code) => void joinLobby(code)}
-          openGame={(id) => void openGame(id)}
-          refresh={() => void loadLobbies()}
-        />
-      ) : (
-        <section
-          className="game-layout"
-          aria-label="Current multiplayer game"
-          inert={pendingCard ? true : undefined}
-        >
+      <div className="app-view" inert={modalOpen ? true : undefined}>
+        {!game ? (
+          <LobbyBrowser
+            nickname={nickname}
+            setNickname={setNickname}
+            joinCode={joinCode}
+            setJoinCode={setJoinCode}
+            lobbies={lobbies}
+            busy={busy}
+            createLobby={() => void createLobby()}
+            joinLobby={(code) => void joinLobby(code)}
+            openGame={(id) => void openGame(id)}
+            refresh={() => void loadLobbies()}
+          />
+        ) : (
+          <section
+            className="game-layout"
+            aria-label="Current multiplayer game"
+          >
           <aside className="game-sidebar">
             <div className="room-block">
               <span className="eyebrow">Lobby code</span>
@@ -805,25 +903,85 @@ export function GameShell({
                   {game.hand.map((card) => {
                     const playable = game.legalActions.playableCardIds.includes(card.id);
                     return (
-                      <button
+                      <CardFace
                         key={card.id}
-                        className={`playing-card ${card.color ? `card-${card.color}` : "card-wild"} ${playable ? "is-playable" : ""}`}
-                        disabled={busy || !playable}
-                        onClick={(event) => selectCard(card, event.currentTarget)}
-                        aria-label={`${cardLabel(card)}${playable ? ", playable" : ", not playable"}`}
-                      >
-                        <span className="card-corner">{shortCardLabel(card)}</span>
-                        <strong>{card.kind === "number" ? card.number : actionCardGlyph(card)}</strong>
-                        <span>{cardLabel(card)}</span>
-                      </button>
+                        card={card}
+                        variant="hand"
+                        interaction={{
+                          kind: "play",
+                          playable,
+                          pending: busy,
+                          onActivate: selectCard,
+                        }}
+                      />
                     );
                   })}
                 </div>
               </div>
             ) : null}
           </div>
-        </section>
-      )}
+          </section>
+        )}
+      </div>
+
+      {testPlayerDialogOpen ? (
+        <div
+          ref={testPlayerDialogRef}
+          className="choice-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="test-player-title"
+          aria-describedby="test-player-description"
+          tabIndex={-1}
+        >
+          <div className="choice-panel">
+            <span className="eyebrow">Local development</span>
+            <h2 id="test-player-title">Switch test player</h2>
+            <p id="test-player-description" className="dialog-copy">
+              Choose a name for a fresh local identity. The page will reload outside the current player&apos;s seat.
+            </p>
+            <form onSubmit={switchLocalPlayer}>
+              <label className="input-label dialog-input" htmlFor="test-player-name">
+                <span>Player name</span>
+                <input
+                  ref={testPlayerInputRef}
+                  id="test-player-name"
+                  name="test-player-name"
+                  type="text"
+                  autoComplete="off"
+                  maxLength={28}
+                  aria-required="true"
+                  aria-invalid={Boolean(testPlayerNameError)}
+                  aria-describedby={testPlayerNameError ? "test-player-name-error" : undefined}
+                  value={testPlayerName}
+                  onChange={(event) => {
+                    setTestPlayerName(event.target.value);
+                    if (testPlayerNameError) setTestPlayerNameError(null);
+                  }}
+                />
+                {testPlayerNameError ? (
+                  <span id="test-player-name-error" className="field-error" role="alert">
+                    {testPlayerNameError}
+                  </span>
+                ) : null}
+              </label>
+              <div className="dialog-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={switchingTestPlayer}
+                  onClick={closeTestPlayerDialog}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="primary-button" disabled={switchingTestPlayer}>
+                  {switchingTestPlayer ? "Switching…" : "Switch player"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
 
       {pendingCard ? (
         <div
@@ -1095,30 +1253,4 @@ function getLocalIdentity(): { id: string; name: string } | null {
 
 function commandId(): string {
   return `cmd_${crypto.randomUUID().replaceAll("-", "_")}`;
-}
-
-function shortCardLabel(card: Card): string {
-  if (card.kind === "number") return String(card.number);
-  if (card.kind === "draw_two") return "+2";
-  if (card.kind === "draw_four" || card.kind === "wild_reverse_draw_four") return "+4";
-  if (card.kind === "wild_draw_six") return "+6";
-  if (card.kind === "wild_draw_ten") return "+10";
-  if (card.kind === "skip") return "SKIP";
-  if (card.kind === "reverse") return "REV";
-  if (card.kind === "discard_all") return "ALL";
-  if (card.kind === "skip_everyone") return "ALL↷";
-  return "COLOR";
-}
-
-function actionCardGlyph(card: Card): string {
-  if (drawLike(card)) return shortCardLabel(card);
-  if (card.kind === "reverse") return "↻";
-  if (card.kind === "skip" || card.kind === "skip_everyone") return "⊘";
-  if (card.kind === "discard_all") return "≋";
-  if (card.kind === "wild_color_roulette") return "◉";
-  return "•";
-}
-
-function drawLike(card: Card) {
-  return ["draw_two", "draw_four", "wild_reverse_draw_four", "wild_draw_six", "wild_draw_ten"].includes(card.kind);
 }

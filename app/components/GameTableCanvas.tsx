@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import { cardLabel } from "../../lib/game/deck";
 import type { GameView } from "../../lib/game/types";
+import { CardBack, CardFace } from "./CardFace";
 
 export function GameTableCanvas({ game }: { game: GameView | null }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -33,12 +34,26 @@ export function GameTableCanvas({ game }: { game: GameView | null }) {
   }, [game]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      className="game-canvas"
-      role="img"
-      aria-label={gameTableLabel(game)}
-    />
+    <div className="game-table-surface" role="img" aria-label={gameTableLabel(game)}>
+      <canvas ref={canvasRef} className="game-canvas" aria-hidden="true" />
+      {game && game.phase !== "lobby" ? (
+        <div className="table-piles" aria-hidden="true">
+          <div className="table-card-slot table-card-slot--draw">
+            <CardBack count={game.drawPileCount} />
+          </div>
+          {game.topDiscard ? (
+            <div className="table-card-slot table-card-slot--discard">
+              <CardFace
+                card={game.topDiscard}
+                variant="table"
+                activeWildColor={game.activeColor}
+                interaction={{ kind: "static", hiddenFromAssistiveTech: true }}
+              />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -79,55 +94,6 @@ function drawTable(
     return;
   }
 
-  const cardWidth = Math.min(126, width * 0.27);
-  const cardHeight = cardWidth * 1.42;
-  const centerX = width / 2;
-  const centerY = height / 2;
-  roundedRect(
-    context,
-    centerX - cardWidth - 30,
-    centerY - cardHeight / 2,
-    cardWidth,
-    cardHeight,
-    15,
-  );
-  context.fillStyle = "#151515";
-  context.fill();
-  context.strokeStyle = "#151515";
-  context.lineWidth = 2;
-  context.stroke();
-  context.fillStyle = "#f6f1e8";
-  context.font = `800 ${Math.max(12, cardWidth * 0.11)}px Geist, sans-serif`;
-  context.textAlign = "center";
-  context.fillText("DRAW", centerX - cardWidth / 2 - 30, centerY - 4);
-  context.font = `600 ${Math.max(11, cardWidth * 0.1)}px Geist Mono, monospace`;
-  context.fillText(`${game.drawPileCount}`, centerX - cardWidth / 2 - 30, centerY + 19);
-
-  const top = game.topDiscard;
-  const color = top?.color ?? game.activeColor;
-  roundedRect(
-    context,
-    centerX + 30,
-    centerY - cardHeight / 2,
-    cardWidth,
-    cardHeight,
-    15,
-  );
-  context.fillStyle = canvasCardColor(color);
-  context.fill();
-  context.strokeStyle = "#151515";
-  context.stroke();
-  context.fillStyle = color === "yellow" || color === "green" ? "#151515" : "#ffffff";
-  context.font = `800 ${Math.max(13, cardWidth * 0.105)}px Geist, sans-serif`;
-  wrapCenteredText(
-    context,
-    top ? cardLabel(top).toUpperCase() : "NO DISCARD",
-    centerX + 30 + cardWidth / 2,
-    centerY - 5,
-    cardWidth - 18,
-    Math.max(15, cardWidth * 0.13),
-  );
-
   context.fillStyle = "#151515";
   context.font = "700 12px Geist Mono, monospace";
   context.textAlign = "left";
@@ -142,14 +108,6 @@ function drawTable(
     width - 18,
     26,
   );
-}
-
-function canvasCardColor(color: GameView["activeColor"]): string {
-  if (color === "red") return "#d93a22";
-  if (color === "yellow") return "#f2d529";
-  if (color === "green") return "#7cae35";
-  if (color === "blue") return "#2f4bff";
-  return "#151515";
 }
 
 function gameTableLabel(game: GameView | null): string {
@@ -167,41 +125,4 @@ function gameTableLabel(game: GameView | null): string {
     game.pendingDraw ? `The pending draw penalty is ${game.pendingDraw.total}.` : null,
   ];
   return parts.filter(Boolean).join(" ");
-}
-
-function roundedRect(
-  context: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-  radius: number,
-) {
-  context.beginPath();
-  context.roundRect(x, y, width, height, radius);
-}
-
-function wrapCenteredText(
-  context: CanvasRenderingContext2D,
-  text: string,
-  x: number,
-  y: number,
-  maxWidth: number,
-  lineHeight: number,
-) {
-  const words = text.split(" ");
-  const lines: string[] = [];
-  let line = "";
-  for (const word of words) {
-    const test = line ? `${line} ${word}` : word;
-    if (context.measureText(test).width > maxWidth && line) {
-      lines.push(line);
-      line = word;
-    } else {
-      line = test;
-    }
-  }
-  lines.push(line);
-  const startY = y - ((lines.length - 1) * lineHeight) / 2;
-  lines.forEach((entry, index) => context.fillText(entry, x, startY + index * lineHeight));
 }
