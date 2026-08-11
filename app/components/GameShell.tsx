@@ -19,6 +19,7 @@ import {
 import type { LobbySummary } from "../../lib/server/game-store";
 import { CardFace } from "./CardFace";
 import { GameTableCanvas } from "./GameTableCanvas";
+import { SignedOutLanding } from "./SignedOutLanding";
 
 type Session = {
   signedIn: boolean;
@@ -54,8 +55,10 @@ declare global {
 
 export function GameShell({
   initialSession,
+  signInPath,
 }: {
   initialSession: Session | null;
+  signInPath: string;
 }) {
   const [session, setSession] = useState<Session | null>(initialSession);
   const [lobbies, setLobbies] = useState<Lobbies>({ mine: [] });
@@ -694,7 +697,7 @@ export function GameShell({
   }
 
   if (!session.signedIn) {
-    return <SignedOutLanding />;
+    return <SignedOutLanding signInPath={signInPath} />;
   }
 
   return (
@@ -1165,36 +1168,6 @@ function RoomCard({ room, actionLabel, action }: { room: LobbySummary; actionLab
       <span>{room.hostName} · {room.playerCount}/6 players</span>
       <button className="secondary-button" onClick={action}>{actionLabel}</button>
     </article>
-  );
-}
-
-function SignedOutLanding() {
-  return (
-    <main className="signed-out-page">
-      <header className="public-header"><span className="public-wordmark">OPEN SHED</span><span>FOUNDATION / 01</span></header>
-      <section className="public-hero">
-        <div>
-          <span className="eyebrow">Online multiplayer card engine</span>
-          <h1>Multiplayer,<br /><em>rules first.</em></h1>
-          <p>A durable, server-authoritative baseline for 2–6 players. Lobbies, private hands, complete Mercy logic, and reconnect-safe turns are ready before the spectacle arrives.</p>
-          <a className="primary-button sign-in-button" href="/signin-with-chatgpt?return_to=/">Sign in to play <span>↗</span></a>
-        </div>
-        <div className="public-system-map" aria-label="Game foundation layers">
-          <span className="map-node map-lobby">LOBBY</span>
-          <span className="map-node map-rules">RULES</span>
-          <span className="map-node map-state">STATE</span>
-          <span className="map-node map-clients">2–6 PLAYERS</span>
-          <span className="map-line line-one" /><span className="map-line line-two" /><span className="map-line line-three" />
-          <strong>SERVER<br />AUTHORITY</strong>
-        </div>
-      </section>
-      <section className="public-features">
-        <article><span>01</span><strong>Create and join</strong><p>Shareable six-character rooms with ready state and stable seats.</p></article>
-        <article><span>02</span><strong>Play the full logic</strong><p>Stacking, Mercy, 0/7, Roulette, every action card, and UNO catches.</p></article>
-        <article><span>03</span><strong>Grow by modules</strong><p>Versioned rules and transport boundaries leave room for chat, sound, video, and new modes.</p></article>
-      </section>
-      <footer className="public-footer">Original code and visual system. No commercial card artwork or assets.</footer>
-    </main>
   );
 }
 

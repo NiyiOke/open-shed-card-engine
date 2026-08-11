@@ -18,9 +18,9 @@ export async function generateMetadata(): Promise<Metadata> {
   const host = requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host");
   const protocol = requestHeaders.get("x-forwarded-proto") ?? "https";
   const base = host ? new URL(`${protocol}://${host}`) : new URL("http://localhost:3000");
-  const title = "Open Shed — Multiplayer, rules first";
+  const title = "Open Shed — Online multiplayer card game";
   const description =
-    "A server-authoritative online shedding-card game foundation with durable lobbies, private hands, and a complete Mercy ruleset.";
+    "Shed your hand, stack draw penalties, and survive the Mercy limit in a complete 2–6 player online card game.";
   return {
     metadataBase: base,
     title,
