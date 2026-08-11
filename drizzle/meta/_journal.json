@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1786437860796,
+      "tag": "0000_ordinary_sheva_callister",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1786439773144,
+      "tag": "0001_tense_scorpion",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786439983238,
+      "tag": "0002_foamy_sage",
+      "breakpoints": true
+    }
+  ]
+}
