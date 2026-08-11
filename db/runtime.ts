@@ -30,6 +30,10 @@ async function initialize(database: D1Database): Promise<void> {
       rules_version TEXT NOT NULL,
       protocol_version INTEGER NOT NULL,
       status TEXT NOT NULL,
+      room_status TEXT NOT NULL DEFAULT 'open',
+      closed_at INTEGER,
+      close_reason TEXT,
+      abandoned_since INTEGER,
       version INTEGER NOT NULL DEFAULT 0,
       state_json TEXT NOT NULL,
       state_hash TEXT NOT NULL,
@@ -51,12 +55,22 @@ async function initialize(database: D1Database): Promise<void> {
       status TEXT NOT NULL,
       joined_at INTEGER NOT NULL,
       left_at INTEGER,
+      public_discovery_consent_at INTEGER,
+      join_source TEXT,
       PRIMARY KEY (game_id, profile_id)
     )`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_game_members_seat
       ON game_members(game_id, seat)`,
     `CREATE INDEX IF NOT EXISTS idx_game_members_profile
       ON game_members(profile_id)`,
+    `CREATE TABLE IF NOT EXISTS profile_blocks (
+      blocker_profile_id TEXT NOT NULL,
+      blocked_profile_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (blocker_profile_id, blocked_profile_id)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_profile_blocks_blocked
+      ON profile_blocks(blocked_profile_id)`,
     `CREATE TABLE IF NOT EXISTS game_presence (
       game_id TEXT NOT NULL,
       player_id TEXT NOT NULL,
@@ -107,5 +121,69 @@ async function initialize(database: D1Database): Promise<void> {
   await database.batch(
     statements.map((statement) => database.prepare(statement)),
   );
+  await ensureColumn(
+    database,
+    "games",
+    "room_status",
+    "ALTER TABLE games ADD COLUMN room_status TEXT NOT NULL DEFAULT 'open'",
+  );
+  await ensureColumn(
+    database,
+    "games",
+    "closed_at",
+    "ALTER TABLE games ADD COLUMN closed_at INTEGER",
+  );
+  await ensureColumn(
+    database,
+    "games",
+    "close_reason",
+    "ALTER TABLE games ADD COLUMN close_reason TEXT",
+  );
+  await ensureColumn(
+    database,
+    "games",
+    "abandoned_since",
+    "ALTER TABLE games ADD COLUMN abandoned_since INTEGER",
+  );
+  await ensureColumn(
+    database,
+    "game_members",
+    "public_discovery_consent_at",
+    "ALTER TABLE game_members ADD COLUMN public_discovery_consent_at INTEGER",
+  );
+  await ensureColumn(
+    database,
+    "game_members",
+    "join_source",
+    "ALTER TABLE game_members ADD COLUMN join_source TEXT",
+  );
+  await database
+    .prepare(
+      `CREATE INDEX IF NOT EXISTS idx_games_room_status_abandoned
+       ON games(room_status, abandoned_since)`,
+    )
+    .run();
   await database.prepare("PRAGMA optimize").run();
+}
+
+async function ensureColumn(
+  database: D1Database,
+  table: "games" | "game_members",
+  column: string,
+  alterStatement: string,
+): Promise<void> {
+  const columns = await database
+    .prepare(`PRAGMA table_info(${table})`)
+    .all<{ name: string }>();
+  if (columns.results.some((entry) => entry.name === column)) return;
+  try {
+    await database.prepare(alterStatement).run();
+  } catch (error) {
+    // Another isolate may have initialized the same legacy database first.
+    const refreshed = await database
+      .prepare(`PRAGMA table_info(${table})`)
+      .all<{ name: string }>();
+    if (refreshed.results.some((entry) => entry.name === column)) return;
+    throw error;
+  }
 }

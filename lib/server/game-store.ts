@@ -22,6 +22,15 @@ import {
   presencePlayer,
   type PresenceSnapshot,
 } from "./presence-policy";
+import {
+  ABANDONED_WAITING_ROOM_CLOSE_AFTER_MS,
+  evaluateWaitingRoomLifecycle,
+  PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+  roomTombstoneExpiresAt,
+  type PersistedGameStatus,
+  type RoomCloseReason,
+  type RoomStatus,
+} from "./room-lifecycle-policy";
 
 type ProfileRow = {
   id: string;
@@ -39,7 +48,23 @@ type GameRow = {
   version: number;
   state_json: string;
   state_hash: string;
+  room_status: RoomStatus;
+  closed_at: number | null;
+  close_reason: RoomCloseReason | null;
+  abandoned_since: number | null;
+  last_activity_at: number;
   expires_at: number;
+};
+
+type LifecyclePresenceRow = {
+  last_seen_at: number | null;
+};
+
+type RoomLifecycleUpdate = {
+  roomStatus: RoomStatus;
+  closedAt: number | null;
+  closeReason: RoomCloseReason | null;
+  abandonedSince: number | null;
 };
 
 type CommandReceiptRow = {
@@ -88,11 +113,21 @@ const LOBBY_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const ACTIVE_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
 const PURGE_INTERVAL_MS = 60_000;
 const PURGE_BATCH_SIZE = 12;
+const ROOM_MAINTENANCE_INTERVAL_MS = 15_000;
+const ROOM_MAINTENANCE_BATCH_SIZE = 12;
 const EVENT_FEED_TAIL = 8;
 const EVENT_FEED_PAGE = 12;
+const OPEN_ROOM_LIFECYCLE: RoomLifecycleUpdate = Object.freeze({
+  roomStatus: "open",
+  closedAt: null,
+  closeReason: null,
+  abandonedSince: null,
+});
 
 let lastPurgeAt = 0;
 let purgePromise: Promise<void> | null = null;
+let lastRoomMaintenanceAt = 0;
+let roomMaintenancePromise: Promise<void> | null = null;
 
 export async function createGame(
   user: AuthenticatedUser,
@@ -101,7 +136,7 @@ export async function createGame(
 ): Promise<GameView> {
   const database = await ensureDatabaseSchema();
   const now = Date.now();
-  await maybePurgeExpiredGames(database, now);
+  await maintainRooms(database, now);
   const profile = await getOrCreateProfile(user, nickname, database, now);
   const operation = "create_game";
   const requestHash = await hashText(
@@ -170,8 +205,8 @@ export async function createGame(
         database
           .prepare(
             `INSERT INTO game_members (
-              game_id, profile_id, seat, role, status, joined_at
-            ) VALUES (?, ?, 0, 'host', 'active', ?)`,
+              game_id, profile_id, seat, role, status, joined_at, join_source
+            ) VALUES (?, ?, 0, 'host', 'active', ?, 'host')`,
           )
           .bind(gameId, profile.id, now),
         presenceUpsertStatement(
@@ -236,7 +271,7 @@ export async function joinGame(
   const joinCode = normalizeJoinCode(joinCodeInput);
   const database = await ensureDatabaseSchema();
   const now = Date.now();
-  await maybePurgeExpiredGames(database, now);
+  await maintainRooms(database, now);
   const profile = await getOrCreateProfile(user, nickname, database, now);
   const operation = "join_game";
   const requestHash = await hashText(
@@ -265,13 +300,16 @@ export async function joinGame(
     const row = await database
       .prepare(
         `SELECT id, join_code, host_profile_id, rules_version, protocol_version,
-                status, version, state_json, state_hash, expires_at
+                status, version, state_json, state_hash, room_status,
+                closed_at, close_reason, abandoned_since, last_activity_at,
+                expires_at
          FROM games WHERE join_code = ? LIMIT 1`,
       )
       .bind(joinCode)
       .first<GameRow>();
     requireRule(row, "LOBBY_NOT_FOUND", "No lobby uses that code.", 404);
     requireRule(row.expires_at > now, "LOBBY_EXPIRED", "That lobby has expired.", 410);
+    requireOpenRoom(row, "That room is closed and cannot be joined.");
     if (!quotaCharged) {
       await enforceMutationQuota(database, now, [
         {
@@ -292,32 +330,41 @@ export async function joinGame(
       now,
     });
     if (result.replayed) {
+      const joined = current.players.find(
+        (player) => player.userId === user.userId,
+      )!;
       try {
         await database.batch([
-          membershipUpsertStatement(
+          guardedReceiptStatement(
             database,
-            current,
-            profile,
-            current.players.find((player) => player.userId === user.userId)!,
-            now,
-          ),
-          presenceUpsertStatement(
-            database,
-            row.id,
-            current.players.find((player) => player.userId === user.userId)!
-              .playerId,
-            profile.id,
-            now,
-          ),
-          receiptStatement(
-            database,
+            row,
             profile.id,
             commandId,
-            row.id,
             operation,
             requestHash,
             current.revision,
             now,
+          ),
+          guardedMembershipUpsertStatement(
+            database,
+            row.id,
+            profile,
+            joined,
+            now,
+            profile.id,
+            commandId,
+            requestHash,
+            current.hostUserId,
+          ),
+          guardedPresenceUpsertStatement(
+            database,
+            row.id,
+            joined.playerId,
+            profile.id,
+            now,
+            profile.id,
+            commandId,
+            requestHash,
           ),
         ]);
       } catch (error) {
@@ -333,7 +380,17 @@ export async function joinGame(
           joinCode,
         );
       }
-      return projectGameForUser(current, user.userId);
+      const receipt = await findCommandReceipt(database, profile.id, commandId);
+      if (!receipt) continue;
+      return viewFromReceipt(
+        database,
+        receipt,
+        user,
+        operation,
+        requestHash,
+        row.id,
+        joinCode,
+      );
     }
 
     const nextJson = JSON.stringify(result.state);
@@ -458,6 +515,8 @@ export async function getGame(
   presence: PresenceSnapshot;
 }> {
   const database = await ensureDatabaseSchema();
+  const now = Date.now();
+  await maintainRooms(database, now);
   const row = await getGameRow(database, gameId);
   const state = await parseAndValidateState(row);
   requireRule(
@@ -469,7 +528,7 @@ export async function getGame(
     403,
   );
   const feed = await readPublicEventFeed(database, gameId, afterRevision);
-  const presence = await buildPresenceSnapshot(database, state, Date.now());
+  const presence = await buildPresenceSnapshot(database, state, now);
   return {
     view: projectGameForUser(state, user.userId),
     events: feed.events,
@@ -483,10 +542,12 @@ export async function getGamePresence(
   gameId: string,
 ): Promise<PresenceSnapshot> {
   const database = await ensureDatabaseSchema();
+  const now = Date.now();
+  await maintainRooms(database, now);
   const row = await getGameRow(database, gameId);
   const state = await parseAndValidateState(row);
   requireCurrentMember(state, user.userId);
-  return buildPresenceSnapshot(database, state, Date.now());
+  return buildPresenceSnapshot(database, state, now);
 }
 
 export async function heartbeatGamePresence(
@@ -495,7 +556,7 @@ export async function heartbeatGamePresence(
 ): Promise<PresenceSnapshot> {
   const database = await ensureDatabaseSchema();
   const now = Date.now();
-  await maybePurgeExpiredGames(database, now);
+  await maintainRooms(database, now);
   const row = await getGameRow(database, gameId);
   const state = await parseAndValidateState(row);
   const player = requireCurrentMember(state, user.userId);
@@ -514,13 +575,25 @@ export async function heartbeatGamePresence(
     },
     { scope: `room:${gameId}:presence`, windowMs: 60_000, limit: 360 },
   ]);
-  const result = await presenceUpsertStatement(
-    database,
-    gameId,
-    player.playerId,
-    profile.id,
-    now,
-  ).run();
+  const [result] = await database.batch([
+    presenceUpsertStatement(
+      database,
+      gameId,
+      player.playerId,
+      profile.id,
+      now,
+    ),
+    database
+      .prepare(
+        `UPDATE games
+         SET abandoned_since = NULL
+         WHERE id = ? AND room_status = 'open'`,
+      )
+      .bind(gameId),
+  ]);
+  if ((result.meta.changes ?? 0) !== 1) {
+    await getGameRow(database, gameId);
+  }
   requireRule(
     (result.meta.changes ?? 0) === 1,
     "NOT_A_MEMBER",
@@ -539,7 +612,7 @@ export async function executeGameCommand(
 ): Promise<{ view: GameView | null; events: GameEvent[]; replayed: boolean }> {
   const database = await ensureDatabaseSchema();
   const now = Date.now();
-  await maybePurgeExpiredGames(database, now);
+  await maintainRooms(database, now);
   const profile = await getOrCreateProfile(
     user,
     user.suggestedName,
@@ -650,9 +723,11 @@ export async function executeGameCommand(
     );
   }
   requireRule(
-    current.phase !== "complete" || command.type === "rematch",
+    current.phase !== "complete" ||
+      command.type === "rematch" ||
+      command.type === "leave_game",
     "GAME_COMPLETE",
-    "This game is already complete. Start a rematch to play again.",
+    "This game is already complete. Start a rematch or leave the table.",
     409,
   );
   const inactiveRemoval = readInactiveRemovalCommand(command);
@@ -670,11 +745,39 @@ export async function executeGameCommand(
     commandId,
     now,
   });
+  const closesEmptyRoom =
+    command.type === "leave_game" &&
+    result.state.players.every((player) => player.status === "left");
+  const roomLifecycle: RoomLifecycleUpdate = closesEmptyRoom
+    ? {
+        roomStatus: "closed",
+        closedAt: now,
+        closeReason: "empty",
+        abandonedSince: null,
+      }
+    : {
+        roomStatus: "open",
+        closedAt: null,
+        closeReason: null,
+        abandonedSince: null,
+      };
+  const persistedEvents: GameEvent[] = closesEmptyRoom
+    ? [
+        ...result.events,
+        {
+          type: "room_closed",
+          actorPlayerId: currentActor?.playerId ?? null,
+          message: "The empty room closed.",
+          data: { reason: "empty" },
+        },
+      ]
+    : result.events;
   const nextJson = JSON.stringify(result.state);
   const nextHash = await hashText(nextJson);
-  const expiresAt =
-    now +
-    (result.state.phase === "lobby" ? LOBBY_LIFETIME_MS : ACTIVE_LIFETIME_MS);
+  const expiresAt = closesEmptyRoom
+    ? roomTombstoneExpiresAt(now)
+    : now +
+      (result.state.phase === "lobby" ? LOBBY_LIFETIME_MS : ACTIVE_LIFETIME_MS);
   const memberProfiles = await profilesForState(database, result.state);
   const memberStatements = result.state.players.map((player) =>
     guardedMembershipUpsertStatement(
@@ -762,7 +865,7 @@ export async function executeGameCommand(
         result.state.revision,
         commandId,
         profile.id,
-        result.events,
+        persistedEvents,
         nextHash,
         now,
         requestHash,
@@ -780,6 +883,7 @@ export async function executeGameCommand(
         profile.id,
         commandId,
         requestHash,
+        roomLifecycle,
       ),
     ]);
     if ((batch.at(-1)?.meta.changes ?? 0) !== 1) {
@@ -799,6 +903,10 @@ export async function executeGameCommand(
           replayed: true,
         };
       }
+      // Surface the terminal lifecycle result when this command lost a race
+      // with automatic closure; otherwise preserve the normal version-conflict
+      // recovery path for an open room.
+      await getGameRow(database, gameId);
       if (inactiveRemoval) {
         try {
           await assertInactiveRemovalAllowed(
@@ -852,7 +960,7 @@ export async function executeGameCommand(
 
   return {
     view: commandViewForUser(result.state, user.userId),
-    events: result.events,
+    events: persistedEvents,
     replayed: result.replayed,
   };
 }
@@ -862,7 +970,7 @@ export async function listLobbies(
 ): Promise<{ mine: LobbySummary[] }> {
   const database = await ensureDatabaseSchema();
   const now = Date.now();
-  await maybePurgeExpiredGames(database, now);
+  await maintainRooms(database, now);
   const profile = await getOrCreateProfile(
     user,
     user.suggestedName,
@@ -874,10 +982,12 @@ export async function listLobbies(
     .prepare(
       `SELECT g.id, g.join_code, g.host_profile_id, g.rules_version,
               g.protocol_version, g.status, g.version, g.state_json,
-              g.state_hash, g.expires_at
+              g.state_hash, g.room_status, g.closed_at, g.close_reason,
+              g.abandoned_since, g.last_activity_at, g.expires_at
        FROM games g
        JOIN game_members m ON m.game_id = g.id
-       WHERE m.profile_id = ? AND m.status <> 'left' AND g.expires_at > ?
+       WHERE m.profile_id = ? AND m.status <> 'left'
+         AND g.room_status = 'open' AND g.expires_at > ?
        ORDER BY g.last_activity_at DESC LIMIT 20`,
     )
     .bind(profile.id, now)
@@ -1054,14 +1164,21 @@ async function getGameRow(database: D1Database, gameId: string): Promise<GameRow
   const row = await database
     .prepare(
       `SELECT id, join_code, host_profile_id, rules_version, protocol_version,
-              status, version, state_json, state_hash, expires_at
+              status, version, state_json, state_hash, room_status,
+              closed_at, close_reason, abandoned_since, last_activity_at,
+              expires_at
        FROM games WHERE id = ? LIMIT 1`,
     )
     .bind(gameId)
     .first<GameRow>();
   requireRule(row, "GAME_NOT_FOUND", "Game not found.", 404);
   requireRule(row.expires_at > Date.now(), "GAME_EXPIRED", "This game has expired.", 410);
+  requireOpenRoom(row, "This room is closed.");
   return row;
+}
+
+function requireOpenRoom(row: GameRow, message: string): void {
+  requireRule(row.room_status === "open", "ROOM_CLOSED", message, 410);
 }
 
 async function findCommandReceipt(
@@ -1149,34 +1266,6 @@ function commandViewForUser(state: GameState, userId: string): GameView | null {
     : null;
 }
 
-function receiptStatement(
-  database: D1Database,
-  profileId: string,
-  commandId: string,
-  gameId: string,
-  operation: string,
-  requestHash: string,
-  resultVersion: number,
-  now: number,
-): D1PreparedStatement {
-  return database
-    .prepare(
-      `INSERT INTO command_receipts (
-        actor_profile_id, command_id, game_id, operation,
-        request_hash, result_version, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(
-      profileId,
-      commandId,
-      gameId,
-      operation,
-      requestHash,
-      resultVersion,
-      now,
-    );
-}
-
 function guardedReceiptStatement(
   database: D1Database,
   row: GameRow,
@@ -1197,6 +1286,7 @@ function guardedReceiptStatement(
       WHERE EXISTS (
         SELECT 1 FROM games
         WHERE id = ? AND version = ? AND state_hash = ?
+          AND room_status = 'open'
       )`,
     )
     .bind(
@@ -1234,6 +1324,7 @@ function guardedInactiveRemovalReceiptStatement(
       WHERE EXISTS (
         SELECT 1 FROM games
         WHERE id = ? AND version = ? AND state_hash = ?
+          AND room_status = 'open'
       )
         AND EXISTS (
           SELECT 1
@@ -1294,6 +1385,7 @@ function guardedEventStatement(
          AND r.command_id = ?
          AND r.request_hash = ?
         WHERE g.id = ? AND g.version = ? AND g.state_hash = ?
+          AND g.room_status = 'open'
       )`,
     )
     .bind(
@@ -1314,35 +1406,6 @@ function guardedEventStatement(
     );
 }
 
-function membershipUpsertStatement(
-  database: D1Database,
-  state: GameState,
-  profile: ProfileRow,
-  player: GameState["players"][number],
-  now: number,
-): D1PreparedStatement {
-  return database
-    .prepare(
-      `INSERT INTO game_members (
-        game_id, profile_id, seat, role, status, joined_at, left_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(game_id, profile_id) DO UPDATE SET
-        seat = excluded.seat,
-        role = excluded.role,
-        status = excluded.status,
-        left_at = excluded.left_at`,
-    )
-    .bind(
-      state.gameId,
-      profile.id,
-      player.seat,
-      state.hostUserId === player.userId ? "host" : "player",
-      player.status,
-      now,
-      player.status === "left" ? now : null,
-    );
-}
-
 function presenceUpsertStatement(
   database: D1Database,
   gameId: string,
@@ -1357,8 +1420,11 @@ function presenceUpsertStatement(
       )
       SELECT ?, ?, ?, ?
       WHERE EXISTS (
-        SELECT 1 FROM game_members
-        WHERE game_id = ? AND profile_id = ? AND status <> 'left'
+        SELECT 1
+        FROM game_members m
+        JOIN games g ON g.id = m.game_id
+        WHERE m.game_id = ? AND m.profile_id = ?
+          AND m.status <> 'left' AND g.room_status = 'open'
       )
       ON CONFLICT(game_id, player_id) DO UPDATE SET
         profile_id = excluded.profile_id,
@@ -1384,8 +1450,11 @@ function guardedPresenceUpsertStatement(
       )
       SELECT ?, ?, ?, ?
       WHERE EXISTS (
-        SELECT 1 FROM game_members
-        WHERE game_id = ? AND profile_id = ? AND status <> 'left'
+        SELECT 1
+        FROM game_members m
+        JOIN games g ON g.id = m.game_id
+        WHERE m.game_id = ? AND m.profile_id = ?
+          AND m.status <> 'left' AND g.room_status = 'open'
       )
         AND EXISTS (
           SELECT 1 FROM command_receipts
@@ -1482,9 +1551,10 @@ function guardedMembershipUpsertStatement(
   return database
     .prepare(
       `INSERT INTO game_members (
-        game_id, profile_id, seat, role, status, joined_at, left_at
+        game_id, profile_id, seat, role, status, joined_at, left_at,
+        join_source
       )
-      SELECT ?, ?, ?, ?, ?, ?, ?
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?
       WHERE EXISTS (
         SELECT 1 FROM command_receipts
         WHERE actor_profile_id = ? AND command_id = ?
@@ -1494,7 +1564,11 @@ function guardedMembershipUpsertStatement(
         seat = excluded.seat,
         role = excluded.role,
         status = excluded.status,
-        left_at = excluded.left_at`,
+        left_at = CASE
+          WHEN game_members.status = 'left' AND excluded.status = 'left'
+            THEN game_members.left_at
+          ELSE excluded.left_at
+        END`,
     )
     .bind(
       gameId,
@@ -1504,6 +1578,7 @@ function guardedMembershipUpsertStatement(
       player.status,
       now,
       player.status === "left" ? now : null,
+      player.userId === hostUserId ? "host" : "invite",
       receiptProfileId,
       commandId,
       gameId,
@@ -1552,6 +1627,7 @@ function guardedGameUpdateStatement(
   receiptProfileId: string,
   commandId: string,
   requestHash: string,
+  roomLifecycle: RoomLifecycleUpdate = OPEN_ROOM_LIFECYCLE,
 ): D1PreparedStatement {
   return database
     .prepare(
@@ -1561,8 +1637,10 @@ function guardedGameUpdateStatement(
              host_profile_id
            ),
            status = ?, version = ?, state_json = ?, state_hash = ?,
-           last_activity_at = ?, expires_at = ?
+           last_activity_at = ?, expires_at = ?, room_status = ?,
+           closed_at = ?, close_reason = ?, abandoned_since = ?
        WHERE id = ? AND version = ? AND state_hash = ?
+         AND room_status = 'open'
          AND EXISTS (
            SELECT 1 FROM command_receipts
            WHERE actor_profile_id = ? AND command_id = ?
@@ -1582,6 +1660,10 @@ function guardedGameUpdateStatement(
       stateHash,
       now,
       expiresAt,
+      roomLifecycle.roomStatus,
+      roomLifecycle.closedAt,
+      roomLifecycle.closeReason,
+      roomLifecycle.abandonedSince,
       row.id,
       row.version,
       row.state_hash,
@@ -1851,6 +1933,343 @@ async function enforceMutationQuota(
         429,
       );
     }
+  }
+}
+
+async function maintainRooms(
+  database: D1Database,
+  now: number,
+): Promise<void> {
+  await maybeMaintainRoomLifecycles(database, now);
+  await maybePurgeExpiredGames(database, now);
+}
+
+async function maybeMaintainRoomLifecycles(
+  database: D1Database,
+  now: number,
+): Promise<void> {
+  if (roomMaintenancePromise) return roomMaintenancePromise;
+  if (now - lastRoomMaintenanceAt < ROOM_MAINTENANCE_INTERVAL_MS) return;
+  lastRoomMaintenanceAt = now;
+  roomMaintenancePromise = maintainRoomLifecycleRows(database, now)
+    .catch((error) => {
+      lastRoomMaintenanceAt = 0;
+      throw error;
+    })
+    .finally(() => {
+      roomMaintenancePromise = null;
+    });
+  return roomMaintenancePromise;
+}
+
+async function maintainRoomLifecycleRows(
+  database: D1Database,
+  now: number,
+): Promise<void> {
+  const rows = await database
+    .prepare(
+      `SELECT g.id, g.join_code, g.host_profile_id, g.rules_version,
+              g.protocol_version, g.status, g.version, g.state_json,
+              g.state_hash, g.room_status, g.closed_at, g.close_reason,
+              g.abandoned_since, g.last_activity_at, g.expires_at
+       FROM games g
+       WHERE g.room_status = 'open' AND g.expires_at > ?
+         AND (
+           NOT EXISTS (
+             SELECT 1 FROM game_members m
+             WHERE m.game_id = g.id AND m.status <> 'left'
+           )
+           OR g.abandoned_since IS NOT NULL
+           OR (
+             g.status = 'lobby'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM game_members m
+               LEFT JOIN game_presence gp
+                 ON gp.game_id = m.game_id
+                AND gp.profile_id = m.profile_id
+               WHERE m.game_id = g.id AND m.status <> 'left'
+                 AND COALESCE(gp.last_seen_at, m.joined_at) > ?
+             )
+           )
+         )
+       ORDER BY COALESCE(g.abandoned_since, g.last_activity_at), g.id
+       LIMIT ?`,
+    )
+    .bind(
+      now,
+      now - PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+      ROOM_MAINTENANCE_BATCH_SIZE,
+    )
+    .all<GameRow>();
+
+  for (const row of rows.results) {
+    try {
+      await maintainRoomLifecycleRow(database, row, now);
+    } catch (error) {
+      console.error("Room lifecycle maintenance skipped a candidate.", {
+        gameId: row.id,
+        code:
+          error instanceof GameRuleError
+            ? error.code
+            : error instanceof Error
+              ? error.name
+              : "UNKNOWN_ERROR",
+      });
+    }
+  }
+}
+
+async function maintainRoomLifecycleRow(
+  database: D1Database,
+  row: GameRow,
+  now: number,
+): Promise<void> {
+  const presenceRows = await database
+    .prepare(
+      `SELECT COALESCE(gp.last_seen_at, m.joined_at) AS last_seen_at
+       FROM game_members m
+       LEFT JOIN game_presence gp
+         ON gp.game_id = m.game_id AND gp.profile_id = m.profile_id
+       WHERE m.game_id = ? AND m.status <> 'left'
+       ORDER BY m.seat`,
+    )
+    .bind(row.id)
+    .all<LifecyclePresenceRow>();
+  const memberLastSeenAt = presenceRows.results.map((presence) =>
+    presence.last_seen_at === null ? null : Number(presence.last_seen_at),
+  );
+
+  if (memberLastSeenAt.length === 0) {
+    await closeRoomFromMaintenance(database, row, "empty", now, null);
+    return;
+  }
+
+  requireRule(
+    ["lobby", "playing", "finished"].includes(row.status),
+    "CORRUPT_GAME_STATE",
+    "Stored game lifecycle status is invalid.",
+    500,
+  );
+  const decision = evaluateWaitingRoomLifecycle({
+    roomStatus: row.room_status,
+    gameStatus: row.status as PersistedGameStatus,
+    abandonedSince: row.abandoned_since,
+    memberLastSeenAt,
+    now,
+  });
+
+  if (decision.action === "close_abandoned") {
+    await closeRoomFromMaintenance(
+      database,
+      row,
+      "abandoned",
+      now,
+      decision.abandonedSince,
+    );
+    return;
+  }
+  if (
+    decision.action !== "mark_abandoned" &&
+    decision.action !== "clear_abandoned"
+  ) {
+    return;
+  }
+
+  const statement = decision.action === "mark_abandoned"
+    ? database
+        .prepare(
+          `UPDATE games
+           SET abandoned_since = ?
+           WHERE id = ? AND version = ? AND state_hash = ?
+             AND room_status = 'open'
+             AND (
+               (abandoned_since IS NULL AND ? IS NULL)
+               OR abandoned_since = ?
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM game_members m
+               LEFT JOIN game_presence gp
+                 ON gp.game_id = m.game_id
+                AND gp.profile_id = m.profile_id
+               WHERE m.game_id = games.id AND m.status <> 'left'
+                 AND COALESCE(gp.last_seen_at, m.joined_at) > ?
+             )`,
+        )
+        .bind(
+          decision.abandonedSince,
+          row.id,
+          row.version,
+          row.state_hash,
+          row.abandoned_since,
+          row.abandoned_since,
+          now - PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+        )
+    : database
+        .prepare(
+          `UPDATE games
+           SET abandoned_since = NULL
+           WHERE id = ? AND version = ? AND state_hash = ?
+             AND room_status = 'open'
+             AND abandoned_since = ?`,
+        )
+        .bind(
+          row.id,
+          row.version,
+          row.state_hash,
+          row.abandoned_since,
+        );
+  await statement.run();
+}
+
+async function closeRoomFromMaintenance(
+  database: D1Database,
+  row: GameRow,
+  reason: Extract<RoomCloseReason, "empty" | "abandoned">,
+  now: number,
+  abandonedSince: number | null,
+): Promise<void> {
+  if (reason === "abandoned") {
+    requireRule(
+      abandonedSince !== null,
+      "CORRUPT_GAME_STATE",
+      "An abandoned room is missing its lifecycle timestamp.",
+      500,
+    );
+  }
+  const state = await parseAndValidateState(row);
+  state.revision += 1;
+  state.updatedAt = now;
+  const stateJson = JSON.stringify(state);
+  const stateHash = await hashText(stateJson);
+  const commandId = `system-room-close:${crypto.randomUUID()}`;
+  const event: GameEvent = {
+    type: "room_closed",
+    actorPlayerId: null,
+    message:
+      reason === "empty"
+        ? "The empty room closed."
+        : "The unattended waiting room closed.",
+    data: { reason },
+  };
+  const eventStatement = reason === "empty"
+    ? database
+        .prepare(
+          `INSERT INTO game_events (
+            game_id, version, command_id, actor_profile_id, kind,
+            public_payload_json, state_hash, created_at
+          )
+          SELECT ?, ?, ?, ?, 'room_closed', ?, ?, ?
+          WHERE EXISTS (
+            SELECT 1 FROM games g
+            WHERE g.id = ? AND g.version = ? AND g.state_hash = ?
+              AND g.room_status = 'open'
+              AND NOT EXISTS (
+                SELECT 1 FROM game_members m
+                WHERE m.game_id = g.id AND m.status <> 'left'
+              )
+          )`,
+        )
+        .bind(
+          row.id,
+          state.revision,
+          commandId,
+          row.host_profile_id,
+          JSON.stringify([event]),
+          stateHash,
+          now,
+          row.id,
+          row.version,
+          row.state_hash,
+        )
+    : database
+        .prepare(
+          `INSERT INTO game_events (
+            game_id, version, command_id, actor_profile_id, kind,
+            public_payload_json, state_hash, created_at
+          )
+          SELECT ?, ?, ?, ?, 'room_closed', ?, ?, ?
+          WHERE EXISTS (
+            SELECT 1 FROM games g
+            WHERE g.id = ? AND g.version = ? AND g.state_hash = ?
+              AND g.room_status = 'open' AND g.status = 'lobby'
+              AND COALESCE(g.abandoned_since, ?) <= ?
+              AND NOT EXISTS (
+                SELECT 1
+                FROM game_members m
+                LEFT JOIN game_presence gp
+                  ON gp.game_id = m.game_id
+                 AND gp.profile_id = m.profile_id
+                WHERE m.game_id = g.id AND m.status <> 'left'
+                  AND COALESCE(gp.last_seen_at, m.joined_at) > ?
+              )
+          )`,
+        )
+        .bind(
+          row.id,
+          state.revision,
+          commandId,
+          row.host_profile_id,
+          JSON.stringify([event]),
+          stateHash,
+          now,
+          row.id,
+          row.version,
+          row.state_hash,
+          abandonedSince,
+          now - ABANDONED_WAITING_ROOM_CLOSE_AFTER_MS,
+          now - PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+        );
+
+  const batch = await database.batch([
+    eventStatement,
+    database
+      .prepare(
+        `DELETE FROM game_presence
+         WHERE game_id = ?
+           AND EXISTS (
+             SELECT 1 FROM game_events
+             WHERE game_id = ? AND version = ? AND command_id = ?
+               AND state_hash = ?
+           )`,
+      )
+      .bind(row.id, row.id, state.revision, commandId, stateHash),
+    database
+      .prepare(
+        `UPDATE games
+         SET status = ?, version = ?, state_json = ?, state_hash = ?,
+             room_status = 'closed', closed_at = ?, close_reason = ?,
+             abandoned_since = NULL, last_activity_at = ?, expires_at = ?
+         WHERE id = ? AND version = ? AND state_hash = ?
+           AND room_status = 'open'
+           AND EXISTS (
+             SELECT 1 FROM game_events
+             WHERE game_id = ? AND version = ? AND command_id = ?
+               AND state_hash = ?
+           )`,
+      )
+      .bind(
+        databaseStatus(state.phase),
+        state.revision,
+        stateJson,
+        stateHash,
+        now,
+        reason,
+        now,
+        roomTombstoneExpiresAt(now),
+        row.id,
+        row.version,
+        row.state_hash,
+        row.id,
+        state.revision,
+        commandId,
+        stateHash,
+      ),
+  ]);
+
+  if ((batch.at(-1)?.meta.changes ?? 0) === 1) {
+    return;
   }
 }
 

@@ -2,6 +2,9 @@ Original prompt: Build the extensible foundation for a cross-platform online mul
 
 ## Work log
 
+- Started V1.5 Epic 1 from `docs/v1.5-open-tables-safe-talk.md`: closed-room tombstones, explicit-final-leave closure, abandoned-lobby cleanup, fail-closed feature switches, profile-block storage, schema migration, and lifecycle regression coverage. Public discovery and communication remain disabled until later epics.
+- Implemented the Epic 1 vertical slice: completed members can explicitly leave with host transfer and card conservation; final departure atomically records `room_emptied`/`room_closed`, hides the room, removes presence, and starts a 24-hour tombstone; stale waiting rooms close after the 45-second disconnect boundary plus five-minute grace; closed reads and joins return `ROOM_CLOSED`; discovery/communication/free-text switches default off; and profile-block/discovery-consent storage is migrated.
+- Verified Epic 1 with 76 passing unit tests, TypeScript, lint, production build, migration regeneration, direct local D1 API flows for empty and abandoned closure, lost-response leave replay, completed-table departures, and required gameplay-client screenshots/text for results → `Leave table and go back` → lobby plus the closed-link error state. Lifecycle sweeps now revalidate heartbeats, avoid attended-room starvation, isolate corrupt candidates, preserve original `left_at`, and map closure races to `ROOM_CLOSED`.
 - Started V1.1 “Game Night Loop” implementation: one-tap invitation/joining, player-focused readiness, contextual turn guidance and in-game rules, visible connection recovery, completed-game results/rematch, mobile hierarchy, and end-to-end release gates. Rich chat/media, matchmaking, rankings, and alternate modes remain deferred.
 - Pinned the V1.1 product and acceptance contract in `docs/v1.1-game-night-loop.md`, taught the server-rendered sign-in path to preserve valid `?join=CODE` invitations, and captured a clean required-game-client baseline (`mode: lobby-browser`) before the larger changes.
 - Initialized the Sites starter and started the local preview.
@@ -28,9 +31,11 @@ Original prompt: Build the extensible foundation for a cross-platform online mul
 
 ## TODO
 
-- Publish the verified V1.1 build only after an explicit deployment approval, then repeat the invite/rematch smoke test against the production D1 binding.
+- Keep V1.5 Epic 1 local until an explicit deployment approval, then apply migration `0004_tired_lizard.sql` and repeat the lifecycle smoke tests against the production D1 binding.
+- Build Epic 2 open-table discovery on the disabled discovery switch; keep listings private by default and anonymous before sign-in.
+- Build Epic 3 curated table communication on its separate disabled switch; arbitrary free text remains off until the documented safety gates pass.
 - Add Durable Object/WebSocket transport when the hosting contract supports it; keep the current command and projection boundary.
-- Add provider-backed chat/media only as separately moderated modules, plus deeper automated D1 concurrency and migration integration coverage.
+- Add deeper automated D1 concurrency and migration integration coverage before enabling either public V1.5 capability.
 
 ## Pinned baseline rule decisions
 

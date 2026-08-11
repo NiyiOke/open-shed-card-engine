@@ -957,6 +957,139 @@ test("rematch rejects non-hosts and games that are not complete", () => {
   assert.deepEqual(completed, snapshot);
 });
 
+test("completed members leave idempotently through host transfer and final room emptying", () => {
+  const completed = completedGameWithEliminatedAndLeftPlayers();
+  const completedSnapshot = structuredClone(completed);
+  const completedCards = sortedCardIds(completed);
+  const winner = structuredClone(completed.winner);
+  const hostHandSize = handIds(completed, HOST.playerId).length;
+  assert.equal(hostHandSize > 0, true);
+  assert.equal(
+    projectGameForUser(completed, HOST.userId).legalActions.canLeave,
+    true,
+  );
+
+  const hostLeaveContext: TransitionContext = {
+    actorUserId: HOST.userId,
+    commandId: "completed-host-leave",
+    now: completed.updatedAt + 10,
+  };
+  const hostLeave = transitionGame(
+    completed,
+    { type: "leave_game" },
+    hostLeaveContext,
+  );
+
+  assert.deepEqual(completed, completedSnapshot);
+  assert.equal(hostLeave.replayed, false);
+  assert.equal(hostLeave.state.phase, "complete");
+  assert.equal(hostLeave.state.hostUserId, B.userId);
+  assert.deepEqual(hostLeave.state.winner, winner);
+  assert.equal(
+    hostLeave.state.players.find((player) => player.playerId === HOST.playerId)
+      ?.status,
+    "left",
+  );
+  assert.deepEqual(handIds(hostLeave.state, HOST.playerId), []);
+  assert.equal(hostLeave.state.mercyReserve.length >= hostHandSize, true);
+  assert.equal(hostLeave.state.currentPlayerId, null);
+  assert.equal(hostLeave.state.pendingDraw, null);
+  assert.equal(hostLeave.state.rouletteTargetId, null);
+  assert.equal(hostLeave.state.forcedCardId, null);
+  assert.deepEqual(hostLeave.state.unoLiabilities, []);
+  assert.deepEqual(sortedCardIds(hostLeave.state), completedCards);
+  assert.deepEqual(hostLeave.events, [
+    {
+      type: "host_transferred",
+      actorPlayerId: HOST.playerId,
+      message: "Ben is now the host.",
+      data: {
+        previousHostPlayerId: HOST.playerId,
+        newHostPlayerId: B.playerId,
+      },
+    },
+    {
+      type: "player_left",
+      actorPlayerId: HOST.playerId,
+      message: "Ada left the game.",
+    },
+  ]);
+  assert.equal(
+    projectGameForUser(hostLeave.state, HOST.userId).legalActions.canLeave,
+    false,
+  );
+  assert.equal(
+    projectGameForUser(hostLeave.state, B.userId).legalActions.canRematch,
+    true,
+  );
+
+  const hostReplay = transitionGame(
+    hostLeave.state,
+    { type: "leave_game" },
+    hostLeaveContext,
+  );
+  assert.equal(hostReplay.replayed, true);
+  assert.equal(hostReplay.state, hostLeave.state);
+  assert.deepEqual(hostReplay.events, []);
+
+  const finalLeaveContext: TransitionContext = {
+    actorUserId: B.userId,
+    commandId: "completed-final-leave",
+    now: hostLeave.state.updatedAt + 10,
+  };
+  const finalLeave = transitionGame(
+    hostLeave.state,
+    { type: "leave_game" },
+    finalLeaveContext,
+  );
+
+  assert.equal(finalLeave.state.phase, "complete");
+  assert.equal(
+    finalLeave.state.players.every((player) => player.status === "left"),
+    true,
+  );
+  assert.deepEqual(finalLeave.state.winner, winner);
+  assert.deepEqual(sortedCardIds(finalLeave.state), completedCards);
+  assert.deepEqual(finalLeave.events, [
+    {
+      type: "player_left",
+      actorPlayerId: B.playerId,
+      message: "Ben left the game.",
+    },
+    {
+      type: "room_emptied",
+      actorPlayerId: B.playerId,
+      message: "The final member left the table.",
+      data: { reason: "explicit_leave" },
+    },
+  ]);
+  assert.equal(
+    projectGameForUser(finalLeave.state, B.userId).legalActions.canLeave,
+    false,
+  );
+
+  const finalReplay = transitionGame(
+    finalLeave.state,
+    { type: "leave_game" },
+    finalLeaveContext,
+  );
+  assert.equal(finalReplay.replayed, true);
+  assert.equal(finalReplay.state, finalLeave.state);
+  assert.deepEqual(finalReplay.events, []);
+
+  const finalSnapshot = structuredClone(finalLeave.state);
+  expectRuleError(
+    () =>
+      transitionGame(finalLeave.state, { type: "leave_game" }, {
+        ...finalLeaveContext,
+        commandId: "different-final-leave",
+        now: finalLeaveContext.now + 1,
+      }),
+    "PLAYER_NOT_ACTIVE",
+  );
+  assert.deepEqual(finalLeave.state, finalSnapshot);
+});
+
 test("the host can remove an inactive current player with leave-safe turn repair", () => {
   let state = forceTurn(startedGame([HOST, B, C]), HOST.playerId);
   setTopDiscard(
@@ -1083,8 +1216,8 @@ test("inactive-player removal enforces host, membership, active target, and self
   );
 });
 
-test("an empty lobby closes cleanly while returning a final viewer projection", () => {
-  let state = createLobbyState({
+test("a final lobby leave emits an idempotent empty-room transition", () => {
+  const state = createLobbyState({
     gameId: "abandoned-game",
     joinCode: "CLOSE1",
     hostUserId: HOST.userId,
@@ -1094,14 +1227,43 @@ test("an empty lobby closes cleanly while returning a final viewer projection", 
     seed: 7,
   });
 
-  state = run(state, HOST.userId, { type: "leave_game" });
+  const context: TransitionContext = {
+    actorUserId: HOST.userId,
+    commandId: "final-lobby-leave",
+    now: state.updatedAt + 1,
+  };
+  const result = transitionGame(state, { type: "leave_game" }, context);
 
-  assert.equal(state.phase, "complete");
-  assert.equal(state.players[0].status, "left");
-  assert.equal(projectGameForUser(state, HOST.userId).phase, "complete");
+  assert.equal(result.state.phase, "complete");
+  assert.equal(result.state.players[0].status, "left");
+  assert.equal(projectGameForUser(result.state, HOST.userId).phase, "complete");
+  assert.deepEqual(result.events, [
+    {
+      type: "player_left",
+      actorPlayerId: HOST.playerId,
+      message: "Ada left the game.",
+    },
+    {
+      type: "room_emptied",
+      actorPlayerId: HOST.playerId,
+      message: "The final member left the table.",
+      data: { reason: "explicit_leave" },
+    },
+  ]);
+
+  const replay = transitionGame(result.state, { type: "leave_game" }, context);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.state, result.state);
+  assert.deepEqual(replay.events, []);
+
   expectRuleError(
-    () => run(state, HOST.userId, { type: "leave_game" }),
-    "GAME_COMPLETE",
+    () =>
+      transitionGame(result.state, { type: "leave_game" }, {
+        ...context,
+        commandId: "second-lobby-leave",
+        now: context.now + 1,
+      }),
+    "PLAYER_NOT_ACTIVE",
   );
 });
 

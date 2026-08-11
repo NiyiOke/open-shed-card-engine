@@ -26,6 +26,39 @@ export function assertGameInvariants(state: GameState): void {
       500,
     );
   }
+  for (const player of state.players) {
+    if (player.status === "left" && player.hand.length > 0) {
+      throw new GameRuleError(
+        "LEFT_PLAYER_HAS_CARDS",
+        "A departed player cannot retain cards.",
+        500,
+      );
+    }
+  }
+  if (
+    state.players.every((player) => player.status === "left") &&
+    state.phase !== "complete"
+  ) {
+    throw new GameRuleError(
+      "EMPTY_ROOM_NOT_COMPLETE",
+      "A table without current members must be terminal.",
+      500,
+    );
+  }
+  if (
+    state.phase === "complete" &&
+    (state.currentPlayerId !== null ||
+      state.pendingDraw !== null ||
+      state.rouletteTargetId !== null ||
+      state.forcedCardId !== null ||
+      state.unoLiabilities.length > 0)
+  ) {
+    throw new GameRuleError(
+      "TERMINAL_TRANSIENT_STATE",
+      "A completed table cannot retain turn-owned transient state.",
+      500,
+    );
+  }
   if (state.phase === "playing") {
     if (state.discardPile.length === 0) {
       throw new GameRuleError(

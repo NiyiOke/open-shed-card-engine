@@ -21,6 +21,10 @@ export const games = sqliteTable(
     rulesVersion: text("rules_version").notNull(),
     protocolVersion: integer("protocol_version").notNull(),
     status: text("status").notNull(),
+    roomStatus: text("room_status").notNull().default("open"),
+    closedAt: integer("closed_at"),
+    closeReason: text("close_reason"),
+    abandonedSince: integer("abandoned_since"),
     version: integer("version").notNull().default(0),
     stateJson: text("state_json").notNull(),
     stateHash: text("state_hash").notNull(),
@@ -31,6 +35,10 @@ export const games = sqliteTable(
   (table) => [
     uniqueIndex("idx_games_join_code").on(table.joinCode),
     index("idx_games_status_activity").on(table.status, table.lastActivityAt),
+    index("idx_games_room_status_abandoned").on(
+      table.roomStatus,
+      table.abandonedSince,
+    ),
     index("idx_games_expiry").on(table.expiresAt),
   ],
 );
@@ -45,11 +53,26 @@ export const gameMembers = sqliteTable(
     status: text("status").notNull(),
     joinedAt: integer("joined_at").notNull(),
     leftAt: integer("left_at"),
+    publicDiscoveryConsentAt: integer("public_discovery_consent_at"),
+    joinSource: text("join_source"),
   },
   (table) => [
     primaryKey({ columns: [table.gameId, table.profileId] }),
     uniqueIndex("idx_game_members_seat").on(table.gameId, table.seat),
     index("idx_game_members_profile").on(table.profileId),
+  ],
+);
+
+export const profileBlocks = sqliteTable(
+  "profile_blocks",
+  {
+    blockerProfileId: text("blocker_profile_id").notNull(),
+    blockedProfileId: text("blocked_profile_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.blockerProfileId, table.blockedProfileId] }),
+    index("idx_profile_blocks_blocked").on(table.blockedProfileId),
   ],
 );
 

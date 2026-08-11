@@ -150,7 +150,7 @@ export function transitionGame(
     (player) => player.userId === context.actorUserId,
   );
   requireRule(actor, "NOT_A_MEMBER", "You are not a member of this game.", 403);
-  if (command.type !== "rematch") {
+  if (command.type !== "rematch" && command.type !== "leave_game") {
     requireRule(
       state.phase !== "complete",
       "GAME_COMPLETE",
@@ -747,12 +747,54 @@ function leaveGame(
   actor: PlayerState,
   events: GameEvent[],
 ): void {
+  requireRule(
+    actor.status !== "left",
+    "PLAYER_NOT_ACTIVE",
+    "You already left this table.",
+    409,
+  );
   removePlayer(state, actor, events);
+
+  if (actor.userId === state.hostUserId) {
+    const currentMembers = state.players.filter(
+      (player) => player.status !== "left",
+    );
+    const eligibleSuccessors =
+      state.phase === "playing"
+        ? currentMembers.filter((player) => player.status === "active")
+        : currentMembers;
+    const successor = eligibleSuccessors
+      .sort((left, right) => left.seat - right.seat)[0];
+    if (successor) {
+      state.hostUserId = successor.userId;
+      events.push({
+        type: "host_transferred",
+        actorPlayerId: actor.playerId,
+        message: `${successor.displayName} is now the host.`,
+        data: {
+          previousHostPlayerId: actor.playerId,
+          newHostPlayerId: successor.playerId,
+        },
+      });
+    }
+  }
+
   events.push({
     type: "player_left",
     actorPlayerId: actor.playerId,
     message: `${actor.displayName} left the game.`,
   });
+
+  if (!state.players.some((player) => player.status !== "left")) {
+    clearTurnTransients(state);
+    state.phase = "complete";
+    events.push({
+      type: "room_emptied",
+      actorPlayerId: actor.playerId,
+      message: "The final member left the table.",
+      data: { reason: "explicit_leave" },
+    });
+  }
 }
 
 function removeInactivePlayer(
@@ -812,9 +854,6 @@ function removePlayer(
     player.status = "left";
     player.ready = false;
     const remaining = activePlayers(state);
-    if (player.userId === state.hostUserId && remaining.length > 0) {
-      state.hostUserId = remaining[0].userId;
-    }
     if (remaining.length === 0) {
       state.phase = "complete";
     }
@@ -835,6 +874,12 @@ function removePlayer(
       (entry) => entry.playerId !== player.playerId,
     );
     repairTurnAfterRemoval(state, player, events);
+  } else {
+    state.mercyReserve.push(...player.hand);
+    player.hand = [];
+    player.status = "left";
+    player.ready = false;
+    clearTurnTransients(state);
   }
 }
 
@@ -1037,11 +1082,7 @@ function completeGame(
 ): void {
   state.phase = "complete";
   state.winner = { playerId: winner.playerId, reason };
-  state.currentPlayerId = null;
-  state.pendingDraw = null;
-  state.rouletteTargetId = null;
-  state.forcedCardId = null;
-  state.unoLiabilities = [];
+  clearTurnTransients(state);
   events.push({
     type: "game_won",
     actorPlayerId: winner.playerId,
@@ -1050,6 +1091,14 @@ function completeGame(
     }.`,
     data: { reason },
   });
+}
+
+function clearTurnTransients(state: GameState): void {
+  state.currentPlayerId = null;
+  state.pendingDraw = null;
+  state.rouletteTargetId = null;
+  state.forcedCardId = null;
+  state.unoLiabilities = [];
 }
 
 function rememberCommand(

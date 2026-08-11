@@ -326,7 +326,7 @@ export function GameShell({
         const code = (failure as RequestFailure).code;
         if (
           gameRef.current?.gameId === gameId &&
-          ["AUTHENTICATION_REQUIRED", "GAME_EXPIRED", "GAME_NOT_FOUND", "NOT_A_MEMBER"].includes(
+          ["AUTHENTICATION_REQUIRED", "GAME_EXPIRED", "GAME_NOT_FOUND", "ROOM_CLOSED", "NOT_A_MEMBER"].includes(
             code ?? "",
           )
         ) {
@@ -737,7 +737,7 @@ export function GameShell({
         if (cancelled) return;
         setError(failure instanceof Error ? failure.message : "Game could not be opened.");
         const code = (failure as RequestFailure).code;
-        if (["GAME_EXPIRED", "GAME_NOT_FOUND", "NOT_A_MEMBER"].includes(code ?? "")) {
+        if (["GAME_EXPIRED", "GAME_NOT_FOUND", "ROOM_CLOSED", "NOT_A_MEMBER"].includes(code ?? "")) {
           setGameInUrl(null);
         }
       })
@@ -858,10 +858,6 @@ export function GameShell({
 
   const leaveTable = async () => {
     if (!gameRef.current) return;
-    if (gameRef.current.phase === "complete") {
-      openLobbyBrowser();
-      return;
-    }
     const left = await sendCommand({ type: "leave_game" });
     if (left) openLobbyBrowser();
   };
@@ -1310,7 +1306,7 @@ export function GameShell({
                   ) : game.isHost ? null : (
                     <span className="waiting-copy">The host can start a rematch.</span>
                   )}
-                  <button className="secondary-button" disabled={busy} onClick={openLobbyBrowser}>Back to your games</button>
+                  <button className="secondary-button" disabled={actionPending} onClick={() => void leaveTable()}>Leave table and go back</button>
                   <button className="secondary-button" disabled={actionPending} onClick={() => void createLobby()}>Create a new table</button>
                 </div>
               </section>
@@ -1461,7 +1457,7 @@ export function GameShell({
               disabled={actionPending}
               onClick={() => void leaveTable()}
             >
-              {game.phase === "complete" ? "Back to your games" : "Leave table"}
+              {game.phase === "complete" ? "Leave table and go back" : "Leave table"}
             </button>
           </aside>
           </section>

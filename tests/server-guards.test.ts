@@ -69,6 +69,9 @@ test("command parser accepts the exact V1.1 room-management commands", () => {
       targetPlayerId: "player-b",
     },
   );
+  assert.deepEqual(parseGameCommand({ type: "leave_game" }), {
+    type: "leave_game",
+  });
 });
 
 test("inactive-player removal parser requires a bounded target player id", () => {

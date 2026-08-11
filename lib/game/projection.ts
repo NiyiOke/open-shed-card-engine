@@ -113,6 +113,6 @@ export function legalActionsFor(
       state.phase === "complete" &&
       state.hostUserId === viewer.userId &&
       viewer.status !== "left",
-    canLeave: state.phase !== "complete",
+    canLeave: viewer.status !== "left",
   };
 }
