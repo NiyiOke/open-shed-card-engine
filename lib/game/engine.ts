@@ -101,6 +101,12 @@ export function joinLobbyState(
   const state = cloneState(original);
   let joined: PlayerState;
   const returning = state.players.find((player) => player.userId === input.userId);
+  // Departed players remain durable in membership storage, but their in-memory
+  // lobby placeholders must not cross a later join boundary. Keep only the
+  // returning actor long enough to preserve their stable seat and player ID.
+  state.players = state.players.filter(
+    (player) => player.status !== "left" || player.userId === input.userId,
+  );
   if (returning) {
     returning.status = "active";
     returning.ready = false;
@@ -108,9 +114,6 @@ export function joinLobbyState(
     returning.knockedOutBy = null;
     joined = returning;
   } else {
-    // Departed lobby placeholders exist only long enough to acknowledge their
-    // leave command. Remove them before assigning a reusable stable seat.
-    state.players = state.players.filter((player) => player.status === "active");
     const usedSeats = new Set(state.players.map((player) => player.seat));
     let seat = 0;
     while (usedSeats.has(seat)) seat += 1;

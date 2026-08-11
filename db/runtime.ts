@@ -57,12 +57,32 @@ async function initialize(database: D1Database): Promise<void> {
       left_at INTEGER,
       public_discovery_consent_at INTEGER,
       join_source TEXT,
+      event_floor_version INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (game_id, profile_id)
     )`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_game_members_seat
       ON game_members(game_id, seat)`,
     `CREATE INDEX IF NOT EXISTS idx_game_members_profile
       ON game_members(profile_id)`,
+    `CREATE TABLE IF NOT EXISTS public_game_listings (
+      game_id TEXT PRIMARY KEY NOT NULL,
+      listing_id TEXT NOT NULL,
+      owner_profile_id TEXT NOT NULL,
+      state TEXT NOT NULL,
+      pace TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      event_floor_version INTEGER NOT NULL,
+      published_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      unlisted_at INTEGER,
+      close_reason TEXT
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_public_game_listings_listing_id
+      ON public_game_listings(listing_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_public_game_listings_state_updated
+      ON public_game_listings(state, updated_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_public_game_listings_owner
+      ON public_game_listings(owner_profile_id)`,
     `CREATE TABLE IF NOT EXISTS profile_blocks (
       blocker_profile_id TEXT NOT NULL,
       blocked_profile_id TEXT NOT NULL,
@@ -157,10 +177,22 @@ async function initialize(database: D1Database): Promise<void> {
     "join_source",
     "ALTER TABLE game_members ADD COLUMN join_source TEXT",
   );
+  await ensureColumn(
+    database,
+    "game_members",
+    "event_floor_version",
+    "ALTER TABLE game_members ADD COLUMN event_floor_version INTEGER NOT NULL DEFAULT 0",
+  );
   await database
     .prepare(
       `CREATE INDEX IF NOT EXISTS idx_games_room_status_abandoned
        ON games(room_status, abandoned_since)`,
+    )
+    .run();
+  await database
+    .prepare(
+      `CREATE INDEX IF NOT EXISTS idx_games_room_status_closed
+       ON games(room_status, closed_at)`,
     )
     .run();
   await database.prepare("PRAGMA optimize").run();

@@ -7,6 +7,7 @@ import {
   transitionGame,
 } from "../lib/game/engine";
 import { GameRuleError } from "../lib/game/errors";
+import { assertGameInvariants } from "../lib/game/invariants";
 import { projectGameForUser } from "../lib/game/projection";
 import type {
   Card,
@@ -776,6 +777,84 @@ test("production lobby identifiers do not determine shuffle entropy", () => {
 
   assert.equal(state.rngState, null);
   assert.equal("rngState" in projectGameForUser(state, HOST.userId), false);
+});
+
+test("a returning lobby player cannot see other departed legacy names", () => {
+  const returningLegacyName = "Account Returning Sentinel";
+  const departedLegacyName = "Account Departed Sentinel";
+  let state = createLobbyState({
+    gameId: "public-return-privacy",
+    joinCode: "RETURN",
+    hostUserId: HOST.userId,
+    hostPlayerId: HOST.playerId,
+    hostDisplayName: "Public Host Alias",
+    now: 1,
+    seed: 17,
+  });
+  state = joinLobbyState(state, {
+    userId: B.userId,
+    playerId: B.playerId,
+    displayName: returningLegacyName,
+    commandId: "join-returning-legacy-player",
+    now: 2,
+  }).state;
+  state = joinLobbyState(state, {
+    userId: C.userId,
+    playerId: C.playerId,
+    displayName: departedLegacyName,
+    commandId: "join-departed-legacy-player",
+    now: 3,
+  }).state;
+  state = run(state, B.userId, { type: "leave_game" });
+  state = run(state, C.userId, { type: "leave_game" });
+  const beforeReturn = structuredClone(state);
+
+  const result = joinLobbyState(state, {
+    userId: B.userId,
+    playerId: "ignored-new-player-id",
+    displayName: "Returning Public Alias",
+    commandId: "public-return-command",
+    now: state.updatedAt + 1,
+  });
+
+  assert.deepEqual(state, beforeReturn);
+  assert.equal(result.replayed, false);
+  assert.equal(result.state.revision, beforeReturn.revision + 1);
+  assert.deepEqual(
+    result.state.players.map((player) => ({
+      userId: player.userId,
+      playerId: player.playerId,
+      displayName: player.displayName,
+      status: player.status,
+    })),
+    [
+      {
+        userId: HOST.userId,
+        playerId: HOST.playerId,
+        displayName: "Public Host Alias",
+        status: "active",
+      },
+      {
+        userId: B.userId,
+        playerId: B.playerId,
+        displayName: "Returning Public Alias",
+        status: "active",
+      },
+    ],
+  );
+  assert.equal(JSON.stringify(result.state).includes(returningLegacyName), false);
+  assert.equal(JSON.stringify(result.state).includes(departedLegacyName), false);
+  assert.deepEqual(result.events, [
+    {
+      type: "player_joined",
+      actorPlayerId: B.playerId,
+      message: "Returning Public Alias rejoined the lobby.",
+    },
+  ]);
+  assert.doesNotThrow(() => assertGameInvariants(result.state));
+  const returningView = projectGameForUser(result.state, B.userId);
+  assert.equal(JSON.stringify(returningView).includes(returningLegacyName), false);
+  assert.equal(JSON.stringify(returningView).includes(departedLegacyName), false);
 });
 
 test("a forced drawn card is visible only to its owner", () => {

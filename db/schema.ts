@@ -39,6 +39,10 @@ export const games = sqliteTable(
       table.roomStatus,
       table.abandonedSince,
     ),
+    index("idx_games_room_status_closed").on(
+      table.roomStatus,
+      table.closedAt,
+    ),
     index("idx_games_expiry").on(table.expiresAt),
   ],
 );
@@ -55,11 +59,37 @@ export const gameMembers = sqliteTable(
     leftAt: integer("left_at"),
     publicDiscoveryConsentAt: integer("public_discovery_consent_at"),
     joinSource: text("join_source"),
+    eventFloorVersion: integer("event_floor_version").notNull().default(0),
   },
   (table) => [
     primaryKey({ columns: [table.gameId, table.profileId] }),
     uniqueIndex("idx_game_members_seat").on(table.gameId, table.seat),
     index("idx_game_members_profile").on(table.profileId),
+  ],
+);
+
+export const publicGameListings = sqliteTable(
+  "public_game_listings",
+  {
+    gameId: text("game_id").primaryKey(),
+    listingId: text("listing_id").notNull(),
+    ownerProfileId: text("owner_profile_id").notNull(),
+    state: text("state").notNull(),
+    pace: text("pace").notNull(),
+    version: integer("version").notNull(),
+    eventFloorVersion: integer("event_floor_version").notNull(),
+    publishedAt: integer("published_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    unlistedAt: integer("unlisted_at"),
+    closeReason: text("close_reason"),
+  },
+  (table) => [
+    uniqueIndex("idx_public_game_listings_listing_id").on(table.listingId),
+    index("idx_public_game_listings_state_updated").on(
+      table.state,
+      table.updatedAt,
+    ),
+    index("idx_public_game_listings_owner").on(table.ownerProfileId),
   ],
 );
 

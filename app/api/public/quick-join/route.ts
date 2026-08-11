@@ -1,9 +1,9 @@
-import { assertSafeMutationRequest, requireRequestUser } from "../../../../lib/server/auth";
-import {
-  getViewerListingForGame,
-  joinGame,
-} from "../../../../lib/server/game-store";
 import { GameRuleError } from "../../../../lib/game/errors";
+import {
+  assertSafeMutationRequest,
+  requireRequestUser,
+} from "../../../../lib/server/auth";
+import { quickJoinPublicRoom } from "../../../../lib/server/game-store";
 import {
   jsonResponse,
   readJsonObject,
@@ -17,19 +17,14 @@ export async function POST(request: Request) {
     const user = requireRequestUser(request);
     const body = await readJsonObject(request);
     const commandId = requireCommandId(body.commandId);
-    if (typeof body.joinCode !== "string") {
-      throw new GameRuleError("INVALID_JOIN_CODE", "joinCode is required.", 400);
-    }
-    if (typeof body.nickname !== "string") {
+    if (typeof body.alias !== "string") {
       throw new GameRuleError(
         "INVALID_ALIAS",
         "Enter a room alias before joining.",
         400,
       );
     }
-    const view = await joinGame(user, body.nickname, body.joinCode, commandId);
-    const listing = await getViewerListingForGame(user, view.gameId);
-    return jsonResponse({ view, ...(listing ? { listing } : {}) });
+    return jsonResponse(await quickJoinPublicRoom(user, body.alias, commandId));
   } catch (error) {
     return routeErrorResponse(error);
   }

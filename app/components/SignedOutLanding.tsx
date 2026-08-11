@@ -1,8 +1,18 @@
 "use client";
 
 import { ArrowRightIcon, ArrowUpRightIcon } from "@phosphor-icons/react";
+import { useEffect, useState } from "react";
 import type { Card } from "../../lib/game/types";
 import { CardFace } from "./CardFace";
+import {
+  cappedCountLabel,
+  parsePublicAvailability,
+  parsePublicRoomPage,
+  signInPathForListing,
+  type PublicAvailability,
+  type PublicRoomCard,
+  waitingAgeLabel,
+} from "./public-discovery";
 
 const HERO_CARDS: Card[] = [
   { id: "landing-red-eight", kind: "number", color: "red", number: 8 },
@@ -68,6 +78,39 @@ const WILD_ACTION_RULES: Array<{ card: Card; description: string; title: string 
 ];
 
 export function SignedOutLanding({ signInPath }: { signInPath: string }) {
+  const [openTables, setOpenTables] = useState<{
+    availability: PublicAvailability;
+    rooms: PublicRoomCard[];
+  } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const [availabilityResponse, roomsResponse] = await Promise.all([
+          fetch("/api/public/availability", { cache: "no-store" }),
+          fetch("/api/public/rooms", { cache: "no-store" }),
+        ]);
+        if (!availabilityResponse.ok || !roomsResponse.ok) return;
+        const [availabilityBody, roomsBody] = await Promise.all([
+          availabilityResponse.json(),
+          roomsResponse.json(),
+        ]);
+        const availability = parsePublicAvailability(availabilityBody);
+        const rooms = parsePublicRoomPage(roomsBody, 6);
+        if (!cancelled && availability && rooms) {
+          setOpenTables({ availability, rooms: rooms.rooms.slice(0, 6) });
+        }
+      } catch {
+        // Discovery is optional and fail-closed. The private game journey remains available.
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <div className="signed-out-page">
       <header className="public-header">
@@ -179,6 +222,63 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
           </div>
         </details>
       </section>
+
+      {openTables ? (
+        <section className="public-open-tables" aria-labelledby="open-tables-title">
+          <div className="public-section-heading public-section-heading--split">
+            <div>
+              <span className="eyebrow">Open tables now</span>
+              <h2 id="open-tables-title">Find a seat.<br />Keep your identity private.</h2>
+            </div>
+            <p>
+              These cards are anonymous before sign-in. They show only table size, pace, rules, and a broad waiting window—never a player name, table code, or game ID.
+            </p>
+          </div>
+
+          <div className="public-availability-strip" aria-label="Open table availability">
+            <div>
+              <span>Open tables</span>
+              <strong>{cappedCountLabel(openTables.availability.tableCount, openTables.availability.tableCountCapped)}</strong>
+            </div>
+            <div>
+              <span>Open seats</span>
+              <strong>{cappedCountLabel(openTables.availability.openSeatCount, openTables.availability.openSeatCountCapped)}</strong>
+            </div>
+            <p>Sign in only when you choose a table. You will confirm a separate room alias before taking a seat.</p>
+          </div>
+
+          {openTables.rooms.length ? (
+            <div className="public-table-grid">
+              {openTables.rooms.map((room) => (
+                <article className="public-table-card" key={room.listingId}>
+                  <div className="public-table-card__status">
+                    <span className="status-pip" aria-hidden="true" />
+                    <span>{room.occupancy} of {room.capacity} players</span>
+                  </div>
+                  <strong>{room.capacity - room.occupancy} {room.capacity - room.occupancy === 1 ? "seat" : "seats"} open</strong>
+                  <dl>
+                    <div><dt>Pace</dt><dd>{room.pace === "quick" ? "Quick" : "Casual"}</dd></div>
+                    <div><dt>Rules</dt><dd>Merciless baseline</dd></div>
+                    <div><dt>Waiting</dt><dd>{waitingAgeLabel(room.waitingAge)}</dd></div>
+                  </dl>
+                  <a
+                    className="primary-button acid"
+                    href={signInPathForListing(signInPath, room.listingId)}
+                    aria-label={`Sign in to join an anonymous ${room.pace} table with ${room.occupancy} of ${room.capacity} players`}
+                  >
+                    Sign in to join <ArrowRightIcon aria-hidden="true" weight="bold" />
+                  </a>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="public-table-empty">
+              <strong>No open table is waiting right now.</strong>
+              <span>Sign in to create the next one, or check again in a moment.</span>
+            </div>
+          )}
+        </section>
+      ) : null}
 
       <section className="public-final-cta" aria-labelledby="public-cta-title">
         <div>

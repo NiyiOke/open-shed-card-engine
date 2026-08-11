@@ -20,6 +20,25 @@ import type { LobbySummary } from "../../lib/server/game-store";
 import { CardFace } from "./CardFace";
 import { GameTableCanvas } from "./GameTableCanvas";
 import { SignedOutLanding } from "./SignedOutLanding";
+import {
+  listingFailureMessage,
+  listingUnavailableReason,
+  isValidRoomAlias,
+  normalizeRoomAlias,
+  normalizePublicListingId,
+  parsePublicAvailability,
+  parsePublicRoomPage,
+  parseViewerListing,
+  PUBLIC_PACES,
+  ROOM_ALIAS_ERROR,
+  ROOM_ALIAS_MAX_LENGTH,
+  publicJoinFailureMessage,
+  type PublicPace,
+  type PublicRoomCard,
+  type PublicRoomPage,
+  type ViewerListing,
+  waitingAgeLabel,
+} from "./public-discovery";
 
 type Session = {
   signedIn: boolean;
@@ -68,12 +87,18 @@ type GameSnapshotResponse = {
   events?: EventLine[];
   eventCursor?: number;
   presence?: PresenceSnapshot;
+  listing?: ViewerListing | null;
 };
 type PollRequest = {
   controller: AbortController;
   gameId: string;
   promise: Promise<boolean>;
 };
+type PublicJoinIntent =
+  | { kind: "listing"; listingId: string; room: PublicRoomCard | null }
+  | { kind: "quick" };
+type ListingDialogAction = "publish" | "unpublish";
+type PendingPublicMutation = { commandId: string; fingerprint: string };
 
 const COMMAND_STORAGE_KEY = "open-shed-inflight-command-v1";
 const REQUEST_TIMEOUT_MS = 12_000;
@@ -106,6 +131,7 @@ export function GameShell({
   const [lobbies, setLobbies] = useState<Lobbies>({ mine: [] });
   const [game, setGame] = useState<GameView | null>(null);
   const [nickname, setNickname] = useState(initialSession?.displayName ?? "");
+  const [joinAlias, setJoinAlias] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -129,6 +155,17 @@ export function GameShell({
   const [removeTargetId, setRemoveTargetId] = useState<string | null>(null);
   const [storedCommand, setStoredCommand] = useState<StoredCommand | null>(null);
   const [sidebarDetailsOpen, setSidebarDetailsOpen] = useState(false);
+  const [publicRooms, setPublicRooms] = useState<PublicRoomPage | null>(null);
+  const [publicDiscoveryEnabled, setPublicDiscoveryEnabled] = useState(false);
+  const [linkedListingIntent, setLinkedListingIntent] = useState<string | null>(null);
+  const [publicJoinIntent, setPublicJoinIntent] = useState<PublicJoinIntent | null>(null);
+  const [publicAlias, setPublicAlias] = useState("");
+  const [publicJoinError, setPublicJoinError] = useState<string | null>(null);
+  const [listing, setListing] = useState<ViewerListing | null>(null);
+  const [listingDialogAction, setListingDialogAction] = useState<ListingDialogAction | null>(null);
+  const [listingAlias, setListingAlias] = useState("");
+  const [listingPace, setListingPace] = useState<PublicPace>("casual");
+  const [listingError, setListingError] = useState<string | null>(null);
   const gameRef = useRef<GameView | null>(null);
   const eventCursorRef = useRef<{ gameId: string; revision: number } | null>(null);
   const pollRequestRef = useRef<PollRequest | null>(null);
@@ -142,8 +179,11 @@ export function GameShell({
   const testPlayerSwitchingRef = useRef(false);
   const utilityDialogRef = useRef<HTMLDivElement>(null);
   const utilityTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const publicAliasInputRef = useRef<HTMLInputElement>(null);
   const storedRetryKeyRef = useRef<string | null>(null);
   const presenceAvailableRef = useRef(true);
+  const publicJoinMutationRef = useRef<PendingPublicMutation | null>(null);
+  const listingMutationRef = useRef<PendingPublicMutation | null>(null);
   const testClock = useRef(0);
   const [reconnectTick, setReconnectTick] = useState(0);
 
@@ -205,6 +245,32 @@ export function GameShell({
     }
   }, [request]);
 
+  const loadPublicRooms = useCallback(async () => {
+    try {
+      const availabilityResponse = await request<unknown>("/api/public/availability");
+      if (!parsePublicAvailability(availabilityResponse)) {
+        setPublicDiscoveryEnabled(false);
+        setPublicRooms(null);
+        return;
+      }
+      setPublicDiscoveryEnabled(true);
+      try {
+        const response = await request<unknown>("/api/public/rooms");
+        const page = parsePublicRoomPage(response, 20);
+        if (!page && (response as { enabled?: unknown })?.enabled === false) {
+          setPublicDiscoveryEnabled(false);
+        }
+        setPublicRooms(page);
+      } catch {
+        setPublicRooms(null);
+      }
+    } catch {
+      // Public discovery is optional and fail-closed.
+      setPublicDiscoveryEnabled(false);
+      setPublicRooms(null);
+    }
+  }, [request]);
+
   useEffect(() => {
     let cancelled = false;
     void request<SessionResponse>("/api/session")
@@ -219,7 +285,10 @@ export function GameShell({
           : { signedIn: false, displayName: "", development: false };
         setSession(next);
         setNickname((current) => current || next.displayName);
-        if (next.signedIn) void loadLobbies();
+        if (next.signedIn) {
+          void loadLobbies();
+          void loadPublicRooms();
+        }
       })
       .catch(() => {
         if (!cancelled) setSession({ signedIn: false, displayName: "", development: false });
@@ -227,19 +296,27 @@ export function GameShell({
     return () => {
       cancelled = true;
     };
-  }, [loadLobbies, request]);
+  }, [loadLobbies, loadPublicRooms, request]);
 
   useEffect(() => {
     const code = normalizeJoinCodeFromUrl(window.location.search);
-    const hasLinkedGame = new URLSearchParams(window.location.search).has("game");
+    const urlParams = new URLSearchParams(window.location.search);
+    const hasLinkedGame = urlParams.has("game");
+    const listingId = normalizePublicListingId(urlParams.get("listing"));
     const frame = window.requestAnimationFrame(() => {
       if (code) {
         const authUrl = new URL(signInPath, window.location.origin);
         authUrl.searchParams.set("return_to", `/?join=${encodeURIComponent(code)}`);
         setResolvedSignInPath(`${authUrl.pathname}${authUrl.search}`);
         setJoinCode(code);
+        setJoinAlias("");
         setInviteCode(code);
         setInviteDialogOpen(!hasLinkedGame);
+      } else if (listingId) {
+        const authUrl = new URL(signInPath, window.location.origin);
+        authUrl.searchParams.set("return_to", `/?listing=${encodeURIComponent(listingId)}`);
+        setResolvedSignInPath(`${authUrl.pathname}${authUrl.search}`);
+        if (!hasLinkedGame) setLinkedListingIntent(listingId);
       } else {
         setResolvedSignInPath(signInPath);
       }
@@ -247,6 +324,35 @@ export function GameShell({
     });
     return () => window.cancelAnimationFrame(frame);
   }, [signInPath]);
+
+  useEffect(() => {
+    if (
+      !session?.signedIn ||
+      game ||
+      !publicDiscoveryEnabled ||
+      !linkedListingIntent ||
+      publicJoinIntent
+    ) {
+      return;
+    }
+    const room = publicRooms?.rooms.find(
+      (candidate) => candidate.listingId === linkedListingIntent,
+    ) ?? null;
+    const frame = window.requestAnimationFrame(() => {
+      publicJoinMutationRef.current = null;
+      setPublicAlias("");
+      setPublicJoinError(null);
+      setPublicJoinIntent({ kind: "listing", listingId: linkedListingIntent, room });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [
+    game,
+    linkedListingIntent,
+    publicDiscoveryEnabled,
+    publicJoinIntent,
+    publicRooms,
+    session?.signedIn,
+  ]);
 
   useEffect(() => {
     const markOffline = () => setConnectionState("offline");
@@ -289,6 +395,9 @@ export function GameShell({
         pollFailureCountRef.current = 0;
         setConnectionState("live");
         if (response.presence) setPresence(response.presence);
+        if (Object.prototype.hasOwnProperty.call(response, "listing")) {
+          setListing(parseViewerListing(response.listing));
+        }
         if (gameRef.current?.gameId !== gameId) return false;
         const latestCursor = eventCursorRef.current;
         if (
@@ -441,7 +550,10 @@ export function GameShell({
   useEffect(() => {
     const retryReconnect = () => {
       setReconnectTick((current) => current + 1);
-      if (!gameRef.current) void loadLobbies();
+      if (!gameRef.current) {
+        void loadLobbies();
+        void loadPublicRooms();
+      }
     };
     window.addEventListener("focus", retryReconnect);
     window.addEventListener("online", retryReconnect);
@@ -449,7 +561,7 @@ export function GameShell({
       window.removeEventListener("focus", retryReconnect);
       window.removeEventListener("online", retryReconnect);
     };
-  }, [loadLobbies]);
+  }, [loadLobbies, loadPublicRooms]);
 
   useEffect(() => {
     if (!shareFeedback) return;
@@ -510,6 +622,7 @@ export function GameShell({
     initialEvents: EventLine[] = [],
     eventCursor = view.revision,
     initialPresence: PresenceSnapshot | null = null,
+    initialListing: ViewerListing | null = null,
   ) => {
     if (pollRequestRef.current?.gameId !== view.gameId) {
       pollRequestRef.current?.controller.abort();
@@ -520,8 +633,10 @@ export function GameShell({
     setGame(view);
     setEvents(initialEvents.slice(-12));
     setPresence(initialPresence);
+    setListing(initialListing);
     setConnectionState("live");
     setError(null);
+    setJoinAlias("");
     setGameInUrl(view.gameId);
     window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
   }, []);
@@ -538,11 +653,13 @@ export function GameShell({
     setDeclareWithPlay(false);
     setEvents([]);
     setPresence(null);
+    setListing(null);
     setError(null);
     setGameInUrl(null);
     window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
     void loadLobbies();
-  }, [loadLobbies]);
+    void loadPublicRooms();
+  }, [loadLobbies, loadPublicRooms]);
 
   const runBusy = useCallback(async (work: () => Promise<void>): Promise<boolean> => {
     if (busy) return false;
@@ -561,23 +678,41 @@ export function GameShell({
 
   const createLobby = async () => {
     return runBusy(async () => {
-      const response = await request<{ view: GameView }>("/api/games", {
+      const response = await request<GameSnapshotResponse>("/api/games", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ commandId: commandId(), nickname }),
       });
-      enterGame(response.view);
+      enterGame(
+        response.view,
+        response.events ?? [],
+        response.eventCursor ?? response.view.revision,
+        response.presence ?? null,
+        parseViewerListing(response.listing),
+      );
     });
   };
 
   const joinLobby = async (code = joinCode) => {
+    const alias = normalizeRoomAlias(joinAlias);
+    if (!isValidRoomAlias(alias)) {
+      setError(ROOM_ALIAS_ERROR);
+      return false;
+    }
     return runBusy(async () => {
-      const response = await request<{ view: GameView }>("/api/games/join", {
+      const response = await request<GameSnapshotResponse>("/api/games/join", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ commandId: commandId(), joinCode: code, nickname }),
+        body: JSON.stringify({ commandId: commandId(), joinCode: code, nickname: alias }),
       });
-      enterGame(response.view);
+      setNickname(alias);
+      enterGame(
+        response.view,
+        response.events ?? [],
+        response.eventCursor ?? response.view.revision,
+        response.presence ?? null,
+        parseViewerListing(response.listing),
+      );
     });
   };
 
@@ -591,6 +726,7 @@ export function GameShell({
         response.events ?? [],
         response.eventCursor ?? response.view.revision,
         response.presence ?? null,
+        parseViewerListing(response.listing),
       );
     });
   };
@@ -605,6 +741,7 @@ export function GameShell({
           view?: GameView;
           events?: EventLine[];
           replayed: boolean;
+          listing?: ViewerListing | null;
         }>(`/api/games/${encodeURIComponent(commandGame.gameId)}/commands`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -615,6 +752,9 @@ export function GameShell({
           }),
         });
         const responseRevision = response.view?.revision ?? null;
+        if (Object.prototype.hasOwnProperty.call(response, "listing")) {
+          setListing(parseViewerListing(response.listing));
+        }
         const cursorBeforeResponse = eventCursorRef.current;
         const responseAlreadyObserved =
           responseRevision !== null &&
@@ -730,6 +870,7 @@ export function GameShell({
             response.events ?? [],
             response.eventCursor ?? response.view.revision,
             response.presence ?? null,
+            parseViewerListing(response.listing),
           );
         }
       })
@@ -764,12 +905,222 @@ export function GameShell({
   const dismissInvite = () => {
     setInviteDialogOpen(false);
     setInviteError(null);
+    setJoinAlias("");
     clearJoinFromUrl();
     setInviteCode(null);
   };
 
+  const openPublicJoin = (room: PublicRoomCard, trigger: HTMLButtonElement) => {
+    utilityTriggerRef.current = trigger;
+    publicJoinMutationRef.current = null;
+    setPublicAlias("");
+    setPublicJoinError(null);
+    setLinkedListingIntent(null);
+    setPublicJoinIntent({ kind: "listing", listingId: room.listingId, room });
+    setListingInUrl(room.listingId);
+  };
+
+  const openQuickJoin = (trigger: HTMLButtonElement) => {
+    utilityTriggerRef.current = trigger;
+    publicJoinMutationRef.current = null;
+    setPublicAlias("");
+    setPublicJoinError(null);
+    setLinkedListingIntent(null);
+    setPublicJoinIntent({ kind: "quick" });
+  };
+
+  const closePublicJoin = useCallback(() => {
+    const wasListingIntent = publicJoinIntent?.kind === "listing";
+    setPublicJoinIntent(null);
+    setPublicAlias("");
+    setPublicJoinError(null);
+    setLinkedListingIntent(null);
+    publicJoinMutationRef.current = null;
+    if (wasListingIntent) clearListingFromUrl();
+    window.requestAnimationFrame(() => utilityTriggerRef.current?.focus());
+  }, [publicJoinIntent?.kind]);
+
+  const confirmPublicJoin = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    if (!publicJoinIntent || busy) return;
+    const alias = normalizeRoomAlias(publicAlias);
+    if (!isValidRoomAlias(alias)) {
+      setPublicJoinError(ROOM_ALIAS_ERROR);
+      publicAliasInputRef.current?.focus();
+      return;
+    }
+    const path = publicJoinIntent.kind === "quick"
+      ? "/api/public/quick-join"
+      : `/api/public/rooms/${encodeURIComponent(publicJoinIntent.listingId)}/join`;
+    const payload = { alias };
+    const fingerprint = JSON.stringify({ path, payload });
+    const requestCommandId = publicJoinMutationRef.current?.fingerprint === fingerprint
+      ? publicJoinMutationRef.current.commandId
+      : commandId();
+    publicJoinMutationRef.current = { commandId: requestCommandId, fingerprint };
+    setBusy(true);
+    setPublicJoinError(null);
+    try {
+      const response = await request<GameSnapshotResponse>(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commandId: requestCommandId, ...payload }),
+      });
+      publicJoinMutationRef.current = null;
+      setPublicJoinIntent(null);
+      setPublicJoinError(null);
+      setPublicAlias("");
+      setLinkedListingIntent(null);
+      setNickname(alias);
+      clearListingFromUrl();
+      enterGame(
+        response.view,
+        response.events ?? [],
+        response.eventCursor ?? response.view.revision,
+        response.presence ?? null,
+        parseViewerListing(response.listing),
+      );
+    } catch (failure) {
+      const code = (failure as RequestFailure).code;
+      if (["DISCOVERY_DISABLED", "FEATURE_DISABLED", "ROUTE_NOT_FOUND"].includes(code ?? "")) {
+        setPublicDiscoveryEnabled(false);
+        setPublicRooms(null);
+        setPublicJoinIntent(null);
+        setLinkedListingIntent(null);
+        setPublicJoinError(null);
+        publicJoinMutationRef.current = null;
+        clearListingFromUrl();
+      } else {
+        setPublicJoinError(publicJoinFailureMessage(code));
+        if (
+          code !== "REQUEST_TIMEOUT" &&
+          !(failure instanceof TypeError) &&
+          navigator.onLine
+        ) {
+          publicJoinMutationRef.current = null;
+        }
+        void loadPublicRooms();
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openListingDialog = (
+    action: ListingDialogAction,
+    trigger: HTMLButtonElement,
+  ) => {
+    utilityTriggerRef.current = trigger;
+    listingMutationRef.current = null;
+    setListingDialogAction(action);
+    setListingAlias("");
+    setListingPace(listing?.pace ?? "casual");
+    setListingError(null);
+  };
+
+  const closeListingDialog = useCallback(() => {
+    setListingDialogAction(null);
+    setListingAlias("");
+    setListingError(null);
+    listingMutationRef.current = null;
+    window.requestAnimationFrame(() => utilityTriggerRef.current?.focus());
+  }, []);
+
+  const confirmListingChange = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    const currentGame = gameRef.current;
+    if (!currentGame || !listing || !listingDialogAction || busy) return;
+    const alias = normalizeRoomAlias(listingAlias);
+    if (listingDialogAction === "publish" && !isValidRoomAlias(alias)) {
+      setListingError(ROOM_ALIAS_ERROR);
+      publicAliasInputRef.current?.focus();
+      return;
+    }
+    const path = `/api/games/${encodeURIComponent(currentGame.gameId)}/listing`;
+    const payload = {
+      expectedRevision: currentGame.revision,
+      expectedListingVersion: listing.version,
+      action: listingDialogAction,
+      ...(listingDialogAction === "publish"
+        ? { alias, pace: listingPace }
+        : {}),
+    };
+    const fingerprint = JSON.stringify({ path, payload });
+    const requestCommandId = listingMutationRef.current?.fingerprint === fingerprint
+      ? listingMutationRef.current.commandId
+      : commandId();
+    listingMutationRef.current = { commandId: requestCommandId, fingerprint };
+    setBusy(true);
+    setListingError(null);
+    try {
+      const response = await request<{ listing: unknown; view: GameView }>(
+        path,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ commandId: requestCommandId, ...payload }),
+        },
+      );
+      const nextListing = parseViewerListing(response.listing);
+      if (!nextListing) {
+        setListing(null);
+        throw new Error("Public listing is unavailable for this table right now.");
+      }
+      if (gameRef.current?.gameId === response.view.gameId) {
+        const currentCursor = eventCursorRef.current;
+        gameRef.current = response.view;
+        setGame(response.view);
+        eventCursorRef.current = {
+          gameId: response.view.gameId,
+          revision:
+            currentCursor?.gameId === response.view.gameId
+              ? currentCursor.revision
+              : listingDialogAction === "publish"
+                ? Math.max(0, response.view.revision - 1)
+                : response.view.revision,
+        };
+      }
+      if (listingDialogAction === "publish") setNickname(alias);
+      setListing(nextListing);
+      setListingDialogAction(null);
+      setListingAlias("");
+      setListingError(null);
+      listingMutationRef.current = null;
+      window.requestAnimationFrame(() => utilityTriggerRef.current?.focus());
+    } catch (failure) {
+      const code = (failure as RequestFailure).code;
+      if (["DISCOVERY_DISABLED", "FEATURE_DISABLED", "NOT_FOUND", "ROUTE_NOT_FOUND"].includes(code ?? "")) {
+        setListing(null);
+        setListingDialogAction(null);
+        listingMutationRef.current = null;
+      } else {
+        setListingError(
+          failure instanceof Error && !code
+            ? failure.message
+            : listingFailureMessage(code),
+        );
+        if (
+          code !== "REQUEST_TIMEOUT" &&
+          !(failure instanceof TypeError) &&
+          navigator.onLine
+        ) {
+          listingMutationRef.current = null;
+        }
+        if (code === "VERSION_CONFLICT" || code === "LISTING_VERSION_CONFLICT") {
+          void refreshGame(currentGame.gameId);
+        }
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const confirmInvite = async () => {
     if (!inviteCode) return;
+    if (!isValidRoomAlias(joinAlias)) {
+      setInviteError(ROOM_ALIAS_ERROR);
+      return;
+    }
     setInviteError(null);
     const joined = await joinLobby(inviteCode);
     if (joined) {
@@ -970,6 +1321,11 @@ export function GameShell({
     (game.legalActions as GameView["legalActions"] & { canRematch?: boolean }).canRematch,
   );
   const removeTarget = game?.players.find((player) => player.playerId === removeTargetId) ?? null;
+  const publicJoinRoom = publicJoinIntent?.kind === "listing"
+    ? publicJoinIntent.room ?? publicRooms?.rooms.find(
+        (room) => room.listingId === publicJoinIntent.listingId,
+      ) ?? null
+    : null;
   const actionPending =
     busy || Boolean(storedCommand && storedCommand.gameId === game?.gameId);
   const pendingCanConfirm = useMemo(() => {
@@ -992,6 +1348,8 @@ export function GameShell({
     Boolean(pendingCard) ||
     testPlayerDialogOpen ||
     inviteDialogOpen ||
+    Boolean(publicJoinIntent) ||
+    Boolean(listingDialogAction) ||
     Boolean(guideTopic) ||
     Boolean(removeTargetId);
 
@@ -1083,7 +1441,13 @@ export function GameShell({
   }, [closeTestPlayerDialog, testPlayerDialogOpen]);
 
   useEffect(() => {
-    if (!inviteDialogOpen && !guideTopic && !removeTargetId) return;
+    if (
+      !inviteDialogOpen &&
+      !publicJoinIntent &&
+      !listingDialogAction &&
+      !guideTopic &&
+      !removeTargetId
+    ) return;
     const dialog = utilityDialogRef.current;
     if (!dialog) return;
     const focusables = () =>
@@ -1097,6 +1461,8 @@ export function GameShell({
     });
     const closeUtility = () => {
       if (inviteDialogOpen) dismissInvite();
+      else if (publicJoinIntent) closePublicJoin();
+      else if (listingDialogAction) closeListingDialog();
       else if (removeTargetId) closeInactiveRemoval();
       else closeGuide();
     };
@@ -1128,7 +1494,17 @@ export function GameShell({
       window.cancelAnimationFrame(frame);
       document.removeEventListener("keydown", onKeyDown);
     };
-  }, [closeGuide, closeInactiveRemoval, guideTopic, inviteDialogOpen, removeTargetId]);
+  }, [
+    closeGuide,
+    closeInactiveRemoval,
+    closeListingDialog,
+    closePublicJoin,
+    guideTopic,
+    inviteDialogOpen,
+    listingDialogAction,
+    publicJoinIntent,
+    removeTargetId,
+  ]);
 
   if (!session) {
     return (
@@ -1208,14 +1584,22 @@ export function GameShell({
           <LobbyBrowser
             nickname={nickname}
             setNickname={setNickname}
+            joinAlias={joinAlias}
+            setJoinAlias={setJoinAlias}
             joinCode={joinCode}
             setJoinCode={setJoinCode}
             lobbies={lobbies}
+            publicRooms={publicRooms}
             busy={busy}
             createLobby={() => void createLobby()}
             joinLobby={(code) => void joinLobby(code)}
             openGame={(id) => void openGame(id)}
-            refresh={() => void loadLobbies()}
+            openPublicJoin={openPublicJoin}
+            openQuickJoin={openQuickJoin}
+            refresh={() => {
+              void loadLobbies();
+              void loadPublicRooms();
+            }}
             openGuide={openGuide}
           />
         ) : (
@@ -1229,6 +1613,46 @@ export function GameShell({
               <strong>{turnCoach?.title}</strong>
               <span>{game.phase === "lobby" ? lobbyReadiness : turnCoach?.detail}</span>
             </div>
+
+            {game.phase === "lobby" && game.isHost && listing ? (
+              <section className={`public-listing-control is-${listing.state}`} aria-labelledby="public-listing-title">
+                <div>
+                  <span className="eyebrow">Open-table listing</span>
+                  <h2 id="public-listing-title">
+                    {listing.state === "listed"
+                      ? "This table is open"
+                      : listing.state === "suppressed"
+                        ? "Listing temporarily paused"
+                        : "Private by default"}
+                  </h2>
+                  <p>
+                    {listing.state === "listed"
+                      ? `Anonymous players can find ${listing.pace === "quick" ? "a quick" : "a casual"} table. Public cards show only seats, pace, rules, and broad wait age.`
+                      : listing.state === "suppressed"
+                        ? "The server has hidden this table while host presence recovers. Seated players are unchanged."
+                        : "Publish only when you want strangers to join. Your room alias is never shown on the public card."}
+                  </p>
+                  {listing.state === "private" && listingUnavailableReason(listing.reason) ? (
+                    <span className="listing-reason">{listingUnavailableReason(listing.reason)}</span>
+                  ) : null}
+                </div>
+                <div className="public-listing-control__action">
+                  {listing.state !== "private" ? (
+                    <span className="listing-state-chip">{listing.state === "listed" ? "Listed" : "Paused"}</span>
+                  ) : null}
+                  <button
+                    className={listing.state === "private" ? "primary-button acid" : "secondary-button"}
+                    disabled={actionPending || (listing.state === "private" && !listing.canPublish)}
+                    onClick={(event) => openListingDialog(
+                      listing.state === "private" ? "publish" : "unpublish",
+                      event.currentTarget,
+                    )}
+                  >
+                    {listing.state === "private" ? "List publicly" : "Make private"}
+                  </button>
+                </div>
+              </section>
+            ) : null}
 
             {game.phase === "playing" && hasTurnActions ? (
               <div className="turn-actions is-urgent" aria-label="Available actions">
@@ -1464,7 +1888,7 @@ export function GameShell({
         )}
       </div>
 
-      {inviteDialogOpen || guideTopic || removeTarget ? (
+      {inviteDialogOpen || publicJoinIntent || listingDialogAction || guideTopic || removeTarget ? (
         <div
           ref={utilityDialogRef}
           className="choice-overlay"
@@ -1473,9 +1897,13 @@ export function GameShell({
           aria-labelledby={
             inviteDialogOpen
               ? "invite-dialog-title"
+              : publicJoinIntent
+                ? "public-join-title"
+                : listingDialogAction
+                  ? "public-listing-dialog-title"
               : removeTarget
-                ? "remove-player-title"
-                : "game-guide-title"
+                  ? "remove-player-title"
+                  : "game-guide-title"
           }
           tabIndex={-1}
         >
@@ -1484,26 +1912,165 @@ export function GameShell({
               <span className="eyebrow">You’re invited</span>
               <h2 id="invite-dialog-title">Join table {inviteCode}?</h2>
               <p className="dialog-copy">
-                Confirm your table name, then join the lobby. No code entry needed.
+                Choose a room alias, then join the lobby. Your account name is never filled in.
               </p>
               <label className="input-label dialog-input" htmlFor="invite-player-name">
-                <span>Playing as</span>
+                <span>Room alias</span>
                 <input
                   id="invite-player-name"
-                  value={nickname}
-                  maxLength={28}
-                  onChange={(event) => setNickname(event.target.value)}
-                  autoComplete="nickname"
+                  value={joinAlias}
+                  maxLength={ROOM_ALIAS_MAX_LENGTH}
+                  onChange={(event) => {
+                    setJoinAlias(event.target.value);
+                    if (inviteError) setInviteError(null);
+                  }}
+                  autoComplete="off"
+                  placeholder="Choose a table name"
                 />
               </label>
+              <p className="dialog-privacy-note">Only the alias you enter will be visible to seated players.</p>
               {inviteError ? <p className="field-error invite-error" role="alert">{inviteError}</p> : null}
               <div className="dialog-actions">
                 <button className="secondary-button" disabled={busy} onClick={dismissInvite}>Use another code</button>
-                <button className="primary-button acid" disabled={busy || !nickname.trim()} onClick={() => void confirmInvite()}>
+                <button className="primary-button acid" disabled={busy || !joinAlias.trim()} onClick={() => void confirmInvite()}>
                   {busy ? "Joining…" : "Join this table"}
                 </button>
               </div>
             </div>
+          ) : publicJoinIntent ? (
+            <form className="choice-panel public-join-panel" onSubmit={confirmPublicJoin}>
+              <span className="eyebrow">
+                {publicJoinIntent.kind === "quick" ? "Quick join" : "Open table"}
+              </span>
+              <h2 id="public-join-title">
+                {publicJoinIntent.kind === "quick"
+                  ? "Find your next table?"
+                  : "Join this open table?"}
+              </h2>
+              <p className="dialog-copy">
+                Confirm a room alias. The server will check the table again before it takes your seat.
+              </p>
+              {publicJoinRoom ? (
+                <div className="public-join-summary" aria-label="Selected open table">
+                  <strong>{publicJoinRoom.occupancy}/{publicJoinRoom.capacity} players</strong>
+                  <span>{publicJoinRoom.pace === "quick" ? "Quick pace" : "Casual pace"}</span>
+                  <span>Merciless baseline</span>
+                  <span>{waitingAgeLabel(publicJoinRoom.waitingAge)}</span>
+                </div>
+              ) : null}
+              <label className="input-label dialog-input" htmlFor="public-room-alias">
+                <span>Room alias</span>
+                <input
+                  ref={publicAliasInputRef}
+                  id="public-room-alias"
+                  value={publicAlias}
+                  maxLength={ROOM_ALIAS_MAX_LENGTH}
+                  autoComplete="off"
+                  placeholder="Choose a table name"
+                  aria-required="true"
+                  aria-invalid={Boolean(publicJoinError)}
+                  aria-describedby="public-room-alias-note"
+                  onChange={(event) => {
+                    setPublicAlias(event.target.value);
+                    if (publicJoinError) setPublicJoinError(null);
+                  }}
+                />
+              </label>
+              <p id="public-room-alias-note" className="dialog-privacy-note">
+                Your account name is not filled in. Only the alias you enter will appear to seated players.
+              </p>
+              {publicJoinError ? <p className="field-error invite-error" role="alert">{publicJoinError}</p> : null}
+              <div className="dialog-actions">
+                <button type="button" className="secondary-button" disabled={busy} onClick={closePublicJoin}>
+                  Back to open tables
+                </button>
+                <button type="submit" className="primary-button acid" disabled={busy || !publicAlias.trim()}>
+                  {busy ? "Checking table…" : "Confirm alias & join"}
+                </button>
+              </div>
+            </form>
+          ) : listingDialogAction ? (
+            <form className="choice-panel public-listing-panel" onSubmit={confirmListingChange}>
+              <span className="eyebrow">Host control</span>
+              <h2 id="public-listing-dialog-title">
+                {listingDialogAction === "publish"
+                  ? "List this table publicly?"
+                  : "Make this table private?"}
+              </h2>
+              {listingDialogAction === "publish" ? (
+                <>
+                  <p className="dialog-copy">
+                    Before sign-in, strangers see only 1 of 6 players, your chosen pace, the rules profile, and a broad waiting age.
+                  </p>
+                  <label className="input-label dialog-input" htmlFor="public-host-alias">
+                    <span>Your room alias</span>
+                    <input
+                      ref={publicAliasInputRef}
+                      id="public-host-alias"
+                      value={listingAlias}
+                      maxLength={ROOM_ALIAS_MAX_LENGTH}
+                      autoComplete="off"
+                      placeholder="Choose a table name"
+                      aria-required="true"
+                      aria-invalid={Boolean(listingError)}
+                      aria-describedby="public-host-alias-note"
+                      onChange={(event) => {
+                        setListingAlias(event.target.value);
+                        if (listingError) setListingError(null);
+                      }}
+                    />
+                  </label>
+                  <p id="public-host-alias-note" className="dialog-privacy-note">
+                    This starts empty and never falls back to your account name. It becomes visible only to players after they join.
+                  </p>
+                  <fieldset className="pace-fieldset">
+                    <legend>Table pace</legend>
+                    <div className="pace-options">
+                      {PUBLIC_PACES.map((pace) => (
+                        <label
+                          key={pace}
+                          htmlFor={`public-table-pace-${pace}`}
+                          aria-label={`${pace === "quick" ? "Quick" : "Casual"} table pace`}
+                          className={listingPace === pace ? "is-selected" : ""}
+                        >
+                          <input
+                            id={`public-table-pace-${pace}`}
+                            type="radio"
+                            name="public-table-pace"
+                            value={pace}
+                            checked={listingPace === pace}
+                            onChange={() => setListingPace(pace)}
+                          />
+                          <span>
+                            <strong>{pace === "quick" ? "Quick" : "Casual"}</strong>
+                            <small>{pace === "quick" ? "Ready to start soon" : "Room for a relaxed setup"}</small>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                </>
+              ) : (
+                <p className="dialog-copy">
+                  The table disappears from open discovery immediately. Everyone already seated stays in the lobby, and private invite links keep working.
+                </p>
+              )}
+              {listingError ? <p className="field-error invite-error" role="alert">{listingError}</p> : null}
+              <div className="dialog-actions">
+                <button type="button" className="secondary-button" disabled={busy} onClick={closeListingDialog}>Cancel</button>
+                <button
+                  type="submit"
+                  className={listingDialogAction === "publish" ? "primary-button acid" : "primary-button"}
+                  disabled={busy || (listingDialogAction === "publish" && !listingAlias.trim())}
+                >
+                  {busy
+                    ? "Saving…"
+                    : listingDialogAction === "publish"
+                      ? "Confirm & list publicly"
+                      : "Confirm & make private"}
+                </button>
+              </div>
+            </form>
           ) : removeTarget ? (
             <div className="choice-panel">
               <span className="eyebrow">Host control</span>
@@ -1707,25 +2274,35 @@ export function GameShell({
 function LobbyBrowser({
   nickname,
   setNickname,
+  joinAlias,
+  setJoinAlias,
   joinCode,
   setJoinCode,
   lobbies,
+  publicRooms,
   busy,
   createLobby,
   joinLobby,
   openGame,
+  openPublicJoin,
+  openQuickJoin,
   refresh,
   openGuide,
 }: {
   nickname: string;
   setNickname: (value: string) => void;
+  joinAlias: string;
+  setJoinAlias: (value: string) => void;
   joinCode: string;
   setJoinCode: (value: string) => void;
   lobbies: Lobbies;
+  publicRooms: PublicRoomPage | null;
   busy: boolean;
   createLobby: () => void;
   joinLobby: (code?: string) => void;
   openGame: (id: string) => void;
+  openPublicJoin: (room: PublicRoomCard, trigger: HTMLButtonElement) => void;
+  openQuickJoin: (trigger: HTMLButtonElement) => void;
   refresh: () => void;
   openGuide: (topic: GuideTopic, trigger?: HTMLButtonElement) => void;
 }) {
@@ -1758,11 +2335,21 @@ function LobbyBrowser({
           </div>
         </div>
         <div className="control-card join-card">
-          <span className="step-number">02</span>
-          <div>
-            <span className="eyebrow">Join your friends</span>
-            <label className="input-label">
-              <span>Table code</span>
+            <span className="step-number">02</span>
+            <div>
+              <span className="eyebrow">Join your friends</span>
+              <label className="input-label join-alias-input">
+                <span>Room alias</span>
+                <input
+                  value={joinAlias}
+                  maxLength={ROOM_ALIAS_MAX_LENGTH}
+                  autoComplete="off"
+                  onChange={(event) => setJoinAlias(event.target.value)}
+                  placeholder="Choose a table name"
+                />
+              </label>
+              <label className="input-label">
+                <span>Table code</span>
               <input
                 className="code-input"
                 value={joinCode}
@@ -1771,10 +2358,60 @@ function LobbyBrowser({
                 placeholder="ABC123"
               />
             </label>
-            <button className="primary-button acid" disabled={busy || joinCode.length !== 6 || !nickname.trim()} onClick={() => joinLobby()}>Join the table</button>
+            <button className="primary-button acid" disabled={busy || joinCode.length !== 6 || !joinAlias.trim()} onClick={() => joinLobby()}>Join the table</button>
           </div>
         </div>
       </div>
+
+      {publicRooms ? (
+        <section className="open-table-pool" aria-labelledby="open-table-pool-title">
+          <div className="section-heading open-table-pool__heading">
+            <div>
+              <span className="eyebrow">Play with someone new</span>
+              <h2 id="open-table-pool-title">Open tables</h2>
+              <p>Choose a table, then confirm a room alias. Public cards never reveal player names or table codes.</p>
+            </div>
+            <div className="open-table-pool__actions">
+              <button
+                className="primary-button acid"
+                disabled={busy || publicRooms.rooms.length === 0}
+                onClick={(event) => openQuickJoin(event.currentTarget)}
+              >
+                Quick join
+              </button>
+              <button className="text-button" disabled={busy} onClick={refresh}>Refresh open tables</button>
+            </div>
+          </div>
+          {publicRooms.rooms.length ? (
+            <div className="open-table-grid">
+              {publicRooms.rooms.map((room) => (
+                <article className="open-table-card" key={room.listingId}>
+                  <span className="open-table-card__pace">{room.pace === "quick" ? "Quick pace" : "Casual pace"}</span>
+                  <strong>{room.occupancy}/{room.capacity} players</strong>
+                  <span>{room.capacity - room.occupancy} {room.capacity - room.occupancy === 1 ? "seat" : "seats"} open</span>
+                  <dl>
+                    <div><dt>Rules</dt><dd>Merciless baseline</dd></div>
+                    <div><dt>Waiting</dt><dd>{waitingAgeLabel(room.waitingAge)}</dd></div>
+                  </dl>
+                  <button
+                    className="secondary-button"
+                    disabled={busy}
+                    onClick={(event) => openPublicJoin(room, event.currentTarget)}
+                    aria-label={`Join an anonymous ${room.pace} table with ${room.occupancy} of ${room.capacity} players`}
+                  >
+                    Choose this table
+                  </button>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-room open-table-empty">
+              <strong>No eligible open tables right now.</strong>
+              <span>Refresh in a moment or create a private table and choose whether to publish it.</span>
+            </div>
+          )}
+        </section>
+      ) : null}
 
       <div className="rooms-section">
         <div className="section-heading">
@@ -1820,9 +2457,34 @@ function setGameInUrl(gameId: string | null): void {
   if (gameId) {
     url.searchParams.set("game", gameId);
     url.searchParams.delete("join");
+    url.searchParams.delete("listing");
   } else {
     url.searchParams.delete("game");
   }
+  window.history.replaceState(
+    window.history.state,
+    "",
+    `${url.pathname}${url.search}${url.hash}`,
+  );
+}
+
+function setListingInUrl(listingId: string): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  url.searchParams.delete("game");
+  url.searchParams.delete("join");
+  url.searchParams.set("listing", listingId);
+  window.history.replaceState(
+    window.history.state,
+    "",
+    `${url.pathname}${url.search}${url.hash}`,
+  );
+}
+
+function clearListingFromUrl(): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  url.searchParams.delete("listing");
   window.history.replaceState(
     window.history.state,
     "",

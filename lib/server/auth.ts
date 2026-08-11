@@ -48,6 +48,22 @@ export function getOptionalRequestUser(request: Request): AuthenticatedUser | nu
   return null;
 }
 
+/**
+ * Public discovery must not mistake the localhost development fallback for an
+ * authenticated visitor. Only an identity explicitly supplied by Sites ingress
+ * or the local test-player header selects personalized discovery behavior.
+ */
+export function getOptionalPublicDiscoveryUser(
+  request: Request,
+): AuthenticatedUser | null {
+  const hasSitesIdentity = Boolean(request.headers.get(USER_ID_HEADER));
+  const hasExplicitDevIdentity =
+    isLocalDevelopment(request) && Boolean(request.headers.get(DEV_USER_HEADER));
+  return hasSitesIdentity || hasExplicitDevIdentity
+    ? getOptionalRequestUser(request)
+    : null;
+}
+
 export function requireRequestUser(request: Request): AuthenticatedUser {
   const user = getOptionalRequestUser(request);
   if (!user) {

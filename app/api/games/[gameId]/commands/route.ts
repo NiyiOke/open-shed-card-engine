@@ -1,7 +1,10 @@
 import { parseGameCommand } from "../../../../../lib/server/command-parser";
 import { GameRuleError } from "../../../../../lib/game/errors";
 import { assertSafeMutationRequest, requireRequestUser } from "../../../../../lib/server/auth";
-import { executeGameCommand } from "../../../../../lib/server/game-store";
+import {
+  executeGameCommand,
+  getViewerListingForGame,
+} from "../../../../../lib/server/game-store";
 import {
   jsonResponse,
   readJsonObject,
@@ -38,7 +41,10 @@ export async function POST(request: Request, context: RouteContext) {
       commandId,
       command,
     );
-    return jsonResponse(result);
+    const listing = result.view
+      ? await getViewerListingForGame(user, gameId)
+      : undefined;
+    return jsonResponse({ ...result, ...(listing ? { listing } : {}) });
   } catch (error) {
     return routeErrorResponse(error);
   }

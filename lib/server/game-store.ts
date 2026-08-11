@@ -17,6 +17,26 @@ import { GAME_PROTOCOL_VERSION, RULES_VERSION } from "../game/types";
 import type { AuthenticatedUser } from "./auth";
 import { cleanNickname } from "./auth";
 import {
+  buildPublicAvailability,
+  buildPublicRoomCard,
+  buildPublicRoomsPage,
+  PUBLIC_DISCOVERY_DISABLED,
+  type PublicAvailability,
+  type PublicRoomsPage,
+  type ViewerListing,
+} from "./discovery-dto";
+import {
+  createPublicListingId,
+  evaluatePublicRoomEligibility,
+  isPublicListingId,
+  normalizePublicAlias,
+  parsePublicPace,
+  PUBLIC_ROOM_CAPACITY,
+  PUBLIC_ROOM_PAGE_LIMIT_ANONYMOUS,
+  PUBLIC_ROOM_PAGE_LIMIT_AUTHENTICATED,
+  type PublicPace,
+} from "./discovery-policy";
+import {
   assertInactiveRemovalPolicy,
   PRESENCE_THRESHOLDS,
   presencePlayer,
@@ -31,6 +51,7 @@ import {
   type RoomCloseReason,
   type RoomStatus,
 } from "./room-lifecycle-policy";
+import { getV15FeaturePolicy } from "./v15-feature-policy";
 
 type ProfileRow = {
   id: string;
@@ -88,6 +109,94 @@ type PresenceRosterRow = {
   last_seen_at: number | null;
 };
 
+type MemberAccessRow = {
+  profile_id: string;
+  event_floor_version: number;
+};
+
+type PublicListingRow = {
+  game_id: string;
+  listing_id: string;
+  owner_profile_id: string;
+  state: "listed" | "unlisted" | "closed";
+  pace: string;
+  version: number;
+  event_floor_version: number;
+  published_at: number;
+  updated_at: number;
+  unlisted_at: number | null;
+  close_reason: string | null;
+};
+
+type PublicAvailabilityRow = {
+  table_count: number;
+  open_seat_count: number;
+};
+
+type PublicRoomRow = {
+  listing_id: string;
+  pace: string;
+  published_at: number;
+  occupancy: number;
+};
+
+type HostPresenceRow = {
+  last_seen_at: number;
+};
+
+type PublicJoinTargetRow = GameRow & {
+  public_listing_id: string;
+  public_listing_owner_profile_id: string;
+  public_listing_state: PublicListingRow["state"];
+  public_listing_pace: string;
+  public_listing_version: number;
+};
+
+type PublicJoinFactsRow = {
+  host_auth_subject: string | null;
+  host_last_seen_at: number | null;
+  host_is_active: number;
+  occupancy: number;
+  all_members_consented: number;
+  viewer_already_member: number;
+  viewer_blocked: number;
+};
+
+export type ListingMutationInput =
+  | Readonly<{
+      action: "publish";
+      alias: string;
+      pace: PublicPace;
+      commandId: string;
+      expectedRevision: number;
+      expectedListingVersion: number | null;
+    }>
+  | Readonly<{
+      action: "unpublish";
+      commandId: string;
+      expectedRevision: number;
+      expectedListingVersion: number;
+    }>;
+
+export type ListingMutationResult = Readonly<{
+  listing: ViewerListing;
+  view: GameView;
+}>;
+
+export type GameSnapshot = Readonly<{
+  view: GameView;
+  events: GameEvent[];
+  eventCursor: number;
+  presence: PresenceSnapshot;
+  listing?: ViewerListing;
+}>;
+
+type PublicJoinExecutionContext = Readonly<{
+  operation: "public_join" | "quick_public_join";
+  requestHash: string;
+  actorQuotaCharged: boolean;
+}>;
+
 type InactiveRemovalCommand = {
   type: "remove_inactive_player";
   targetPlayerId: string;
@@ -129,6 +238,597 @@ let purgePromise: Promise<void> | null = null;
 let lastRoomMaintenanceAt = 0;
 let roomMaintenancePromise: Promise<void> | null = null;
 
+export async function getPublicAvailability(): Promise<PublicAvailability> {
+  if (!getV15FeaturePolicy().discoveryEnabled) {
+    return PUBLIC_DISCOVERY_DISABLED;
+  }
+  const database = await ensureDatabaseSchema();
+  const now = Date.now();
+  await maintainRooms(database, now);
+  const row = await database
+    .prepare(
+      `SELECT COUNT(*) AS table_count,
+              COALESCE(SUM(? - eligible.occupancy), 0) AS open_seat_count
+       FROM (
+         SELECT l.game_id,
+                (
+                  SELECT COUNT(*) FROM game_members occupants
+                  WHERE occupants.game_id = g.id AND occupants.status <> 'left'
+                ) AS occupancy
+         FROM public_game_listings l
+         JOIN games g ON g.id = l.game_id
+         WHERE l.state = 'listed'
+           AND l.owner_profile_id = g.host_profile_id
+           AND g.room_status = 'open' AND g.status = 'lobby'
+           AND g.expires_at > ?
+           AND g.protocol_version = ? AND g.rules_version = ?
+           AND EXISTS (
+             SELECT 1
+             FROM game_members host_member
+             JOIN game_presence host_presence
+               ON host_presence.game_id = host_member.game_id
+              AND host_presence.profile_id = host_member.profile_id
+             WHERE host_member.game_id = g.id
+               AND host_member.profile_id = g.host_profile_id
+               AND host_member.status = 'active'
+               AND host_presence.last_seen_at > ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM game_members member_consent
+             WHERE member_consent.game_id = g.id
+               AND member_consent.status <> 'left'
+               AND member_consent.public_discovery_consent_at IS NULL
+           )
+       ) eligible
+       WHERE eligible.occupancy > 0 AND eligible.occupancy < ?`,
+    )
+    .bind(
+      PUBLIC_ROOM_CAPACITY,
+      now,
+      GAME_PROTOCOL_VERSION,
+      RULES_VERSION,
+      now - PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+      PUBLIC_ROOM_CAPACITY,
+    )
+    .first<PublicAvailabilityRow>();
+  return buildPublicAvailability(
+    Number(row?.table_count ?? 0),
+    Number(row?.open_seat_count ?? 0),
+  );
+}
+
+export async function listPublicRooms(
+  user: AuthenticatedUser | null,
+  cursor: string | null,
+): Promise<PublicRoomsPage> {
+  if (!getV15FeaturePolicy().discoveryEnabled) {
+    return PUBLIC_DISCOVERY_DISABLED;
+  }
+  requireRule(
+    cursor === null || isPublicListingId(cursor),
+    "INVALID_CURSOR",
+    "The public room cursor is invalid.",
+    400,
+  );
+  const database = await ensureDatabaseSchema();
+  const now = Date.now();
+  await maintainRooms(database, now);
+  const viewerProfile = user
+    ? await findProfileForUser(database, user.userId)
+    : null;
+  const pageLimit = user
+    ? PUBLIC_ROOM_PAGE_LIMIT_AUTHENTICATED
+    : PUBLIC_ROOM_PAGE_LIMIT_ANONYMOUS;
+  const cursorClause = cursor
+    ? "AND l.listing_id < ?"
+    : "";
+  const viewerClause = viewerProfile
+    ? `AND NOT EXISTS (
+         SELECT 1 FROM game_members viewer_membership
+         WHERE viewer_membership.game_id = g.id
+           AND viewer_membership.profile_id = ?
+           AND viewer_membership.status <> 'left'
+       )
+       AND NOT EXISTS (
+         SELECT 1
+         FROM game_members table_member
+         JOIN profile_blocks block_edge
+           ON (
+             block_edge.blocker_profile_id = ?
+             AND block_edge.blocked_profile_id = table_member.profile_id
+           ) OR (
+             block_edge.blocked_profile_id = ?
+             AND block_edge.blocker_profile_id = table_member.profile_id
+           )
+         WHERE table_member.game_id = g.id
+           AND table_member.status <> 'left'
+       )`
+    : "";
+  const bindings: unknown[] = [
+    now,
+    GAME_PROTOCOL_VERSION,
+    RULES_VERSION,
+    now - PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+    PUBLIC_ROOM_CAPACITY,
+  ];
+  if (cursor) bindings.push(cursor);
+  if (viewerProfile) {
+    bindings.push(viewerProfile.id, viewerProfile.id, viewerProfile.id);
+  }
+  bindings.push(pageLimit + 1);
+  const rows = await database
+    .prepare(
+      `SELECT l.listing_id, l.pace, l.published_at,
+              (
+                SELECT COUNT(*) FROM game_members occupants
+                WHERE occupants.game_id = g.id AND occupants.status <> 'left'
+              ) AS occupancy
+       FROM public_game_listings l
+       JOIN games g ON g.id = l.game_id
+       WHERE l.state = 'listed'
+         AND l.owner_profile_id = g.host_profile_id
+         AND g.room_status = 'open' AND g.status = 'lobby'
+         AND g.expires_at > ?
+         AND g.protocol_version = ? AND g.rules_version = ?
+         AND EXISTS (
+           SELECT 1
+           FROM game_members host_member
+           JOIN game_presence host_presence
+             ON host_presence.game_id = host_member.game_id
+            AND host_presence.profile_id = host_member.profile_id
+           WHERE host_member.game_id = g.id
+             AND host_member.profile_id = g.host_profile_id
+             AND host_member.status = 'active'
+             AND host_presence.last_seen_at > ?
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM game_members member_consent
+           WHERE member_consent.game_id = g.id
+             AND member_consent.status <> 'left'
+             AND member_consent.public_discovery_consent_at IS NULL
+         )
+         AND (
+           SELECT COUNT(*) FROM game_members occupants
+           WHERE occupants.game_id = g.id AND occupants.status <> 'left'
+         ) BETWEEN 1 AND (? - 1)
+         ${cursorClause}
+         ${viewerClause}
+       ORDER BY l.listing_id DESC
+       LIMIT ?`,
+    )
+    .bind(...bindings)
+    .all<PublicRoomRow>();
+  const visibleRows = rows.results.slice(0, pageLimit);
+  const cards = visibleRows.map((room) => {
+    const pace = parsePublicPace(room.pace);
+    requireRule(
+      pace,
+      "CORRUPT_PUBLIC_LISTING",
+      "A public listing is invalid.",
+      500,
+    );
+    return buildPublicRoomCard(
+      {
+        listingId: room.listing_id,
+        occupancy: Number(room.occupancy),
+        pace,
+        publishedAt: Number(room.published_at),
+      },
+      now,
+    );
+  });
+  const nextCursor =
+    rows.results.length > pageLimit
+      ? visibleRows.at(-1)?.listing_id ?? null
+      : null;
+  return buildPublicRoomsPage(cards, nextCursor);
+}
+
+export async function mutateGameListing(
+  user: AuthenticatedUser,
+  gameId: string,
+  input: ListingMutationInput,
+): Promise<ListingMutationResult> {
+  requireRule(
+    getV15FeaturePolicy().discoveryEnabled,
+    "DISCOVERY_DISABLED",
+    "Public table discovery is not available.",
+    404,
+  );
+  requireRule(
+    Number.isSafeInteger(input.expectedRevision) && input.expectedRevision >= 0,
+    "INVALID_REVISION",
+    "expectedRevision must be a non-negative integer.",
+    400,
+  );
+  requireRule(
+    input.expectedListingVersion === null ||
+      (Number.isSafeInteger(input.expectedListingVersion) &&
+        input.expectedListingVersion >= 0),
+    "INVALID_LISTING_VERSION",
+    "expectedListingVersion must be null or a non-negative integer.",
+    400,
+  );
+  const alias = input.action === "publish"
+    ? normalizePublicAlias(input.alias)
+    : null;
+  if (input.action === "publish") {
+    requireRule(
+      alias,
+      "INVALID_ALIAS",
+      "Use a 2–24 character alias with letters, numbers, spaces, _, apostrophes, or hyphens.",
+      400,
+    );
+    requireRule(
+      parsePublicPace(input.pace),
+      "INVALID_PACE",
+      "pace must be casual or quick.",
+      400,
+    );
+  }
+
+  const database = await ensureDatabaseSchema();
+  const now = Date.now();
+  await maintainRooms(database, now);
+  const profile = await findProfileForUser(database, user.userId);
+  requireRule(
+    profile,
+    "NOT_A_MEMBER",
+    "You are not a member of this game.",
+    403,
+  );
+  const operation = "game_listing";
+  const requestHash = await hashText(
+    JSON.stringify({
+      operation,
+      gameId,
+      action: input.action,
+      expectedRevision: input.expectedRevision,
+      expectedListingVersion: input.expectedListingVersion,
+      ...(input.action === "publish"
+        ? { alias, pace: input.pace }
+        : {}),
+    }),
+  );
+  const existingReceipt = await findCommandReceipt(
+    database,
+    profile.id,
+    input.commandId,
+  );
+  if (existingReceipt) {
+    return listingResultFromReceipt(
+      database,
+      existingReceipt,
+      user,
+      operation,
+      requestHash,
+      gameId,
+      now,
+    );
+  }
+  await enforceMutationQuota(database, now, [
+    {
+      scope: `user:${profile.id}:listing`,
+      windowMs: 60_000,
+      limit: 20,
+    },
+  ]);
+
+  const row = await getGameRow(database, gameId);
+  const state = await parseAndValidateState(row);
+  requireRule(
+    row.version === input.expectedRevision &&
+      state.revision === input.expectedRevision,
+    "VERSION_CONFLICT",
+    "The game changed before the listing update. Refresh and try again.",
+    409,
+  );
+  const actor = requireCurrentMember(state, user.userId);
+  requireRule(
+    state.hostUserId === user.userId && row.host_profile_id === profile.id,
+    "HOST_ONLY",
+    "Only the current host can change public listing settings.",
+    403,
+  );
+  requireRule(
+    actor.status === "active",
+    "PLAYER_NOT_ACTIVE",
+    "Only an active host can change public listing settings.",
+    409,
+  );
+  await enforceMutationQuota(database, now, [
+    { scope: `room:${gameId}:listing`, windowMs: 60_000, limit: 40 },
+  ]);
+  const listing = await readPublicListingForGame(database, gameId);
+  requireRule(
+    (listing === null && input.expectedListingVersion === null) ||
+      (listing !== null && listing.version === input.expectedListingVersion),
+    "VERSION_CONFLICT",
+    "The public listing changed. Refresh and try again.",
+    409,
+  );
+
+  if (input.action === "unpublish") {
+    requireRule(
+      listing?.state === "listed",
+      "VERSION_CONFLICT",
+      "The public listing changed. Refresh and try again.",
+      409,
+    );
+    try {
+      const batch = await database.batch([
+        guardedUnpublishReceiptStatement(
+          database,
+          row,
+          profile.id,
+          input.commandId,
+          operation,
+          requestHash,
+          now,
+          input.expectedListingVersion,
+        ),
+        guardedListingVisibilityStatement(
+          database,
+          gameId,
+          profile.id,
+          input.commandId,
+          requestHash,
+          "unlisted",
+          "host_unpublished",
+          now,
+        ),
+      ]);
+      if ((batch.at(-1)?.meta.changes ?? 0) !== 1) {
+        const receipt = await findCommandReceipt(
+          database,
+          profile.id,
+          input.commandId,
+        );
+        if (receipt) {
+          return listingResultFromReceipt(
+            database,
+            receipt,
+            user,
+            operation,
+            requestHash,
+            gameId,
+            now,
+          );
+        }
+        throw new GameRuleError(
+          "VERSION_CONFLICT",
+          "The public listing changed. Refresh and try again.",
+          409,
+        );
+      }
+    } catch (error) {
+      const receipt = await findCommandReceipt(
+        database,
+        profile.id,
+        input.commandId,
+      );
+      if (receipt) {
+        return listingResultFromReceipt(
+          database,
+          receipt,
+          user,
+          operation,
+          requestHash,
+          gameId,
+          now,
+        );
+      }
+      throw error;
+    }
+    const updatedListing = await readPublicListingForGame(database, gameId);
+    return {
+      listing: await buildViewerListing(
+        database,
+        row,
+        state,
+        user.userId,
+        profile.id,
+        now,
+        updatedListing,
+      ),
+      view: projectGameForUser(state, user.userId),
+    };
+  }
+
+  requireRule(
+    state.phase === "lobby",
+    "NOT_LOBBY",
+    "Only a waiting lobby can be listed publicly.",
+    409,
+  );
+  requireRule(
+    state.players.filter((player) => player.status !== "left").length === 1,
+    "NOT_SOLE_OCCUPANT",
+    "A table can only be published while the host is its sole occupant.",
+    409,
+  );
+  requireRule(
+    listing?.state !== "listed",
+    "VERSION_CONFLICT",
+    "This table is already listed publicly.",
+    409,
+  );
+  const hostPresence = await database
+    .prepare(
+      `SELECT last_seen_at FROM game_presence
+       WHERE game_id = ? AND profile_id = ? LIMIT 1`,
+    )
+    .bind(gameId, profile.id)
+    .first<HostPresenceRow>();
+  requireRule(
+    hostPresence &&
+      Number(hostPresence.last_seen_at) >
+        now - PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+    "HOST_OFFLINE",
+    "Reconnect fully before publishing this table.",
+    409,
+  );
+
+  const nextState = JSON.parse(JSON.stringify(state)) as GameState;
+  const nextHost = nextState.players.find(
+    (player) => player.userId === user.userId,
+  );
+  requireRule(
+    nextHost,
+    "CORRUPT_GAME_STATE",
+    "The host player is missing from stored game state.",
+    500,
+  );
+  nextHost.displayName = alias!;
+  nextState.revision += 1;
+  nextState.updatedAt = now;
+  nextState.processedCommands.push({
+    actorUserId: user.userId,
+    commandId: input.commandId,
+  });
+  if (nextState.processedCommands.length > 64) {
+    nextState.processedCommands.splice(
+      0,
+      nextState.processedCommands.length - 64,
+    );
+  }
+  assertGameInvariants(nextState);
+  const nextJson = JSON.stringify(nextState);
+  const nextHash = await hashText(nextJson);
+  const nextListingId = createPublicListingId();
+  const nextListingVersion = (listing?.version ?? 0) + 1;
+  const events: GameEvent[] = [
+    {
+      type: "public_listing_published",
+      actorPlayerId: actor.playerId,
+      message: "The host listed this table publicly.",
+    },
+  ];
+
+  try {
+    const batch = await database.batch([
+      guardedPublishReceiptStatement(
+        database,
+        row,
+        profile.id,
+        input.commandId,
+        operation,
+        requestHash,
+        nextState.revision,
+        now,
+        input.expectedListingVersion,
+      ),
+      guardedProfileNicknameStatement(
+        database,
+        profile.id,
+        alias!,
+        now,
+        input.commandId,
+        requestHash,
+        gameId,
+      ),
+      guardedEventStatement(
+        database,
+        row,
+        nextState.revision,
+        input.commandId,
+        profile.id,
+        events,
+        nextHash,
+        now,
+        requestHash,
+      ),
+      guardedHostDiscoveryConsentStatement(
+        database,
+        gameId,
+        profile.id,
+        now,
+        input.commandId,
+        requestHash,
+      ),
+      guardedPublishListingStatement(
+        database,
+        gameId,
+        nextListingId,
+        profile.id,
+        input.pace,
+        nextListingVersion,
+        nextState.revision,
+        now,
+        input.expectedListingVersion,
+        input.commandId,
+        requestHash,
+      ),
+      guardedGameUpdateStatement(
+        database,
+        row,
+        nextState,
+        nextJson,
+        nextHash,
+        now,
+        now + LOBBY_LIFETIME_MS,
+        profile.id,
+        input.commandId,
+        requestHash,
+      ),
+    ]);
+    if ((batch.at(-1)?.meta.changes ?? 0) !== 1) {
+      const receipt = await findCommandReceipt(
+        database,
+        profile.id,
+        input.commandId,
+      );
+      if (receipt) {
+        return listingResultFromReceipt(
+          database,
+          receipt,
+          user,
+          operation,
+          requestHash,
+          gameId,
+          now,
+        );
+      }
+      throw new GameRuleError(
+        "VERSION_CONFLICT",
+        "The table changed before publication completed. Refresh and try again.",
+        409,
+      );
+    }
+  } catch (error) {
+    const receipt = await findCommandReceipt(
+      database,
+      profile.id,
+      input.commandId,
+    );
+    if (receipt) {
+      return listingResultFromReceipt(
+        database,
+        receipt,
+        user,
+        operation,
+        requestHash,
+        gameId,
+        now,
+      );
+    }
+    throw error;
+  }
+  const publishedListing = await readPublicListingForGame(database, gameId);
+  return {
+    listing: await buildViewerListing(
+      database,
+      { ...row, version: nextState.revision, state_json: nextJson, state_hash: nextHash },
+      nextState,
+      user.userId,
+      profile.id,
+      now,
+      publishedListing,
+    ),
+    view: projectGameForUser(nextState, user.userId),
+  };
+}
+
 export async function createGame(
   user: AuthenticatedUser,
   nickname: string,
@@ -137,7 +837,7 @@ export async function createGame(
   const database = await ensureDatabaseSchema();
   const now = Date.now();
   await maintainRooms(database, now);
-  const profile = await getOrCreateProfile(user, nickname, database, now);
+  const profile = await getOrCreateProfile(user, nickname, database, now, true);
   const operation = "create_game";
   const requestHash = await hashText(
     JSON.stringify({ operation, nickname: profile.nickname }),
@@ -205,8 +905,9 @@ export async function createGame(
         database
           .prepare(
             `INSERT INTO game_members (
-              game_id, profile_id, seat, role, status, joined_at, join_source
-            ) VALUES (?, ?, 0, 'host', 'active', ?, 'host')`,
+              game_id, profile_id, seat, role, status, joined_at, join_source,
+              event_floor_version
+            ) VALUES (?, ?, 0, 'host', 'active', ?, 'host', 0)`,
           )
           .bind(gameId, profile.id, now),
         presenceUpsertStatement(
@@ -269,19 +970,24 @@ export async function joinGame(
   commandId: string,
 ): Promise<GameView> {
   const joinCode = normalizeJoinCode(joinCodeInput);
+  const alias = normalizePublicAlias(nickname);
+  requireRule(
+    alias,
+    "INVALID_ALIAS",
+    "Use a 2–24 character alias with letters, numbers, spaces, _, apostrophes, or hyphens.",
+    400,
+  );
   const database = await ensureDatabaseSchema();
   const now = Date.now();
   await maintainRooms(database, now);
-  const profile = await getOrCreateProfile(user, nickname, database, now);
+  const initialProfile = await findProfileForUser(database, user.userId);
   const operation = "join_game";
   const requestHash = await hashText(
-    JSON.stringify({ operation, joinCode, nickname: profile.nickname }),
+    JSON.stringify({ operation, joinCode, nickname: alias }),
   );
-  const existingReceipt = await findCommandReceipt(
-    database,
-    profile.id,
-    commandId,
-  );
+  const existingReceipt = initialProfile
+    ? await findCommandReceipt(database, initialProfile.id, commandId)
+    : null;
   if (existingReceipt) {
     return viewFromReceipt(
       database,
@@ -295,8 +1001,31 @@ export async function joinGame(
   }
 
   let quotaCharged = false;
+  const candidateProfileId = crypto.randomUUID();
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    const storedProfile = await findProfileForUser(database, user.userId);
+    const profile: ProfileRow = storedProfile
+      ? { ...storedProfile, nickname: alias }
+      : {
+          id: candidateProfileId,
+          auth_subject: user.userId,
+          nickname: alias,
+        };
+    const acceptedReceipt = storedProfile
+      ? await findCommandReceipt(database, storedProfile.id, commandId)
+      : null;
+    if (acceptedReceipt) {
+      return viewFromReceipt(
+        database,
+        acceptedReceipt,
+        user,
+        operation,
+        requestHash,
+        undefined,
+        joinCode,
+      );
+    }
     const row = await database
       .prepare(
         `SELECT id, join_code, host_profile_id, rules_version, protocol_version,
@@ -310,10 +1039,21 @@ export async function joinGame(
     requireRule(row, "LOBBY_NOT_FOUND", "No lobby uses that code.", 404);
     requireRule(row.expires_at > now, "LOBBY_EXPIRED", "That lobby has expired.", 410);
     requireOpenRoom(row, "That room is closed and cannot be joined.");
+    const current = await parseAndValidateState(row);
+    const alreadyActive = current.players.some(
+      (player) => player.userId === user.userId && player.status !== "left",
+    );
+    const recoversAcceptedJoin = current.processedCommands.some(
+      (entry) =>
+        entry.actorUserId === user.userId && entry.commandId === commandId,
+    );
+    if (alreadyActive && !recoversAcceptedJoin) {
+      return projectGameForUser(current, user.userId);
+    }
     if (!quotaCharged) {
       await enforceMutationQuota(database, now, [
         {
-          scope: `user:${profile.id}:join`,
+          scope: `auth:${user.userId}:join`,
           windowMs: 60_000,
           limit: 30,
         },
@@ -321,11 +1061,10 @@ export async function joinGame(
       ]);
       quotaCharged = true;
     }
-    const current = await parseAndValidateState(row);
     const result = joinLobbyState(current, {
       userId: user.userId,
       playerId: crypto.randomUUID(),
-      displayName: profile.nickname,
+      displayName: alias,
       commandId,
       now,
     });
@@ -335,15 +1074,27 @@ export async function joinGame(
       )!;
       try {
         await database.batch([
-          guardedReceiptStatement(
+          guardedJoinReceiptStatement(
             database,
             row,
             profile.id,
+            storedProfile !== null,
+            user.userId,
             commandId,
             operation,
             requestHash,
             current.revision,
             now,
+          ),
+          guardedPublicProfileProvisionStatement(
+            database,
+            profile.id,
+            user.userId,
+            alias,
+            now,
+            commandId,
+            requestHash,
+            row.id,
           ),
           guardedMembershipUpsertStatement(
             database,
@@ -355,6 +1106,7 @@ export async function joinGame(
             commandId,
             requestHash,
             current.hostUserId,
+            current.revision,
           ),
           guardedPresenceUpsertStatement(
             database,
@@ -400,15 +1152,37 @@ export async function joinGame(
     )!;
     try {
       const batch = await database.batch([
-        guardedReceiptStatement(
+        guardedJoinReceiptStatement(
           database,
           row,
           profile.id,
+          storedProfile !== null,
+          user.userId,
           commandId,
           operation,
           requestHash,
           result.state.revision,
           now,
+        ),
+        guardedListingVisibilityStatement(
+          database,
+          row.id,
+          profile.id,
+          commandId,
+          requestHash,
+          "unlisted",
+          "private_join",
+          now,
+        ),
+        guardedPublicProfileProvisionStatement(
+          database,
+          profile.id,
+          user.userId,
+          alias,
+          now,
+          commandId,
+          requestHash,
+          row.id,
         ),
         guardedEventStatement(
           database,
@@ -440,6 +1214,7 @@ export async function joinGame(
           commandId,
           requestHash,
           result.state.hostUserId,
+          result.state.revision,
         ),
         guardedPresenceUpsertStatement(
           database,
@@ -504,16 +1279,404 @@ export async function joinGame(
   );
 }
 
+export async function joinPublicRoom(
+  user: AuthenticatedUser,
+  listingIdInput: string,
+  aliasInput: string,
+  commandId: string,
+): Promise<GameSnapshot> {
+  return joinSelectedPublicRoom(
+    user,
+    listingIdInput,
+    aliasInput,
+    commandId,
+  );
+}
+
+export async function quickJoinPublicRoom(
+  user: AuthenticatedUser,
+  aliasInput: string,
+  commandId: string,
+): Promise<GameSnapshot> {
+  requireRule(
+    getV15FeaturePolicy().discoveryEnabled,
+    "DISCOVERY_DISABLED",
+    "Public table discovery is not available.",
+    404,
+  );
+  const alias = normalizePublicAlias(aliasInput);
+  requireRule(
+    alias,
+    "INVALID_ALIAS",
+    "Use a 2–24 character alias with letters, numbers, spaces, _, apostrophes, or hyphens.",
+    400,
+  );
+  const database = await ensureDatabaseSchema();
+  const now = Date.now();
+  const operation = "quick_public_join";
+  // The selected opaque locator is deliberately absent. A lost-response retry
+  // must resolve the durable receipt instead of selecting from a changed pool.
+  const requestHash = await hashText(JSON.stringify({ operation, alias }));
+  const existing = await recoverPublicJoinReceipt(
+    database,
+    user,
+    commandId,
+    operation,
+    requestHash,
+  );
+  if (existing) return existing;
+
+  try {
+    await enforceMutationQuota(database, now, [
+      {
+        scope: `auth:${user.userId}:public-join`,
+        windowMs: 60_000,
+        limit: 30,
+      },
+    ]);
+  } catch (error) {
+    const recovered = await recoverPublicJoinReceipt(
+      database,
+      user,
+      commandId,
+      operation,
+      requestHash,
+    );
+    if (recovered) return recovered;
+    throw error;
+  }
+
+  const attemptedListingIds = new Set<string>();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const accepted = await recoverPublicJoinReceipt(
+      database,
+      user,
+      commandId,
+      operation,
+      requestHash,
+    );
+    if (accepted) return accepted;
+
+    const pool = await listPublicRooms(user, null);
+    const candidates = pool.enabled
+      ? pool.rooms.filter(
+          (room) => !attemptedListingIds.has(room.listingId),
+        )
+      : [];
+    if (candidates.length === 0) break;
+    const selected = candidates[secureRandomIndex(candidates.length)];
+    attemptedListingIds.add(selected.listingId);
+    try {
+      return await joinSelectedPublicRoom(
+        user,
+        selected.listingId,
+        alias,
+        commandId,
+        { operation, requestHash, actorQuotaCharged: true },
+      );
+    } catch (error) {
+      if (!isRetryableQuickSelectionError(error)) throw error;
+    }
+  }
+
+  // A concurrent identical request can fill the final table between pool read
+  // and exhaustion. Its durable receipt wins over the empty-pool response.
+  const accepted = await recoverPublicJoinReceipt(
+    database,
+    user,
+    commandId,
+    operation,
+    requestHash,
+  );
+  if (accepted) return accepted;
+  throw new GameRuleError(
+    "NO_ELIGIBLE_PUBLIC_ROOM",
+    "No eligible public table is available right now.",
+    404,
+  );
+}
+
+async function joinSelectedPublicRoom(
+  user: AuthenticatedUser,
+  listingIdInput: string,
+  aliasInput: string,
+  commandId: string,
+  execution?: PublicJoinExecutionContext,
+): Promise<GameSnapshot> {
+  requireRule(
+    getV15FeaturePolicy().discoveryEnabled,
+    "DISCOVERY_DISABLED",
+    "Public table discovery is not available.",
+    404,
+  );
+  requireRule(
+    isPublicListingId(listingIdInput),
+    "PUBLIC_ROOM_UNAVAILABLE",
+    "This public table is no longer available.",
+    404,
+  );
+  const listingId = listingIdInput;
+  const alias = normalizePublicAlias(aliasInput);
+  requireRule(
+    alias,
+    "INVALID_ALIAS",
+    "Use a 2–24 character alias with letters, numbers, spaces, _, apostrophes, or hyphens.",
+    400,
+  );
+
+  const database = await ensureDatabaseSchema();
+  const now = Date.now();
+  const operation = execution?.operation ?? "public_join";
+  const requestHash = execution?.requestHash ?? await hashText(
+    JSON.stringify({ operation, listingId, alias }),
+  );
+  const initialProfile = await findProfileForUser(database, user.userId);
+  const initialReceipt = initialProfile
+    ? await findCommandReceipt(database, initialProfile.id, commandId)
+    : null;
+  if (initialReceipt) {
+    return publicJoinSnapshotFromReceipt(
+      database,
+      initialReceipt,
+      user,
+      operation,
+      requestHash,
+    );
+  }
+
+  // The actor limiter deliberately runs before resolving the opaque target.
+  // This makes guessed locators no cheaper to probe than valid ones.
+  if (!execution?.actorQuotaCharged) {
+    try {
+      await enforceMutationQuota(database, now, [
+        {
+          scope: `auth:${user.userId}:public-join`,
+          windowMs: 60_000,
+          limit: 30,
+        },
+      ]);
+    } catch (error) {
+      const recovered = await recoverPublicJoinReceipt(
+        database,
+        user,
+        commandId,
+        operation,
+        requestHash,
+      );
+      if (recovered) return recovered;
+      throw error;
+    }
+  }
+  await maintainRooms(database, now);
+
+  const candidateProfileId = crypto.randomUUID();
+  let targetQuotaCharged = false;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const profile = await findProfileForUser(database, user.userId);
+    const actorProfileId = profile?.id ?? candidateProfileId;
+    const receipt = profile
+      ? await findCommandReceipt(database, profile.id, commandId)
+      : null;
+    if (receipt) {
+      return publicJoinSnapshotFromReceipt(
+        database,
+        receipt,
+        user,
+        operation,
+        requestHash,
+      );
+    }
+
+    const target = await readPublicJoinTarget(database, listingId);
+    if (!target) throwPublicRoomUnavailable();
+    const current = await requireEligiblePublicJoinTarget(
+      database,
+      target,
+      user.userId,
+      actorProfileId,
+      now,
+    );
+
+    if (!targetQuotaCharged) {
+      try {
+        await enforceMutationQuota(database, now, [
+          {
+            scope: `room:${target.id}:public-join`,
+            windowMs: 60_000,
+            limit: 240,
+          },
+          {
+            scope: `listing:${listingId}:public-join`,
+            windowMs: 60_000,
+            limit: 240,
+          },
+        ]);
+      } catch (error) {
+        const recovered = await recoverPublicJoinReceipt(
+          database,
+          user,
+          commandId,
+          operation,
+          requestHash,
+        );
+        if (recovered) return recovered;
+        throw error;
+      }
+      targetQuotaCharged = true;
+    }
+
+    let joinedResult: ReturnType<typeof joinLobbyState>;
+    try {
+      joinedResult = joinLobbyState(current, {
+        userId: user.userId,
+        playerId: crypto.randomUUID(),
+        displayName: alias,
+        commandId,
+        now,
+      });
+    } catch (error) {
+      if (error instanceof GameRuleError && error.code === "LOBBY_FULL") {
+        throwPublicRoomFull();
+      }
+      if (error instanceof GameRuleError) throwPublicRoomUnavailable();
+      throw error;
+    }
+    if (joinedResult.replayed) throwPublicRoomUnavailable();
+
+    const joined = joinedResult.state.players.find(
+      (player) => player.userId === user.userId,
+    );
+    if (!joined) throwPublicRoomUnavailable();
+    const nextJson = JSON.stringify(joinedResult.state);
+    const nextHash = await hashText(nextJson);
+    const eventCommandId = `public-join:${actorProfileId}:${commandId}`;
+
+    try {
+      const batch = await database.batch([
+        guardedPublicJoinReceiptStatement(
+          database,
+          target,
+          current,
+          actorProfileId,
+          profile !== null,
+          user.userId,
+          commandId,
+          operation,
+          requestHash,
+          joinedResult.state.revision,
+          now,
+        ),
+        guardedPublicProfileProvisionStatement(
+          database,
+          actorProfileId,
+          user.userId,
+          alias,
+          now,
+          commandId,
+          requestHash,
+          target.id,
+        ),
+        guardedEventStatement(
+          database,
+          target,
+          joinedResult.state.revision,
+          commandId,
+          actorProfileId,
+          joinedResult.events,
+          nextHash,
+          now,
+          requestHash,
+          eventCommandId,
+        ),
+        staleSeatCleanupStatement(
+          database,
+          target.id,
+          joined.seat,
+          actorProfileId,
+          actorProfileId,
+          commandId,
+          requestHash,
+        ),
+        guardedPublicMembershipUpsertStatement(
+          database,
+          target.id,
+          actorProfileId,
+          joined,
+          now,
+          commandId,
+          requestHash,
+          joinedResult.state.revision,
+        ),
+        guardedPresenceUpsertStatement(
+          database,
+          target.id,
+          joined.playerId,
+          actorProfileId,
+          now,
+          actorProfileId,
+          commandId,
+          requestHash,
+        ),
+        guardedGameUpdateStatement(
+          database,
+          target,
+          joinedResult.state,
+          nextJson,
+          nextHash,
+          now,
+          now + LOBBY_LIFETIME_MS,
+          actorProfileId,
+          commandId,
+          requestHash,
+          OPEN_ROOM_LIFECYCLE,
+          eventCommandId,
+        ),
+      ]);
+      if ((batch.at(-1)?.meta.changes ?? 0) === 1) {
+        return getGame(user, target.id);
+      }
+    } catch (error) {
+      const accepted = await findCommandReceipt(
+        database,
+        actorProfileId,
+        commandId,
+      );
+      if (accepted) {
+        return publicJoinSnapshotFromReceipt(
+          database,
+          accepted,
+          user,
+          operation,
+          requestHash,
+        );
+      }
+      if (!isRetryableMutationConflict(error)) throw error;
+    }
+
+    const accepted = await findCommandReceipt(
+      database,
+      actorProfileId,
+      commandId,
+    );
+    if (accepted) {
+      return publicJoinSnapshotFromReceipt(
+        database,
+        accepted,
+        user,
+        operation,
+        requestHash,
+      );
+    }
+  }
+
+  throwPublicRoomUnavailable();
+}
+
 export async function getGame(
   user: AuthenticatedUser,
   gameId: string,
   afterRevision?: number,
-): Promise<{
-  view: GameView;
-  events: GameEvent[];
-  eventCursor: number;
-  presence: PresenceSnapshot;
-}> {
+): Promise<GameSnapshot> {
   const database = await ensureDatabaseSchema();
   const now = Date.now();
   await maintainRooms(database, now);
@@ -527,14 +1690,74 @@ export async function getGame(
     "You are not a member of this game.",
     403,
   );
-  const feed = await readPublicEventFeed(database, gameId, afterRevision);
+  const membership = await database
+    .prepare(
+      `SELECT m.profile_id, m.event_floor_version
+       FROM game_members m
+       JOIN profiles p ON p.id = m.profile_id
+       WHERE m.game_id = ? AND p.auth_subject = ? AND m.status <> 'left'
+       LIMIT 1`,
+    )
+    .bind(gameId, user.userId)
+    .first<MemberAccessRow>();
+  requireRule(
+    membership,
+    "NOT_A_MEMBER",
+    "You are not a member of this game.",
+    403,
+  );
+  const feed = await readPublicEventFeed(
+    database,
+    gameId,
+    afterRevision,
+    Math.max(0, Number(membership.event_floor_version)),
+  );
   const presence = await buildPresenceSnapshot(database, state, now);
+  const listing = getV15FeaturePolicy().discoveryEnabled
+    ? await buildViewerListing(
+        database,
+        row,
+        state,
+        user.userId,
+        membership.profile_id,
+        now,
+      )
+    : undefined;
   return {
     view: projectGameForUser(state, user.userId),
     events: feed.events,
     eventCursor: feed.cursor,
     presence,
+    ...(listing ? { listing } : {}),
   };
+}
+
+export async function getViewerListingForGame(
+  user: AuthenticatedUser,
+  gameId: string,
+): Promise<ViewerListing | undefined> {
+  if (!getV15FeaturePolicy().discoveryEnabled) return undefined;
+  const database = await ensureDatabaseSchema();
+  const now = Date.now();
+  await maintainRooms(database, now);
+  const row = await getGameRow(database, gameId);
+  const state = await parseAndValidateState(row);
+  requireCurrentMember(state, user.userId);
+  const profile = await findProfileForUser(database, user.userId);
+  requireRule(
+    profile,
+    "NOT_A_MEMBER",
+    "You are not a member of this game.",
+    403,
+  );
+  return buildViewerListing(
+    database,
+    row,
+    state,
+    user.userId,
+    profile.id,
+    now,
+  );
 }
 
 export async function getGamePresence(
@@ -649,7 +1872,6 @@ export async function executeGameCommand(
       windowMs: 60_000,
       limit: 120,
     },
-    { scope: `room:${gameId}`, windowMs: 60_000, limit: 360 },
   ]);
   const row = await getGameRow(database, gameId);
   const current = await parseAndValidateState(row);
@@ -715,6 +1937,16 @@ export async function executeGameCommand(
     };
   }
 
+  requireRule(
+    currentActor,
+    "NOT_A_MEMBER",
+    "You are not a member of this game.",
+    403,
+  );
+  await enforceMutationQuota(database, now, [
+    { scope: `room:${gameId}`, windowMs: 60_000, limit: 360 },
+  ]);
+
   if (row.version !== expectedRevision || current.revision !== expectedRevision) {
     throw new GameRuleError(
       "VERSION_CONFLICT",
@@ -772,6 +2004,13 @@ export async function executeGameCommand(
         },
       ]
     : result.events;
+  const listingLifecycle = closesEmptyRoom
+    ? ({ state: "closed", reason: "empty" } as const)
+    : result.state.hostUserId !== current.hostUserId
+      ? ({ state: "unlisted", reason: "host_changed" } as const)
+      : current.phase === "lobby" && result.state.phase !== "lobby"
+        ? ({ state: "unlisted", reason: "game_started" } as const)
+        : null;
   const nextJson = JSON.stringify(result.state);
   const nextHash = await hashText(nextJson);
   const expiresAt = closesEmptyRoom
@@ -790,6 +2029,7 @@ export async function executeGameCommand(
       commandId,
       requestHash,
       result.state.hostUserId,
+      0,
     ),
   );
   const actorStillPresent = result.state.players.some(
@@ -859,6 +2099,20 @@ export async function executeGameCommand(
             result.state.revision,
             now,
           ),
+      ...(listingLifecycle
+        ? [
+            guardedListingVisibilityStatement(
+              database,
+              gameId,
+              profile.id,
+              commandId,
+              requestHash,
+              listingLifecycle.state,
+              listingLifecycle.reason,
+              now,
+            ),
+          ]
+        : []),
       guardedEventStatement(
         database,
         row,
@@ -1118,16 +2372,12 @@ async function getOrCreateProfile(
   nicknameInput: string,
   database: D1Database,
   now: number,
+  updateExistingNickname = false,
 ): Promise<ProfileRow> {
-  const existing = await database
-    .prepare(
-      `SELECT id, auth_subject, nickname FROM profiles WHERE auth_subject = ? LIMIT 1`,
-    )
-    .bind(user.userId)
-    .first<ProfileRow>();
+  const existing = await findProfileForUser(database, user.userId);
   const nickname = cleanNickname(nicknameInput || user.suggestedName);
   if (existing) {
-    if (existing.nickname !== nickname) {
+    if (updateExistingNickname && existing.nickname !== nickname) {
       await database
         .prepare("UPDATE profiles SET nickname = ?, updated_at = ? WHERE id = ?")
         .bind(nickname, now, existing.id)
@@ -1151,13 +2401,414 @@ async function getOrCreateProfile(
     .bind(profile.id, profile.auth_subject, profile.nickname, now, now)
     .run();
   return (
-    (await database
-      .prepare(
-        `SELECT id, auth_subject, nickname FROM profiles WHERE auth_subject = ? LIMIT 1`,
-      )
-      .bind(user.userId)
-      .first<ProfileRow>()) ?? profile
+    (await findProfileForUser(database, user.userId)) ?? profile
   );
+}
+
+async function findProfileForUser(
+  database: D1Database,
+  userId: string,
+): Promise<ProfileRow | null> {
+  return database
+    .prepare(
+      `SELECT id, auth_subject, nickname
+       FROM profiles WHERE auth_subject = ? LIMIT 1`,
+    )
+    .bind(userId)
+    .first<ProfileRow>();
+}
+
+async function readPublicJoinTarget(
+  database: D1Database,
+  listingId: string,
+): Promise<PublicJoinTargetRow | null> {
+  return database
+    .prepare(
+      `SELECT g.id, g.join_code, g.host_profile_id, g.rules_version,
+              g.protocol_version, g.status, g.version, g.state_json,
+              g.state_hash, g.room_status, g.closed_at, g.close_reason,
+              g.abandoned_since, g.last_activity_at, g.expires_at,
+              l.listing_id AS public_listing_id,
+              l.owner_profile_id AS public_listing_owner_profile_id,
+              l.state AS public_listing_state,
+              l.pace AS public_listing_pace,
+              l.version AS public_listing_version
+       FROM public_game_listings l
+       JOIN games g ON g.id = l.game_id
+       WHERE l.listing_id = ? LIMIT 1`,
+    )
+    .bind(listingId)
+    .first<PublicJoinTargetRow>();
+}
+
+async function readPublicJoinFacts(
+  database: D1Database,
+  gameId: string,
+  hostProfileId: string,
+  actorProfileId: string,
+): Promise<PublicJoinFactsRow> {
+  const facts = await database
+    .prepare(
+      `SELECT
+         (SELECT p.auth_subject FROM profiles p WHERE p.id = ? LIMIT 1)
+           AS host_auth_subject,
+         (SELECT gp.last_seen_at FROM game_presence gp
+          WHERE gp.game_id = ? AND gp.profile_id = ? LIMIT 1)
+           AS host_last_seen_at,
+         EXISTS (
+           SELECT 1 FROM game_members hm
+           WHERE hm.game_id = ? AND hm.profile_id = ? AND hm.status = 'active'
+         ) AS host_is_active,
+         (SELECT COUNT(*) FROM game_members members
+          WHERE members.game_id = ? AND members.status <> 'left')
+           AS occupancy,
+         NOT EXISTS (
+           SELECT 1 FROM game_members members
+           WHERE members.game_id = ? AND members.status <> 'left'
+             AND members.public_discovery_consent_at IS NULL
+         ) AS all_members_consented,
+         EXISTS (
+           SELECT 1 FROM game_members membership
+           WHERE membership.game_id = ? AND membership.profile_id = ?
+             AND membership.status <> 'left'
+         ) AS viewer_already_member,
+         EXISTS (
+           SELECT 1
+           FROM game_members members
+           JOIN profile_blocks blocks
+             ON (
+               blocks.blocker_profile_id = ?
+               AND blocks.blocked_profile_id = members.profile_id
+             ) OR (
+               blocks.blocker_profile_id = members.profile_id
+               AND blocks.blocked_profile_id = ?
+             )
+           WHERE members.game_id = ? AND members.status <> 'left'
+         ) AS viewer_blocked`,
+    )
+    .bind(
+      hostProfileId,
+      gameId,
+      hostProfileId,
+      gameId,
+      hostProfileId,
+      gameId,
+      gameId,
+      gameId,
+      actorProfileId,
+      actorProfileId,
+      actorProfileId,
+      gameId,
+    )
+    .first<PublicJoinFactsRow>();
+  if (!facts) throwPublicRoomUnavailable();
+  return facts;
+}
+
+async function requireEligiblePublicJoinTarget(
+  database: D1Database,
+  target: PublicJoinTargetRow,
+  viewerUserId: string,
+  actorProfileId: string,
+  now: number,
+): Promise<GameState> {
+  if (
+    !["listed", "unlisted", "closed"].includes(target.public_listing_state) ||
+    !parsePublicPace(target.public_listing_pace) ||
+    !Number.isSafeInteger(target.public_listing_version) ||
+    target.public_listing_version < 1
+  ) {
+    throwPublicRoomUnavailable();
+  }
+
+  let state: GameState;
+  try {
+    state = await parseAndValidateState(target);
+  } catch (error) {
+    if (error instanceof GameRuleError) throwPublicRoomUnavailable();
+    throw error;
+  }
+  const facts = await readPublicJoinFacts(
+    database,
+    target.id,
+    target.host_profile_id,
+    actorProfileId,
+  );
+  const stateOccupancy = state.players.filter(
+    (player) => player.status !== "left",
+  ).length;
+  const viewerAlreadyMember =
+    Number(facts.viewer_already_member) === 1 ||
+    state.players.some(
+      (player) =>
+        player.userId === viewerUserId && player.status !== "left",
+    );
+  const viewerBlocked = Number(facts.viewer_blocked) === 1;
+  // Identity-sensitive rejections always win over the precise selected-card
+  // race responses. A blocked or already-seated viewer must not learn whether
+  // the retained locator is now closed or full.
+  if (viewerAlreadyMember || viewerBlocked) throwPublicRoomUnavailable();
+  // Withdrawing a listing is a privacy boundary. Even if that private room
+  // later closes, its formerly public locator must remain indistinguishable
+  // from every other unavailable locator.
+  if (target.public_listing_state === "unlisted") throwPublicRoomUnavailable();
+  if (
+    target.public_listing_state === "closed" ||
+    target.room_status === "closed"
+  ) {
+    throwPublicRoomClosed();
+  }
+  const hostMatches =
+    target.public_listing_owner_profile_id === target.host_profile_id &&
+    Number(facts.host_is_active) === 1 &&
+    facts.host_auth_subject === state.hostUserId;
+  const eligibility = evaluatePublicRoomEligibility({
+    discoveryEnabled: getV15FeaturePolicy().discoveryEnabled,
+    listingState: target.public_listing_state,
+    roomStatus: target.room_status,
+    gameStatus: target.status as "lobby" | "playing" | "finished",
+    expiresAt: Number(target.expires_at),
+    protocolVersion: Number(target.protocol_version),
+    rulesVersion: target.rules_version,
+    ownerMatchesHost: hostMatches,
+    hostLastSeenAt:
+      facts.host_last_seen_at === null
+        ? null
+        : Number(facts.host_last_seen_at),
+    allMembersConsented:
+      Number(facts.all_members_consented) === 1 &&
+      Number(facts.occupancy) === stateOccupancy,
+    occupancy: Number(facts.occupancy),
+    viewerAlreadyMember,
+    viewerBlocked,
+    now,
+  });
+  if (eligibility.eligible) return state;
+  if (eligibility.reason === "full") throwPublicRoomFull();
+  throwPublicRoomUnavailable();
+}
+
+function throwPublicRoomUnavailable(): never {
+  throw new GameRuleError(
+    "PUBLIC_ROOM_UNAVAILABLE",
+    "This public table is no longer available.",
+    404,
+  );
+}
+
+function throwPublicRoomFull(): never {
+  throw new GameRuleError(
+    "PUBLIC_ROOM_FULL",
+    "This public table is full.",
+    409,
+  );
+}
+
+function throwPublicRoomClosed(): never {
+  throw new GameRuleError(
+    "ROOM_CLOSED",
+    "This room is closed.",
+    410,
+  );
+}
+
+function secureRandomIndex(length: number): number {
+  if (!Number.isSafeInteger(length) || length <= 0) {
+    throw new TypeError("A non-empty public room pool is required.");
+  }
+  const uint32Range = 0x1_0000_0000;
+  const unbiasedLimit = uint32Range - (uint32Range % length);
+  const random = new Uint32Array(1);
+  do {
+    crypto.getRandomValues(random);
+  } while (random[0] >= unbiasedLimit);
+  return random[0] % length;
+}
+
+function isRetryableQuickSelectionError(error: unknown): boolean {
+  return (
+    error instanceof GameRuleError &&
+    [
+      "PUBLIC_ROOM_UNAVAILABLE",
+      "PUBLIC_ROOM_FULL",
+      "ROOM_CLOSED",
+    ].includes(error.code)
+  );
+}
+
+async function publicJoinSnapshotFromReceipt(
+  database: D1Database,
+  receipt: CommandReceiptRow,
+  user: AuthenticatedUser,
+  operation: string,
+  requestHash: string,
+): Promise<GameSnapshot> {
+  assertReceiptMatches(receipt, operation, requestHash);
+  const profile = await findProfileForUser(database, user.userId);
+  requireRule(
+    profile?.id === receipt.actor_profile_id,
+    "IDEMPOTENCY_KEY_REUSED",
+    "That commandId was already used for a different request.",
+    409,
+  );
+  return getGame(user, receipt.game_id);
+}
+
+async function recoverPublicJoinReceipt(
+  database: D1Database,
+  user: AuthenticatedUser,
+  commandId: string,
+  operation: string,
+  requestHash: string,
+): Promise<GameSnapshot | null> {
+  const profile = await findProfileForUser(database, user.userId);
+  if (!profile) return null;
+  const receipt = await findCommandReceipt(database, profile.id, commandId);
+  return receipt
+    ? publicJoinSnapshotFromReceipt(
+        database,
+        receipt,
+        user,
+        operation,
+        requestHash,
+      )
+    : null;
+}
+
+function isRetryableMutationConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:SQLITE_)?CONSTRAINT|UNIQUE constraint|constraint failed/i.test(
+    message,
+  );
+}
+
+async function readPublicListingForGame(
+  database: D1Database,
+  gameId: string,
+): Promise<PublicListingRow | null> {
+  const listing = await database
+    .prepare(
+      `SELECT game_id, listing_id, owner_profile_id, state, pace, version,
+              event_floor_version, published_at, updated_at, unlisted_at,
+              close_reason
+       FROM public_game_listings WHERE game_id = ? LIMIT 1`,
+    )
+    .bind(gameId)
+    .first<PublicListingRow>();
+  if (!listing) return null;
+  requireRule(
+    ["listed", "unlisted", "closed"].includes(listing.state) &&
+      Number.isSafeInteger(listing.version) &&
+      listing.version >= 1,
+    "CORRUPT_PUBLIC_LISTING",
+    "Stored public listing state is invalid.",
+    500,
+  );
+  return listing;
+}
+
+async function buildViewerListing(
+  database: D1Database,
+  row: GameRow,
+  state: GameState,
+  viewerUserId: string,
+  viewerProfileId: string,
+  now: number,
+  listing: PublicListingRow | null = null,
+): Promise<ViewerListing> {
+  const currentListing =
+    listing ?? (await readPublicListingForGame(database, row.id));
+  const activePlayers = state.players.filter(
+    (player) => player.status !== "left",
+  );
+  const hostPlayer = state.players.find(
+    (player) => player.userId === state.hostUserId,
+  );
+  const isHost =
+    viewerUserId === state.hostUserId &&
+    viewerProfileId === row.host_profile_id;
+  const hostPresence = await database
+    .prepare(
+      `SELECT last_seen_at FROM game_presence
+       WHERE game_id = ? AND profile_id = ? LIMIT 1`,
+    )
+    .bind(row.id, row.host_profile_id)
+    .first<HostPresenceRow>();
+  const hostIsLive = Boolean(
+    hostPlayer?.status === "active" &&
+      hostPresence &&
+      Number(hostPresence.last_seen_at) >
+        now - PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+  );
+  const compatibleListedState = Boolean(
+    currentListing?.state === "listed" &&
+      currentListing.owner_profile_id === row.host_profile_id &&
+      row.room_status === "open" &&
+      state.phase === "lobby",
+  );
+
+  if (compatibleListedState) {
+    const pace = parsePublicPace(currentListing!.pace);
+    requireRule(
+      pace,
+      "CORRUPT_PUBLIC_LISTING",
+      "Stored public listing pace is invalid.",
+      500,
+    );
+    return {
+      state: hostIsLive ? "listed" : "suppressed",
+      pace,
+      version: currentListing!.version,
+      canPublish: false,
+      ...(!hostIsLive ? { reason: "HOST_OFFLINE" as const } : {}),
+    };
+  }
+
+  let reason: ViewerListing["reason"];
+  if (!isHost) reason = "NOT_HOST";
+  else if (state.phase !== "lobby") reason = "NOT_LOBBY";
+  else if (activePlayers.length !== 1) reason = "NOT_SOLE_OCCUPANT";
+  else if (!hostIsLive) reason = "HOST_OFFLINE";
+  return {
+    state: "private",
+    pace: null,
+    version: currentListing?.version ?? null,
+    canPublish: reason === undefined,
+    ...(reason ? { reason } : {}),
+  };
+}
+
+async function listingResultFromReceipt(
+  database: D1Database,
+  receipt: CommandReceiptRow,
+  user: AuthenticatedUser,
+  operation: string,
+  requestHash: string,
+  gameId: string,
+  now: number,
+): Promise<ListingMutationResult> {
+  assertReceiptMatches(receipt, operation, requestHash, gameId);
+  const profile = await findProfileForUser(database, user.userId);
+  requireRule(
+    profile?.id === receipt.actor_profile_id,
+    "NOT_A_MEMBER",
+    "You are not a member of this game.",
+    403,
+  );
+  const row = await getGameRow(database, gameId);
+  const state = await parseAndValidateState(row);
+  requireCurrentMember(state, user.userId);
+  return {
+    listing: await buildViewerListing(
+      database,
+      row,
+      state,
+      user.userId,
+      profile.id,
+      now,
+    ),
+    view: projectGameForUser(state, user.userId),
+  };
 }
 
 async function getGameRow(database: D1Database, gameId: string): Promise<GameRow> {
@@ -1266,6 +2917,234 @@ function commandViewForUser(state: GameState, userId: string): GameView | null {
     : null;
 }
 
+function guardedPublicJoinReceiptStatement(
+  database: D1Database,
+  row: PublicJoinTargetRow,
+  state: GameState,
+  actorProfileId: string,
+  profileWasPresent: boolean,
+  actorUserId: string,
+  commandId: string,
+  operation: string,
+  requestHash: string,
+  resultVersion: number,
+  now: number,
+): D1PreparedStatement {
+  const existingProfileMode = profileWasPresent ? 1 : 0;
+  return database
+    .prepare(
+      `INSERT INTO command_receipts (
+        actor_profile_id, command_id, game_id, operation,
+        request_hash, result_version, created_at
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?
+      WHERE (
+        (
+          ? = 1
+          AND EXISTS (
+            SELECT 1 FROM profiles
+            WHERE id = ? AND auth_subject = ?
+          )
+        ) OR (
+          ? = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM profiles WHERE auth_subject = ?
+          )
+        )
+      )
+        AND EXISTS (
+          SELECT 1
+          FROM public_game_listings listing
+          JOIN games game ON game.id = listing.game_id
+          JOIN game_members host_member
+            ON host_member.game_id = game.id
+           AND host_member.profile_id = game.host_profile_id
+          JOIN profiles host_profile ON host_profile.id = game.host_profile_id
+          JOIN game_presence host_presence
+            ON host_presence.game_id = game.id
+           AND host_presence.profile_id = game.host_profile_id
+          WHERE listing.listing_id = ?
+            AND listing.game_id = ?
+            AND listing.version = ?
+            AND listing.state = 'listed'
+            AND listing.owner_profile_id = game.host_profile_id
+            AND game.id = ?
+            AND game.version = ?
+            AND game.state_hash = ?
+            AND game.room_status = 'open'
+            AND game.status = 'lobby'
+            AND game.expires_at > ?
+            AND game.protocol_version = ?
+            AND game.rules_version = ?
+            AND host_profile.auth_subject = ?
+            AND host_member.status = 'active'
+            AND host_presence.last_seen_at > ?
+            AND NOT EXISTS (
+              SELECT 1 FROM game_members members
+              WHERE members.game_id = game.id
+                AND members.status <> 'left'
+                AND members.public_discovery_consent_at IS NULL
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM game_members membership
+              WHERE membership.game_id = game.id
+                AND membership.profile_id = ?
+                AND membership.status <> 'left'
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM game_members members
+              JOIN profile_blocks blocks
+                ON (
+                  blocks.blocker_profile_id = ?
+                  AND blocks.blocked_profile_id = members.profile_id
+                ) OR (
+                  blocks.blocker_profile_id = members.profile_id
+                  AND blocks.blocked_profile_id = ?
+                )
+              WHERE members.game_id = game.id
+                AND members.status <> 'left'
+            )
+            AND (
+              SELECT COUNT(*) FROM game_members occupants
+              WHERE occupants.game_id = game.id
+                AND occupants.status <> 'left'
+            ) < ?
+        )`,
+    )
+    .bind(
+      actorProfileId,
+      commandId,
+      row.id,
+      operation,
+      requestHash,
+      resultVersion,
+      now,
+      existingProfileMode,
+      actorProfileId,
+      actorUserId,
+      existingProfileMode,
+      actorUserId,
+      row.public_listing_id,
+      row.id,
+      row.public_listing_version,
+      row.id,
+      row.version,
+      row.state_hash,
+      now,
+      GAME_PROTOCOL_VERSION,
+      RULES_VERSION,
+      state.hostUserId,
+      now - PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+      actorProfileId,
+      actorProfileId,
+      actorProfileId,
+      PUBLIC_ROOM_CAPACITY,
+    );
+}
+
+function guardedPublicProfileProvisionStatement(
+  database: D1Database,
+  profileId: string,
+  authSubject: string,
+  alias: string,
+  now: number,
+  commandId: string,
+  requestHash: string,
+  gameId: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO profiles (
+        id, auth_subject, nickname, created_at, updated_at
+      )
+      SELECT ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM command_receipts
+        WHERE actor_profile_id = ? AND command_id = ?
+          AND game_id = ? AND request_hash = ?
+      )
+      ON CONFLICT(auth_subject) DO UPDATE SET
+        nickname = excluded.nickname,
+        updated_at = excluded.updated_at
+      WHERE profiles.id = excluded.id`,
+    )
+    .bind(
+      profileId,
+      authSubject,
+      alias,
+      now,
+      now,
+      profileId,
+      commandId,
+      gameId,
+      requestHash,
+    );
+}
+
+function guardedJoinReceiptStatement(
+  database: D1Database,
+  row: GameRow,
+  profileId: string,
+  profileWasPresent: boolean,
+  actorUserId: string,
+  commandId: string,
+  operation: string,
+  requestHash: string,
+  resultVersion: number,
+  now: number,
+): D1PreparedStatement {
+  const existingProfileMode = profileWasPresent ? 1 : 0;
+  return database
+    .prepare(
+      `INSERT INTO command_receipts (
+        actor_profile_id, command_id, game_id, operation,
+        request_hash, result_version, created_at
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?
+      WHERE (
+        (
+          ? = 1
+          AND EXISTS (
+            SELECT 1 FROM profiles
+            WHERE id = ? AND auth_subject = ?
+          )
+        ) OR (
+          ? = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM profiles WHERE auth_subject = ?
+          )
+        )
+      )
+        AND EXISTS (
+          SELECT 1 FROM games
+          WHERE id = ? AND join_code = ?
+            AND version = ? AND state_hash = ?
+            AND room_status = 'open' AND status = 'lobby'
+            AND expires_at > ?
+        )`,
+    )
+    .bind(
+      profileId,
+      commandId,
+      row.id,
+      operation,
+      requestHash,
+      resultVersion,
+      now,
+      existingProfileMode,
+      profileId,
+      actorUserId,
+      existingProfileMode,
+      actorUserId,
+      row.id,
+      row.join_code,
+      row.version,
+      row.state_hash,
+      now,
+    );
+}
+
 function guardedReceiptStatement(
   database: D1Database,
   row: GameRow,
@@ -1300,6 +3179,250 @@ function guardedReceiptStatement(
       row.id,
       row.version,
       row.state_hash,
+    );
+}
+
+function guardedPublishReceiptStatement(
+  database: D1Database,
+  row: GameRow,
+  profileId: string,
+  commandId: string,
+  operation: string,
+  requestHash: string,
+  resultVersion: number,
+  now: number,
+  expectedListingVersion: number | null,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO command_receipts (
+        actor_profile_id, command_id, game_id, operation,
+        request_hash, result_version, created_at
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1
+        FROM games g
+        JOIN game_members host_member
+          ON host_member.game_id = g.id AND host_member.profile_id = ?
+        JOIN game_presence host_presence
+          ON host_presence.game_id = host_member.game_id
+         AND host_presence.profile_id = host_member.profile_id
+        WHERE g.id = ? AND g.version = ? AND g.state_hash = ?
+          AND g.room_status = 'open' AND g.status = 'lobby'
+          AND g.expires_at > ?
+          AND g.host_profile_id = ? AND host_member.status = 'active'
+          AND host_presence.last_seen_at > ?
+          AND (
+            SELECT COUNT(*) FROM game_members occupants
+            WHERE occupants.game_id = g.id AND occupants.status <> 'left'
+          ) = 1
+      )
+        AND (
+          (
+            ? IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM public_game_listings
+              WHERE game_id = ?
+            )
+          )
+          OR (
+            ? IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM public_game_listings
+              WHERE game_id = ? AND version = ? AND state = 'unlisted'
+            )
+          )
+        )`,
+    )
+    .bind(
+      profileId,
+      commandId,
+      row.id,
+      operation,
+      requestHash,
+      resultVersion,
+      now,
+      profileId,
+      row.id,
+      row.version,
+      row.state_hash,
+      now,
+      profileId,
+      now - PUBLIC_HOST_SUPPRESSION_AFTER_MS,
+      expectedListingVersion,
+      row.id,
+      expectedListingVersion,
+      row.id,
+      expectedListingVersion,
+    );
+}
+
+function guardedUnpublishReceiptStatement(
+  database: D1Database,
+  row: GameRow,
+  profileId: string,
+  commandId: string,
+  operation: string,
+  requestHash: string,
+  now: number,
+  expectedListingVersion: number,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO command_receipts (
+        actor_profile_id, command_id, game_id, operation,
+        request_hash, result_version, created_at
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1
+        FROM games g
+        JOIN game_members host_member
+          ON host_member.game_id = g.id AND host_member.profile_id = ?
+        JOIN public_game_listings listing ON listing.game_id = g.id
+        WHERE g.id = ? AND g.version = ? AND g.state_hash = ?
+          AND g.room_status = 'open' AND g.host_profile_id = ?
+          AND host_member.status = 'active'
+          AND listing.state = 'listed' AND listing.version = ?
+      )`,
+    )
+    .bind(
+      profileId,
+      commandId,
+      row.id,
+      operation,
+      requestHash,
+      row.version,
+      now,
+      profileId,
+      row.id,
+      row.version,
+      row.state_hash,
+      profileId,
+      expectedListingVersion,
+    );
+}
+
+function guardedHostDiscoveryConsentStatement(
+  database: D1Database,
+  gameId: string,
+  profileId: string,
+  now: number,
+  commandId: string,
+  requestHash: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `UPDATE game_members
+       SET public_discovery_consent_at = ?
+       WHERE game_id = ? AND profile_id = ? AND status = 'active'
+         AND EXISTS (
+           SELECT 1 FROM command_receipts
+           WHERE actor_profile_id = ? AND command_id = ?
+             AND game_id = ? AND request_hash = ?
+         )`,
+    )
+    .bind(
+      now,
+      gameId,
+      profileId,
+      profileId,
+      commandId,
+      gameId,
+      requestHash,
+    );
+}
+
+function guardedPublishListingStatement(
+  database: D1Database,
+  gameId: string,
+  listingId: string,
+  ownerProfileId: string,
+  pace: PublicPace,
+  version: number,
+  eventFloorVersion: number,
+  now: number,
+  expectedListingVersion: number | null,
+  commandId: string,
+  requestHash: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO public_game_listings (
+        game_id, listing_id, owner_profile_id, state, pace, version,
+        event_floor_version, published_at, updated_at, unlisted_at,
+        close_reason
+      )
+      SELECT ?, ?, ?, 'listed', ?, ?, ?, ?, ?, NULL, NULL
+      WHERE EXISTS (
+        SELECT 1 FROM command_receipts
+        WHERE actor_profile_id = ? AND command_id = ?
+          AND game_id = ? AND request_hash = ?
+      )
+      ON CONFLICT(game_id) DO UPDATE SET
+        listing_id = excluded.listing_id,
+        owner_profile_id = excluded.owner_profile_id,
+        state = 'listed',
+        pace = excluded.pace,
+        version = excluded.version,
+        event_floor_version = excluded.event_floor_version,
+        published_at = excluded.published_at,
+        updated_at = excluded.updated_at,
+        unlisted_at = NULL,
+        close_reason = NULL
+      WHERE public_game_listings.version = ?
+        AND public_game_listings.state = 'unlisted'`,
+    )
+    .bind(
+      gameId,
+      listingId,
+      ownerProfileId,
+      pace,
+      version,
+      eventFloorVersion,
+      now,
+      now,
+      ownerProfileId,
+      commandId,
+      gameId,
+      requestHash,
+      expectedListingVersion ?? -1,
+    );
+}
+
+function guardedListingVisibilityStatement(
+  database: D1Database,
+  gameId: string,
+  receiptProfileId: string,
+  commandId: string,
+  requestHash: string,
+  state: Extract<PublicListingRow["state"], "unlisted" | "closed">,
+  closeReason: string,
+  now: number,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `UPDATE public_game_listings
+       SET state = ?, version = version + 1, updated_at = ?,
+           unlisted_at = ?, close_reason = ?
+       WHERE game_id = ? AND state = 'listed'
+         AND EXISTS (
+           SELECT 1 FROM command_receipts
+           WHERE actor_profile_id = ? AND command_id = ?
+             AND game_id = ? AND request_hash = ?
+         )`,
+    )
+    .bind(
+      state,
+      now,
+      now,
+      closeReason,
+      gameId,
+      receiptProfileId,
+      commandId,
+      gameId,
+      requestHash,
     );
 }
 
@@ -1368,6 +3491,7 @@ function guardedEventStatement(
   stateHash: string,
   now: number,
   requestHash: string,
+  eventCommandId = commandId,
 ): D1PreparedStatement {
   return database
     .prepare(
@@ -1391,7 +3515,7 @@ function guardedEventStatement(
     .bind(
       row.id,
       version,
-      commandId,
+      eventCommandId,
       profileId,
       events.at(-1)?.type ?? "state_changed",
       JSON.stringify(events),
@@ -1479,6 +3603,37 @@ function guardedPresenceUpsertStatement(
     );
 }
 
+function guardedProfileNicknameStatement(
+  database: D1Database,
+  profileId: string,
+  nickname: string,
+  now: number,
+  commandId: string,
+  requestHash: string,
+  gameId: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `UPDATE profiles
+       SET nickname = ?, updated_at = ?
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM command_receipts
+           WHERE actor_profile_id = ? AND command_id = ?
+             AND game_id = ? AND request_hash = ?
+         )`,
+    )
+    .bind(
+      nickname,
+      now,
+      profileId,
+      profileId,
+      commandId,
+      gameId,
+      requestHash,
+    );
+}
+
 function guardedPresenceDeleteStatement(
   database: D1Database,
   gameId: string,
@@ -1537,6 +3692,53 @@ function staleSeatCleanupStatement(
     );
 }
 
+function guardedPublicMembershipUpsertStatement(
+  database: D1Database,
+  gameId: string,
+  profileId: string,
+  player: GameState["players"][number],
+  now: number,
+  commandId: string,
+  requestHash: string,
+  eventFloorVersion: number,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO game_members (
+        game_id, profile_id, seat, role, status, joined_at, left_at,
+        public_discovery_consent_at, join_source, event_floor_version
+      )
+      SELECT ?, ?, ?, 'player', 'active', ?, NULL, ?, 'public', ?
+      WHERE EXISTS (
+        SELECT 1 FROM command_receipts
+        WHERE actor_profile_id = ? AND command_id = ?
+          AND game_id = ? AND request_hash = ?
+      )
+      ON CONFLICT(game_id, profile_id) DO UPDATE SET
+        seat = excluded.seat,
+        role = 'player',
+        status = 'active',
+        joined_at = excluded.joined_at,
+        left_at = NULL,
+        public_discovery_consent_at = excluded.public_discovery_consent_at,
+        join_source = 'public',
+        event_floor_version = excluded.event_floor_version
+      WHERE game_members.status = 'left'`,
+    )
+    .bind(
+      gameId,
+      profileId,
+      player.seat,
+      now,
+      now,
+      eventFloorVersion,
+      profileId,
+      commandId,
+      gameId,
+      requestHash,
+    );
+}
+
 function guardedMembershipUpsertStatement(
   database: D1Database,
   gameId: string,
@@ -1547,14 +3749,15 @@ function guardedMembershipUpsertStatement(
   commandId: string,
   requestHash: string,
   hostUserId: string,
+  eventFloorVersion = 0,
 ): D1PreparedStatement {
   return database
     .prepare(
       `INSERT INTO game_members (
         game_id, profile_id, seat, role, status, joined_at, left_at,
-        join_source
+        join_source, event_floor_version
       )
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE EXISTS (
         SELECT 1 FROM command_receipts
         WHERE actor_profile_id = ? AND command_id = ?
@@ -1564,10 +3767,30 @@ function guardedMembershipUpsertStatement(
         seat = excluded.seat,
         role = excluded.role,
         status = excluded.status,
+        joined_at = CASE
+          WHEN game_members.status = 'left' AND excluded.status <> 'left'
+            THEN excluded.joined_at
+          ELSE game_members.joined_at
+        END,
         left_at = CASE
           WHEN game_members.status = 'left' AND excluded.status = 'left'
             THEN game_members.left_at
           ELSE excluded.left_at
+        END,
+        public_discovery_consent_at = CASE
+          WHEN game_members.status = 'left' AND excluded.status <> 'left'
+            THEN NULL
+          ELSE game_members.public_discovery_consent_at
+        END,
+        join_source = CASE
+          WHEN game_members.status = 'left' AND excluded.status <> 'left'
+            THEN excluded.join_source
+          ELSE game_members.join_source
+        END,
+        event_floor_version = CASE
+          WHEN game_members.status = 'left' AND excluded.status <> 'left'
+            THEN excluded.event_floor_version
+          ELSE game_members.event_floor_version
         END`,
     )
     .bind(
@@ -1579,6 +3802,7 @@ function guardedMembershipUpsertStatement(
       now,
       player.status === "left" ? now : null,
       player.userId === hostUserId ? "host" : "invite",
+      eventFloorVersion,
       receiptProfileId,
       commandId,
       gameId,
@@ -1628,6 +3852,7 @@ function guardedGameUpdateStatement(
   commandId: string,
   requestHash: string,
   roomLifecycle: RoomLifecycleUpdate = OPEN_ROOM_LIFECYCLE,
+  eventCommandId = commandId,
 ): D1PreparedStatement {
   return database
     .prepare(
@@ -1674,7 +3899,7 @@ function guardedGameUpdateStatement(
       row.id,
       state.revision,
       receiptProfileId,
-      commandId,
+      eventCommandId,
       stateHash,
     );
 }
@@ -1810,37 +4035,61 @@ async function readPublicEventFeed(
   database: D1Database,
   gameId: string,
   afterRevision?: number,
+  minimumVersion = 0,
 ): Promise<{ events: GameEvent[]; cursor: number }> {
-  const query = afterRevision === undefined
+  const bounds = eventFeedBoundsForViewer(afterRevision, minimumVersion);
+  const query = bounds.afterRevision === undefined
     ? database
         .prepare(
           `SELECT version, public_payload_json
            FROM (
              SELECT version, public_payload_json
              FROM game_events
-             WHERE game_id = ?
+             WHERE game_id = ? AND version >= ?
              ORDER BY version DESC LIMIT ?
            ) recent
            ORDER BY version ASC`,
         )
-        .bind(gameId, EVENT_FEED_TAIL)
+        .bind(gameId, bounds.minimumVersion, EVENT_FEED_TAIL)
     : database
         .prepare(
           `SELECT version, public_payload_json
            FROM game_events
-           WHERE game_id = ? AND version > ?
+           WHERE game_id = ? AND version > ? AND version >= ?
            ORDER BY version ASC LIMIT ?`,
         )
-        .bind(gameId, afterRevision, EVENT_FEED_PAGE);
+        .bind(
+          gameId,
+          bounds.afterRevision,
+          bounds.minimumVersion,
+          EVENT_FEED_PAGE,
+        );
   const rows = await query.all<EventRow>();
   const events = rows.results.flatMap((row) => parsePublicEvents(row));
   return {
     events,
     cursor:
       rows.results.at(-1)?.version ??
-      afterRevision ??
-      0,
+      bounds.afterRevision ??
+      Math.max(0, bounds.minimumVersion - 1),
   };
+}
+
+export function eventFeedBoundsForViewer(
+  afterRevision: number | undefined,
+  eventFloorVersion: number,
+): Readonly<{ minimumVersion: number; afterRevision: number | undefined }> {
+  const minimumVersion =
+    Number.isSafeInteger(eventFloorVersion) && eventFloorVersion >= 0
+      ? eventFloorVersion
+      : 0;
+  return Object.freeze({
+    minimumVersion,
+    afterRevision:
+      afterRevision === undefined
+        ? undefined
+        : Math.max(afterRevision, minimumVersion - 1),
+  });
 }
 
 function parsePublicEvents(row: EventRow): GameEvent[] {
@@ -1905,9 +4154,9 @@ async function enforceMutationQuota(
   now: number,
   rules: QuotaRule[],
 ): Promise<void> {
-  const statements = rules.map((rule) => {
+  for (const rule of rules) {
     const bucketStart = Math.floor(now / rule.windowMs) * rule.windowMs;
-    return database
+    const result = await database
       .prepare(
         `INSERT INTO mutation_quotas (
           scope, bucket_start, count, expires_at
@@ -1921,12 +4170,10 @@ async function enforceMutationQuota(
         rule.scope,
         bucketStart,
         bucketStart + rule.windowMs + 5 * 60_000,
-      );
-  });
-  const results = await database.batch<{ count: number }>(statements);
-  for (let index = 0; index < rules.length; index += 1) {
-    const count = Number(results[index]?.results?.[0]?.count ?? 0);
-    if (count > rules[index].limit) {
+      )
+      .first<{ count: number }>();
+    const count = Number(result?.count ?? 0);
+    if (count > rule.limit) {
       throw new GameRuleError(
         "RATE_LIMITED",
         "Too many write requests. Please wait and try again.",
@@ -2237,6 +4484,28 @@ async function closeRoomFromMaintenance(
       .bind(row.id, row.id, state.revision, commandId, stateHash),
     database
       .prepare(
+        `UPDATE public_game_listings
+         SET state = 'closed', version = version + 1, updated_at = ?,
+             unlisted_at = ?, close_reason = ?
+         WHERE game_id = ? AND state = 'listed'
+           AND EXISTS (
+             SELECT 1 FROM game_events
+             WHERE game_id = ? AND version = ? AND command_id = ?
+               AND state_hash = ?
+           )`,
+      )
+      .bind(
+        now,
+        now,
+        reason,
+        row.id,
+        row.id,
+        state.revision,
+        commandId,
+        stateHash,
+      ),
+    database
+      .prepare(
         `UPDATE games
          SET status = ?, version = ?, state_json = ?, state_hash = ?,
              room_status = 'closed', closed_at = ?, close_reason = ?,
@@ -2298,6 +4567,17 @@ async function purgeExpiredRows(
   await database.batch([
     database
       .prepare(
+        `DELETE FROM public_game_listings WHERE rowid IN (
+          SELECT listing.rowid FROM public_game_listings listing
+          JOIN games g ON g.id = listing.game_id
+          WHERE g.expires_at <= ?
+          ORDER BY g.expires_at, listing.game_id
+          LIMIT 64
+        )`,
+      )
+      .bind(now),
+    database
+      .prepare(
         `DELETE FROM game_presence WHERE rowid IN (
           SELECT p.rowid FROM game_presence p
           JOIN games g ON g.id = p.game_id
@@ -2349,6 +4629,10 @@ async function purgeExpiredRows(
             AND NOT EXISTS (SELECT 1 FROM command_receipts r WHERE r.game_id = g.id)
             AND NOT EXISTS (SELECT 1 FROM game_members m WHERE m.game_id = g.id)
             AND NOT EXISTS (SELECT 1 FROM game_presence p WHERE p.game_id = g.id)
+            AND NOT EXISTS (
+              SELECT 1 FROM public_game_listings listing
+              WHERE listing.game_id = g.id
+            )
           ORDER BY g.expires_at, g.id
           LIMIT ?
         )`,

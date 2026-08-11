@@ -1,5 +1,9 @@
 import { assertSafeMutationRequest, requireRequestUser } from "../../../lib/server/auth";
-import { createGame, listLobbies } from "../../../lib/server/game-store";
+import {
+  createGame,
+  getViewerListingForGame,
+  listLobbies,
+} from "../../../lib/server/game-store";
 import {
   jsonResponse,
   readJsonObject,
@@ -25,7 +29,8 @@ export async function POST(request: Request) {
     const nickname =
       typeof body.nickname === "string" ? body.nickname : user.suggestedName;
     const view = await createGame(user, nickname, commandId);
-    return jsonResponse({ view }, 201);
+    const listing = await getViewerListingForGame(user, view.gameId);
+    return jsonResponse({ view, ...(listing ? { listing } : {}) }, 201);
   } catch (error) {
     return routeErrorResponse(error);
   }
