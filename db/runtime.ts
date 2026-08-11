@@ -91,6 +91,56 @@ async function initialize(database: D1Database): Promise<void> {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_profile_blocks_blocked
       ON profile_blocks(blocked_profile_id)`,
+    `CREATE TABLE IF NOT EXISTS game_messages (
+      id TEXT PRIMARY KEY NOT NULL,
+      game_id TEXT NOT NULL,
+      sender_profile_id TEXT NOT NULL,
+      sender_player_id TEXT NOT NULL,
+      sender_display_name TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      content_id TEXT NOT NULL,
+      command_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_game_messages_feed
+      ON game_messages(game_id, created_at, id)`,
+    `CREATE INDEX IF NOT EXISTS idx_game_messages_expiry
+      ON game_messages(expires_at)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_game_messages_sender_command
+      ON game_messages(sender_profile_id, command_id)`,
+    `CREATE TABLE IF NOT EXISTS game_message_reports (
+      id TEXT PRIMARY KEY NOT NULL,
+      game_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      reporter_profile_id TEXT NOT NULL,
+      reported_profile_id TEXT NOT NULL,
+      evidence_sender_player_id TEXT NOT NULL,
+      evidence_sender_display_name TEXT NOT NULL,
+      evidence_kind TEXT NOT NULL,
+      evidence_content_id TEXT NOT NULL,
+      evidence_created_at INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      moderation_state TEXT NOT NULL DEFAULT 'pending',
+      command_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_game_message_reports_review
+      ON game_message_reports(moderation_state, created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_game_message_reports_expiry
+      ON game_message_reports(expires_at)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_game_message_reports_reporter_command
+      ON game_message_reports(reporter_profile_id, command_id)`,
+    `CREATE TABLE IF NOT EXISTS game_mutes (
+      game_id TEXT NOT NULL,
+      muter_profile_id TEXT NOT NULL,
+      muted_profile_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (game_id, muter_profile_id, muted_profile_id)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_game_mutes_muted
+      ON game_mutes(game_id, muted_profile_id)`,
     `CREATE TABLE IF NOT EXISTS game_presence (
       game_id TEXT NOT NULL,
       player_id TEXT NOT NULL,

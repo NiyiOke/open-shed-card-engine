@@ -106,6 +106,82 @@ export const profileBlocks = sqliteTable(
   ],
 );
 
+export const gameMessages = sqliteTable(
+  "game_messages",
+  {
+    id: text("id").primaryKey(),
+    gameId: text("game_id").notNull(),
+    senderProfileId: text("sender_profile_id").notNull(),
+    senderPlayerId: text("sender_player_id").notNull(),
+    senderDisplayName: text("sender_display_name").notNull(),
+    kind: text("kind").notNull(),
+    contentId: text("content_id").notNull(),
+    commandId: text("command_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (table) => [
+    index("idx_game_messages_feed").on(
+      table.gameId,
+      table.createdAt,
+      table.id,
+    ),
+    index("idx_game_messages_expiry").on(table.expiresAt),
+    uniqueIndex("idx_game_messages_sender_command").on(
+      table.senderProfileId,
+      table.commandId,
+    ),
+  ],
+);
+
+export const gameMessageReports = sqliteTable(
+  "game_message_reports",
+  {
+    id: text("id").primaryKey(),
+    gameId: text("game_id").notNull(),
+    messageId: text("message_id").notNull(),
+    reporterProfileId: text("reporter_profile_id").notNull(),
+    reportedProfileId: text("reported_profile_id").notNull(),
+    evidenceSenderPlayerId: text("evidence_sender_player_id").notNull(),
+    evidenceSenderDisplayName: text("evidence_sender_display_name").notNull(),
+    evidenceKind: text("evidence_kind").notNull(),
+    evidenceContentId: text("evidence_content_id").notNull(),
+    evidenceCreatedAt: integer("evidence_created_at").notNull(),
+    reason: text("reason").notNull(),
+    moderationState: text("moderation_state").notNull().default("pending"),
+    commandId: text("command_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (table) => [
+    index("idx_game_message_reports_review").on(
+      table.moderationState,
+      table.createdAt,
+    ),
+    index("idx_game_message_reports_expiry").on(table.expiresAt),
+    uniqueIndex("idx_game_message_reports_reporter_command").on(
+      table.reporterProfileId,
+      table.commandId,
+    ),
+  ],
+);
+
+export const gameMutes = sqliteTable(
+  "game_mutes",
+  {
+    gameId: text("game_id").notNull(),
+    muterProfileId: text("muter_profile_id").notNull(),
+    mutedProfileId: text("muted_profile_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.gameId, table.muterProfileId, table.mutedProfileId],
+    }),
+    index("idx_game_mutes_muted").on(table.gameId, table.mutedProfileId),
+  ],
+);
+
 export const gamePresence = sqliteTable(
   "game_presence",
   {

@@ -14,6 +14,7 @@
     "test:v11-browser": "node scripts/v11-browser-acceptance.mjs",
     "test:v15-lifecycle": "node scripts/v15-room-lifecycle-acceptance.mjs",
     "test:v15-discovery": "node scripts/v15-discovery-acceptance.mjs",
+    "test:v15-chat": "node scripts/v15-chat-acceptance.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"

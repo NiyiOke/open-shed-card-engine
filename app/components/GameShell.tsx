@@ -21,6 +21,17 @@ import { CardFace } from "./CardFace";
 import { GameTableCanvas } from "./GameTableCanvas";
 import { SignedOutLanding } from "./SignedOutLanding";
 import {
+  CHAT_MESSAGE_LIMIT,
+  CHAT_PHRASES,
+  CHAT_REACTIONS,
+  CHAT_REPORT_REASONS,
+  chatContentPresentation,
+  parseChatPage,
+  type ChatKind,
+  type ChatMessage,
+  type ChatReportReason,
+} from "./chat-ui";
+import {
   listingFailureMessage,
   listingUnavailableReason,
   isValidRoomAlias,
@@ -99,8 +110,16 @@ type PublicJoinIntent =
   | { kind: "quick" };
 type ListingDialogAction = "publish" | "unpublish";
 type PendingPublicMutation = { commandId: string; fingerprint: string };
+type SidebarTab = "chat" | "activity";
+type ChatModerationAction = "mute" | "block" | "report";
+type ChatDialog = {
+  action: ChatModerationAction;
+  message: ChatMessage;
+};
 
 const COMMAND_STORAGE_KEY = "open-shed-inflight-command-v1";
+const CHAT_TAB_STORAGE_KEY = "open-shed-chat-tab-v1";
+const CHAT_ANNOUNCEMENTS_STORAGE_KEY = "open-shed-chat-announcements-v1";
 const REQUEST_TIMEOUT_MS = 12_000;
 
 const ACTION_GUIDE = [
@@ -166,6 +185,23 @@ export function GameShell({
   const [listingAlias, setListingAlias] = useState("");
   const [listingPace, setListingPace] = useState<PublicPace>("casual");
   const [listingError, setListingError] = useState<string | null>(null);
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("activity");
+  const [chatEnabled, setChatEnabled] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatUnread, setChatUnread] = useState(0);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [chatStatus, setChatStatus] = useState<string | null>(null);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatCoolingDown, setChatCoolingDown] = useState(false);
+  const [chatAnnouncements, setChatAnnouncements] = useState(true);
+  const [mutedChatPlayers, setMutedChatPlayers] = useState<Record<string, string>>({});
+  const [blockedChatPlayers, setBlockedChatPlayers] = useState<Record<string, string>>({});
+  const [chatDialog, setChatDialog] = useState<ChatDialog | null>(null);
+  const [chatReportReason, setChatReportReason] = useState<ChatReportReason>("harassment");
+  const [chatModerationBusy, setChatModerationBusy] = useState(false);
+  const [chatViewportMobile, setChatViewportMobile] = useState(false);
+  const [documentVisible, setDocumentVisible] = useState(true);
+  const [chatRefreshTick, setChatRefreshTick] = useState(0);
   const gameRef = useRef<GameView | null>(null);
   const eventCursorRef = useRef<{ gameId: string; revision: number } | null>(null);
   const pollRequestRef = useRef<PollRequest | null>(null);
@@ -184,6 +220,14 @@ export function GameShell({
   const presenceAvailableRef = useRef(true);
   const publicJoinMutationRef = useRef<PendingPublicMutation | null>(null);
   const listingMutationRef = useRef<PendingPublicMutation | null>(null);
+  const chatCursorRef = useRef<{ gameId: string; cursor: string | null } | null>(null);
+  const chatMessageIdsRef = useRef(new Set<string>());
+  const chatSendMutationRef = useRef<PendingPublicMutation | null>(null);
+  const chatReportMutationRef = useRef<PendingPublicMutation | null>(null);
+  const chatTabPreferenceRef = useRef(false);
+  const chatDialogRef = useRef<HTMLDivElement>(null);
+  const chatDialogTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const chatLogRef = useRef<HTMLDivElement>(null);
   const testClock = useRef(0);
   const [reconnectTick, setReconnectTick] = useState(0);
 
@@ -455,10 +499,257 @@ export function GameShell({
 
   const activeGameId = game?.gameId ?? null;
   const activeGamePhase = game?.phase ?? null;
+  const chatHasAnotherPlayer = Boolean(
+    game?.players.some((player) => !player.isSelf && player.status !== "left"),
+  );
+  const visibleChatMessages = useMemo(() => {
+    if (!game) return [];
+    const currentPlayerIds = new Set(
+      game.players
+        .filter((player) => player.status !== "left")
+        .map((player) => player.playerId),
+    );
+    return chatMessages.filter(
+      (message) =>
+        currentPlayerIds.has(message.senderPlayerId) &&
+        !mutedChatPlayers[message.senderPlayerId] &&
+        !blockedChatPlayers[message.senderPlayerId],
+    );
+  }, [blockedChatPlayers, chatMessages, game, mutedChatPlayers]);
+  const chatPanelVisible = Boolean(
+    chatEnabled &&
+    sidebarTab === "chat" &&
+    documentVisible &&
+    (!chatViewportMobile || sidebarDetailsOpen),
+  );
 
   useEffect(() => {
     gameRef.current = game;
   }, [game]);
+
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 720px)");
+    const updateViewport = () => setChatViewportMobile(query.matches);
+    const updateVisibility = () => setDocumentVisible(!document.hidden);
+    updateViewport();
+    updateVisibility();
+    query.addEventListener("change", updateViewport);
+    document.addEventListener("visibilitychange", updateVisibility);
+    return () => {
+      query.removeEventListener("change", updateViewport);
+      document.removeEventListener("visibilitychange", updateVisibility);
+    };
+  }, []);
+
+  useEffect(() => {
+    chatCursorRef.current = activeGameId ? { gameId: activeGameId, cursor: null } : null;
+    chatMessageIdsRef.current = new Set();
+    chatTabPreferenceRef.current = false;
+    chatSendMutationRef.current = null;
+    chatReportMutationRef.current = null;
+    const frame = window.requestAnimationFrame(() => {
+      setChatEnabled(false);
+      setChatMessages([]);
+      setChatUnread(0);
+      setChatError(null);
+      setChatStatus(null);
+      setChatSending(false);
+      setChatCoolingDown(false);
+      setMutedChatPlayers({});
+      setBlockedChatPlayers({});
+      setChatDialog(null);
+      setChatModerationBusy(false);
+      if (!activeGameId) return;
+
+      const rememberedTab = window.sessionStorage.getItem(CHAT_TAB_STORAGE_KEY);
+      if (rememberedTab === "chat" || rememberedTab === "activity") {
+        chatTabPreferenceRef.current = true;
+        setSidebarTab(rememberedTab);
+      } else {
+        setSidebarTab(
+          gameRef.current?.players.some(
+            (player) => !player.isSelf && player.status !== "left",
+          )
+            ? "chat"
+            : "activity",
+        );
+      }
+      setChatAnnouncements(
+        window.sessionStorage.getItem(CHAT_ANNOUNCEMENTS_STORAGE_KEY) !== "off",
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeGameId]);
+
+  useEffect(() => {
+    if (
+      activeGameId &&
+      chatEnabled &&
+      chatHasAnotherPlayer &&
+      !chatTabPreferenceRef.current
+    ) {
+      setSidebarTab("chat");
+    }
+  }, [activeGameId, chatEnabled, chatHasAnotherPlayer]);
+
+  useEffect(() => {
+    if (!activeGameId) return;
+    let cancelled = false;
+    let timeout: number | null = null;
+    let controller: AbortController | null = null;
+
+    const schedule = () => {
+      if (cancelled) return;
+      if (timeout !== null) window.clearTimeout(timeout);
+      timeout = window.setTimeout(
+        poll,
+        documentVisible && navigator.onLine ? 2_500 : 12_000,
+      );
+    };
+    const hideDisabledChat = () => {
+      setChatEnabled(false);
+      setChatMessages([]);
+      setChatUnread(0);
+      setChatError(null);
+      chatMessageIdsRef.current = new Set();
+    };
+    const poll = () => {
+      if (cancelled) return;
+      controller?.abort();
+      controller = new AbortController();
+      const cursorState = chatCursorRef.current;
+      const cursor = cursorState?.gameId === activeGameId ? cursorState.cursor : null;
+      const params = new URLSearchParams();
+      if (cursor) params.set("cursor", cursor);
+      const suffix = params.size ? `?${params.toString()}` : "";
+      void request<unknown>(
+        `/api/games/${encodeURIComponent(activeGameId)}/messages${suffix}`,
+        { signal: controller.signal },
+      )
+        .then((response) => {
+          if (cancelled || gameRef.current?.gameId !== activeGameId) return;
+          const page = parseChatPage(response);
+          if (!page) {
+            hideDisabledChat();
+            return;
+          }
+
+          const currentGame = gameRef.current;
+          const currentPlayers = new Map(
+            currentGame.players
+              .filter((player) => player.status !== "left")
+              .map((player) => [player.playerId, player]),
+          );
+          const nextMutedPlayers = Object.fromEntries(
+            page.viewer.mutedPlayerIds
+              .map((playerId) => {
+                const player = currentPlayers.get(playerId);
+                return player ? [playerId, player.displayName] : null;
+              })
+              .filter((entry): entry is [string, string] => entry !== null),
+          );
+          const nextBlockedPlayers = Object.fromEntries(
+            page.viewer.blockedPlayerIds
+              .map((playerId) => {
+                const player = currentPlayers.get(playerId);
+                return player ? [playerId, player.displayName] : null;
+              })
+              .filter((entry): entry is [string, string] => entry !== null),
+          );
+          setMutedChatPlayers((current) =>
+            samePlayerMap(current, nextMutedPlayers) ? current : nextMutedPlayers,
+          );
+          setBlockedChatPlayers((current) =>
+            samePlayerMap(current, nextBlockedPlayers) ? current : nextBlockedPlayers,
+          );
+          const mutedIds = new Set(page.viewer.mutedPlayerIds);
+          const blockedIds = new Set(page.viewer.blockedPlayerIds);
+          const unseenMessages = page.messages
+            .filter((message) => currentPlayers.has(message.senderPlayerId))
+            .map((message) => ({
+              ...message,
+              senderDisplayName:
+                currentPlayers.get(message.senderPlayerId)?.displayName ??
+                message.senderDisplayName,
+            }))
+            .filter((message) => !chatMessageIdsRef.current.has(message.id));
+
+          if (unseenMessages.length) {
+            const selfId = currentGame.players.find((player) => player.isSelf)?.playerId;
+            const unreadAdded = unseenMessages.filter(
+              (message) =>
+                message.senderPlayerId !== selfId &&
+                !mutedIds.has(message.senderPlayerId) &&
+                !blockedIds.has(message.senderPlayerId),
+            ).length;
+            setChatMessages((current) => {
+              const next = [...current, ...unseenMessages].slice(-CHAT_MESSAGE_LIMIT);
+              chatMessageIdsRef.current = new Set(next.map((message) => message.id));
+              return next;
+            });
+            if (!chatPanelVisible && unreadAdded) {
+              setChatUnread((current) => Math.min(99, current + unreadAdded));
+            }
+          }
+          if (page.nextCursor !== null) {
+            chatCursorRef.current = { gameId: activeGameId, cursor: page.nextCursor };
+          }
+          setChatEnabled(true);
+          setChatError(null);
+        })
+        .catch((failure) => {
+          if (cancelled || (failure as Error).name === "AbortError") return;
+          const code = (failure as RequestFailure).code;
+          if (
+            [
+              "COMMUNICATION_DISABLED",
+              "FEATURE_DISABLED",
+              "ROUTE_NOT_FOUND",
+              "NOT_FOUND",
+            ].includes(code ?? "")
+          ) {
+            hideDisabledChat();
+          } else if (chatEnabled) {
+            setChatError("Chat is reconnecting. Your game actions still work.");
+          }
+        })
+        .finally(schedule);
+    };
+    const refreshNow = () => {
+      if (timeout !== null) window.clearTimeout(timeout);
+      poll();
+    };
+
+    poll();
+    window.addEventListener("focus", refreshNow);
+    window.addEventListener("online", refreshNow);
+    return () => {
+      cancelled = true;
+      if (timeout !== null) window.clearTimeout(timeout);
+      controller?.abort();
+      window.removeEventListener("focus", refreshNow);
+      window.removeEventListener("online", refreshNow);
+    };
+  }, [
+    activeGameId,
+    blockedChatPlayers,
+    chatEnabled,
+    chatPanelVisible,
+    chatRefreshTick,
+    documentVisible,
+    mutedChatPlayers,
+    request,
+  ]);
+
+  useEffect(() => {
+    if (!chatPanelVisible) return;
+    const frame = window.requestAnimationFrame(() => {
+      setChatUnread(0);
+      const log = chatLogRef.current;
+      if (log) log.scrollTop = log.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [chatPanelVisible, visibleChatMessages.length]);
 
   useEffect(() => {
     if (!activeGameId) return;
@@ -570,6 +861,18 @@ export function GameShell({
   }, [shareFeedback]);
 
   useEffect(() => {
+    if (!chatStatus) return;
+    const timeout = window.setTimeout(() => setChatStatus(null), 5_000);
+    return () => window.clearTimeout(timeout);
+  }, [chatStatus]);
+
+  useEffect(() => {
+    if (!chatCoolingDown) return;
+    const timeout = window.setTimeout(() => setChatCoolingDown(false), 2_000);
+    return () => window.clearTimeout(timeout);
+  }, [chatCoolingDown]);
+
+  useEffect(() => {
     window.render_game_to_text = () =>
       JSON.stringify({
         coordinateSystem: "Canvas origin is top-left; x increases right and y increases down.",
@@ -602,6 +905,19 @@ export function GameShell({
               legalActions: game.legalActions,
               winner: game.winner,
               coach: getTurnCoach(game, game.players.find((player) => player.isSelf)?.playerId),
+              chat: chatEnabled
+                ? {
+                    visible: chatPanelVisible,
+                    tab: sidebarTab,
+                    unread: chatUnread,
+                    announcements: chatAnnouncements,
+                    latest: visibleChatMessages.slice(-3).map((message) => ({
+                      senderPlayerId: message.senderPlayerId,
+                      kind: message.kind,
+                      contentId: message.contentId,
+                    })),
+                  }
+                : null,
             }
           : null,
       });
@@ -615,7 +931,19 @@ export function GameShell({
       delete window.render_game_to_text;
       delete window.advanceTime;
     };
-  }, [connectionState, game, presence, session, storedCommand]);
+  }, [
+    chatAnnouncements,
+    chatEnabled,
+    chatPanelVisible,
+    chatUnread,
+    connectionState,
+    game,
+    presence,
+    session,
+    sidebarTab,
+    storedCommand,
+    visibleChatMessages,
+  ]);
 
   const enterGame = useCallback((
     view: GameView,
@@ -1293,6 +1621,234 @@ export function GameShell({
     void sendCommand({ type: "play_card", cardId: card.id, declareUno: false });
   };
 
+  const selectSidebarTab = (tab: SidebarTab) => {
+    chatTabPreferenceRef.current = true;
+    setSidebarTab(tab);
+    window.sessionStorage.setItem(CHAT_TAB_STORAGE_KEY, tab);
+    if (tab === "chat") setChatUnread(0);
+  };
+
+  const toggleChatAnnouncements = () => {
+    setChatAnnouncements((current) => {
+      const next = !current;
+      window.sessionStorage.setItem(
+        CHAT_ANNOUNCEMENTS_STORAGE_KEY,
+        next ? "on" : "off",
+      );
+      return next;
+    });
+  };
+
+  const hideChatFeature = () => {
+    setChatEnabled(false);
+    setChatMessages([]);
+    setChatUnread(0);
+    setChatError(null);
+    setChatStatus(null);
+    setChatDialog(null);
+    setChatCoolingDown(false);
+    chatMessageIdsRef.current = new Set();
+    chatSendMutationRef.current = null;
+    chatReportMutationRef.current = null;
+  };
+
+  const sendCuratedChat = async (
+    kind: ChatKind,
+    contentId: ChatMessage["contentId"],
+  ) => {
+    const currentGame = gameRef.current;
+    if (!currentGame || !chatEnabled || chatSending || chatCoolingDown) return;
+    const fingerprint = JSON.stringify({
+      gameId: currentGame.gameId,
+      kind,
+      contentId,
+    });
+    const requestCommandId =
+      chatSendMutationRef.current?.fingerprint === fingerprint
+        ? chatSendMutationRef.current.commandId
+        : commandId();
+    chatSendMutationRef.current = { commandId: requestCommandId, fingerprint };
+    setChatSending(true);
+    setChatError(null);
+    setChatStatus(null);
+    try {
+      await request<unknown>(
+        `/api/games/${encodeURIComponent(currentGame.gameId)}/messages`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ commandId: requestCommandId, kind, contentId }),
+        },
+      );
+      if (gameRef.current?.gameId === currentGame.gameId) {
+        chatSendMutationRef.current = null;
+        setChatCoolingDown(true);
+        setChatStatus("Message sent.");
+        setChatRefreshTick((current) => current + 1);
+      }
+    } catch (failure) {
+      const code = (failure as RequestFailure).code;
+      if (
+        ["COMMUNICATION_DISABLED", "FEATURE_DISABLED", "ROUTE_NOT_FOUND"].includes(
+          code ?? "",
+        )
+      ) {
+        hideChatFeature();
+      } else {
+        const recoverable =
+          code === "REQUEST_TIMEOUT" || failure instanceof TypeError || !navigator.onLine;
+        if (!recoverable) chatSendMutationRef.current = null;
+        setChatError(
+          code === "RATE_LIMITED"
+            ? "Wait a moment before sending again."
+            : recoverable
+              ? "Chat lost the response. Retry the same message safely. Your game actions still work."
+              : "That message did not send. Your game actions are unaffected.",
+        );
+      }
+    } finally {
+      setChatSending(false);
+    }
+  };
+
+  const openChatDialog = (
+    action: ChatModerationAction,
+    message: ChatMessage,
+    trigger: HTMLButtonElement,
+  ) => {
+    chatDialogTriggerRef.current = trigger;
+    setChatReportReason("harassment");
+    setChatError(null);
+    setChatDialog({ action, message });
+  };
+
+  const closeChatDialog = useCallback(() => {
+    setChatDialog(null);
+    setChatModerationBusy(false);
+    window.requestAnimationFrame(() => {
+      if (chatDialogTriggerRef.current?.isConnected) {
+        chatDialogTriggerRef.current.focus();
+      } else {
+        document.getElementById("chat-tab")?.focus();
+      }
+    });
+  }, []);
+
+  const changeChatRestriction = async (
+    restriction: "mute" | "block",
+    playerId: string,
+    displayName: string,
+    enabled: boolean,
+  ): Promise<boolean> => {
+    const currentGame = gameRef.current;
+    if (!currentGame || !chatEnabled || chatModerationBusy) return false;
+    setChatModerationBusy(true);
+    setChatError(null);
+    setChatStatus(null);
+    try {
+      await request<unknown>(
+        `/api/games/${encodeURIComponent(currentGame.gameId)}/players/${encodeURIComponent(playerId)}/${restriction}`,
+        {
+          method: enabled ? "PUT" : "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        },
+      );
+      const update = restriction === "mute" ? setMutedChatPlayers : setBlockedChatPlayers;
+      update((current) => {
+        const next = { ...current };
+        if (enabled) next[playerId] = displayName;
+        else delete next[playerId];
+        return next;
+      });
+      setChatUnread(0);
+      setChatStatus(
+        enabled
+          ? `${displayName} is now ${restriction === "mute" ? "muted" : "blocked"}.`
+          : `${displayName} is no longer ${restriction === "mute" ? "muted" : "blocked"}.`,
+      );
+      return true;
+    } catch (failure) {
+      const code = (failure as RequestFailure).code;
+      if (
+        ["COMMUNICATION_DISABLED", "FEATURE_DISABLED", "ROUTE_NOT_FOUND"].includes(
+          code ?? "",
+        )
+      ) {
+        hideChatFeature();
+      } else {
+        setChatError(`Could not ${enabled ? "apply" : "remove"} that ${restriction}.`);
+      }
+      return false;
+    } finally {
+      setChatModerationBusy(false);
+    }
+  };
+
+  const confirmChatModeration = async () => {
+    const currentDialog = chatDialog;
+    if (!currentDialog || chatModerationBusy) return;
+    if (currentDialog.action === "report") {
+      const fingerprint = JSON.stringify({
+        messageId: currentDialog.message.id,
+        reason: chatReportReason,
+      });
+      const requestCommandId =
+        chatReportMutationRef.current?.fingerprint === fingerprint
+          ? chatReportMutationRef.current.commandId
+          : commandId();
+      chatReportMutationRef.current = { commandId: requestCommandId, fingerprint };
+      setChatModerationBusy(true);
+      setChatError(null);
+      setChatStatus(null);
+      try {
+        await request<unknown>(
+          `/api/messages/${encodeURIComponent(currentDialog.message.id)}/report`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              commandId: requestCommandId,
+              reason: chatReportReason,
+            }),
+          },
+        );
+        chatReportMutationRef.current = null;
+        setChatStatus("Report received. Thank you for helping keep the table safe.");
+        closeChatDialog();
+      } catch (failure) {
+        const code = (failure as RequestFailure).code;
+        if (
+          ["COMMUNICATION_DISABLED", "FEATURE_DISABLED", "ROUTE_NOT_FOUND"].includes(
+            code ?? "",
+          )
+        ) {
+          hideChatFeature();
+        } else {
+          const recoverable =
+            code === "REQUEST_TIMEOUT" || failure instanceof TypeError || !navigator.onLine;
+          if (!recoverable) chatReportMutationRef.current = null;
+          setChatError(
+            recoverable
+              ? "The report response was interrupted. Retry safely with the same reason."
+              : "The report could not be sent. Please try again.",
+          );
+        }
+      } finally {
+        setChatModerationBusy(false);
+      }
+      return;
+    }
+
+    const changed = await changeChatRestriction(
+      currentDialog.action,
+      currentDialog.message.senderPlayerId,
+      currentDialog.message.senderDisplayName,
+      true,
+    );
+    if (changed) closeChatDialog();
+  };
+
   const self = game?.players.find((player) => player.isSelf) ?? null;
   const activeOpponents =
     game?.players.filter((player) => !player.isSelf && player.status === "active") ?? [];
@@ -1351,7 +1907,8 @@ export function GameShell({
     Boolean(publicJoinIntent) ||
     Boolean(listingDialogAction) ||
     Boolean(guideTopic) ||
-    Boolean(removeTargetId);
+    Boolean(removeTargetId) ||
+    Boolean(chatDialog);
 
   useEffect(() => {
     if (!pendingCard) return;
@@ -1505,6 +2062,52 @@ export function GameShell({
     publicJoinIntent,
     removeTargetId,
   ]);
+
+  useEffect(() => {
+    if (!chatDialog) return;
+    const dialog = chatDialogRef.current;
+    if (!dialog) return;
+    const focusables = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hidden);
+    const frame = window.requestAnimationFrame(() => {
+      (focusables()[0] ?? dialog).focus();
+    });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeChatDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (!items.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items.at(-1)!;
+      if (
+        event.shiftKey &&
+        (document.activeElement === first || !dialog.contains(document.activeElement))
+      ) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [chatDialog, closeChatDialog]);
 
   if (!session) {
     return (
@@ -1822,7 +2425,12 @@ export function GameShell({
               aria-expanded={sidebarDetailsOpen}
               onClick={() => setSidebarDetailsOpen((open) => !open)}
             >
-              Players &amp; activity
+              <span>{chatEnabled ? "Players, chat & activity" : "Players & activity"}</span>
+              {chatEnabled && chatUnread ? (
+                <span className="chat-unread" aria-label={`${chatUnread} unread chat messages`}>
+                  {chatUnread}
+                </span>
+              ) : null}
             </button>
             <div className={`sidebar-details-panel ${sidebarDetailsOpen ? "is-open" : ""}`}>
               <div className="players-list" aria-label="Players">
@@ -1863,18 +2471,254 @@ export function GameShell({
                   );
                 })}
               </div>
-              <div
-                className="event-log"
-                role="log"
-                aria-label="Recent game events"
-                aria-live="polite"
-                aria-relevant="additions"
-              >
-                <span className="eyebrow">Recent events</span>
-                {events.length ? events.map((event, index) => (
-                  <p key={`${event.type}-${index}`}>{event.message}</p>
-                )) : <p>New table actions will appear here.</p>}
-              </div>
+              {chatEnabled ? (
+                <div className="sidebar-communication">
+                  <div
+                    className="sidebar-tabs"
+                    role="tablist"
+                    aria-label="Table communication"
+                    aria-orientation="horizontal"
+                  >
+                    <button
+                      id="chat-tab"
+                      type="button"
+                      role="tab"
+                      aria-controls="chat-panel"
+                      aria-selected={sidebarTab === "chat"}
+                      tabIndex={sidebarTab === "chat" ? 0 : -1}
+                      onClick={() => selectSidebarTab("chat")}
+                      onKeyDown={(event) => {
+                        if (event.key !== "ArrowRight" && event.key !== "End") return;
+                        event.preventDefault();
+                        selectSidebarTab("activity");
+                        window.requestAnimationFrame(() =>
+                          document.getElementById("activity-tab")?.focus(),
+                        );
+                      }}
+                    >
+                      Chat
+                      {chatUnread ? (
+                        <span className="chat-unread" aria-label={`${chatUnread} unread`}>
+                          {chatUnread}
+                        </span>
+                      ) : null}
+                    </button>
+                    <button
+                      id="activity-tab"
+                      type="button"
+                      role="tab"
+                      aria-controls="activity-panel"
+                      aria-selected={sidebarTab === "activity"}
+                      tabIndex={sidebarTab === "activity" ? 0 : -1}
+                      onClick={() => selectSidebarTab("activity")}
+                      onKeyDown={(event) => {
+                        if (event.key !== "ArrowLeft" && event.key !== "Home") return;
+                        event.preventDefault();
+                        selectSidebarTab("chat");
+                        window.requestAnimationFrame(() =>
+                          document.getElementById("chat-tab")?.focus(),
+                        );
+                      }}
+                    >
+                      Activity
+                    </button>
+                  </div>
+
+                  <section
+                    id="chat-panel"
+                    className="chat-panel"
+                    role="tabpanel"
+                    aria-labelledby="chat-tab"
+                    hidden={sidebarTab !== "chat"}
+                  >
+                    <div className="chat-toolbar">
+                      <span className="eyebrow">Table chat</span>
+                      <button
+                        type="button"
+                        className="chat-announcement-toggle"
+                        role="switch"
+                        aria-checked={chatAnnouncements}
+                        aria-label="Announce new chat messages"
+                        onClick={toggleChatAnnouncements}
+                      >
+                        Announce {chatAnnouncements ? "on" : "off"}
+                      </button>
+                    </div>
+                    <div
+                      ref={chatLogRef}
+                      className="chat-feed"
+                      role="log"
+                      aria-label="Table chat"
+                      aria-live={chatAnnouncements ? "polite" : "off"}
+                      aria-relevant="additions"
+                    >
+                      {visibleChatMessages.length ? (
+                        visibleChatMessages.map((message) => {
+                          const presentation = chatContentPresentation(
+                            message.kind,
+                            message.contentId,
+                          );
+                          const isSelfMessage = message.senderPlayerId === self?.playerId;
+                          if (!presentation) return null;
+                          return (
+                            <article
+                              className={`chat-message ${isSelfMessage ? "is-self" : ""}`}
+                              key={message.id}
+                              data-message-id={message.id}
+                            >
+                              <div className="chat-message__meta">
+                                <strong>
+                                  {message.senderDisplayName}{isSelfMessage ? " (you)" : ""}
+                                </strong>
+                                <time dateTime={new Date(message.createdAt).toISOString()}>
+                                  {formatChatTime(message.createdAt)}
+                                </time>
+                              </div>
+                              <div className="chat-message__content">
+                                {presentation.icon ? (
+                                  <span className="chat-message__icon" aria-hidden="true">
+                                    {presentation.icon}
+                                  </span>
+                                ) : null}
+                                <span>{presentation.label}</span>
+                              </div>
+                              {!isSelfMessage ? (
+                                <details className="chat-message-actions">
+                                  <summary aria-label={`Actions for message from ${message.senderDisplayName}`}>
+                                    •••
+                                  </summary>
+                                  <div>
+                                    <button
+                                      type="button"
+                                      onClick={(event) => openChatDialog("mute", message, event.currentTarget)}
+                                    >
+                                      Mute
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(event) => openChatDialog("block", message, event.currentTarget)}
+                                    >
+                                      Block
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(event) => openChatDialog("report", message, event.currentTarget)}
+                                    >
+                                      Report
+                                    </button>
+                                  </div>
+                                </details>
+                              ) : null}
+                            </article>
+                          );
+                        })
+                      ) : (
+                        <p className="chat-empty">
+                          No messages yet. Use a quick phrase or reaction—free text stays off.
+                        </p>
+                      )}
+                    </div>
+
+                    {chatError ? <p className="chat-feedback is-error" role="alert">{chatError}</p> : null}
+                    {chatStatus ? <p className="chat-feedback" role="status">{chatStatus}</p> : null}
+
+                    <div className="chat-composer" aria-label="Send a curated chat message">
+                      <span className="eyebrow">Quick phrases</span>
+                      <div className="chat-phrase-grid">
+                        {CHAT_PHRASES.map((phrase) => (
+                          <button
+                            key={phrase.id}
+                            type="button"
+                            disabled={chatSending || chatCoolingDown}
+                            aria-label={`Send “${phrase.label}”`}
+                            onClick={() => void sendCuratedChat("phrase", phrase.id)}
+                          >
+                            {phrase.label}
+                          </button>
+                        ))}
+                      </div>
+                      <span className="eyebrow">Reactions</span>
+                      <div className="chat-reaction-grid">
+                        {CHAT_REACTIONS.map((reaction) => (
+                          <button
+                            key={reaction.id}
+                            type="button"
+                            disabled={chatSending || chatCoolingDown}
+                            aria-label={`Send ${reaction.label}`}
+                            title={reaction.label}
+                            onClick={() => void sendCuratedChat("reaction", reaction.id)}
+                          >
+                            <span aria-hidden="true">{reaction.icon}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {Object.keys(mutedChatPlayers).length || Object.keys(blockedChatPlayers).length ? (
+                      <details className="chat-safety-controls">
+                        <summary>Muted &amp; blocked players</summary>
+                        {Object.entries(mutedChatPlayers).map(([playerId, displayName]) => (
+                          <div key={`muted-${playerId}`}>
+                            <span>{displayName} · muted</span>
+                            <button
+                              type="button"
+                              disabled={chatModerationBusy}
+                              onClick={() => void changeChatRestriction("mute", playerId, displayName, false)}
+                            >
+                              Unmute
+                            </button>
+                          </div>
+                        ))}
+                        {Object.entries(blockedChatPlayers).map(([playerId, displayName]) => (
+                          <div key={`blocked-${playerId}`}>
+                            <span>{displayName} · blocked</span>
+                            <button
+                              type="button"
+                              disabled={chatModerationBusy}
+                              onClick={() => void changeChatRestriction("block", playerId, displayName, false)}
+                            >
+                              Unblock
+                            </button>
+                          </div>
+                        ))}
+                      </details>
+                    ) : null}
+                  </section>
+
+                  <div
+                    id="activity-panel"
+                    className="event-log"
+                    role="tabpanel"
+                    aria-labelledby="activity-tab"
+                    hidden={sidebarTab !== "activity"}
+                  >
+                    <span className="eyebrow">Recent events</span>
+                    <div
+                      role="log"
+                      aria-label="Recent game events"
+                      aria-live="polite"
+                      aria-relevant="additions"
+                    >
+                      {events.length ? events.map((event, index) => (
+                        <p key={`${event.type}-${index}`}>{event.message}</p>
+                      )) : <p>New table actions will appear here.</p>}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div
+                  className="event-log"
+                  role="log"
+                  aria-label="Recent game events"
+                  aria-live="polite"
+                  aria-relevant="additions"
+                >
+                  <span className="eyebrow">Recent events</span>
+                  {events.length ? events.map((event, index) => (
+                    <p key={`${event.type}-${index}`}>{event.message}</p>
+                  )) : <p>New table actions will appear here.</p>}
+                </div>
+              )}
             </div>
             <button
               className="secondary-button leave-button"
@@ -2129,6 +2973,78 @@ export function GameShell({
               </div>
             </div>
           ) : null}
+        </div>
+      ) : null}
+
+      {chatDialog ? (
+        <div
+          ref={chatDialogRef}
+          className="choice-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="chat-moderation-title"
+          tabIndex={-1}
+        >
+          <div className="choice-panel chat-moderation-panel">
+            <span className="eyebrow">Chat safety</span>
+            <h2 id="chat-moderation-title">
+              {chatDialog.action === "mute"
+                ? `Mute ${chatDialog.message.senderDisplayName}?`
+                : chatDialog.action === "block"
+                  ? `Block ${chatDialog.message.senderDisplayName}?`
+                  : "Report this message?"}
+            </h2>
+            <p className="dialog-copy">
+              {chatDialog.action === "mute"
+                ? "Their table messages will be hidden for you. You can unmute them from chat safety controls."
+                : chatDialog.action === "block"
+                  ? "Their messages will be hidden and the service will prevent future matching where possible. You can unblock them from chat safety controls."
+                  : `Tell us why you’re reporting ${chatDialog.message.senderDisplayName}. Reports never include free-text notes.`}
+            </p>
+            {chatDialog.action === "report" ? (
+              <fieldset className="chat-report-reasons">
+                <legend>Reason for report</legend>
+                {CHAT_REPORT_REASONS.map((reason) => (
+                  <label key={reason.id}>
+                    <input
+                      type="radio"
+                      name="chat-report-reason"
+                      value={reason.id}
+                      checked={chatReportReason === reason.id}
+                      disabled={chatModerationBusy}
+                      onChange={() => setChatReportReason(reason.id)}
+                    />
+                    <span>{reason.label}</span>
+                  </label>
+                ))}
+              </fieldset>
+            ) : null}
+            {chatError ? <p className="field-error" role="alert">{chatError}</p> : null}
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={chatModerationBusy}
+                onClick={closeChatDialog}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={chatDialog.action === "mute" ? "primary-button" : "primary-button danger"}
+                disabled={chatModerationBusy}
+                onClick={() => void confirmChatModeration()}
+              >
+                {chatModerationBusy
+                  ? "Saving…"
+                  : chatDialog.action === "mute"
+                    ? `Mute ${chatDialog.message.senderDisplayName}`
+                    : chatDialog.action === "block"
+                      ? `Block ${chatDialog.message.senderDisplayName}`
+                      : "Report message"}
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
@@ -2613,6 +3529,25 @@ function formatNameList(names: string[]): string {
   if (names.length <= 1) return names[0] ?? "A player";
   if (names.length === 2) return `${names[0]} and ${names[1]}`;
   return `${names.slice(0, -1).join(", ")}, and ${names.at(-1)}`;
+}
+
+function formatChatTime(createdAt: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(createdAt));
+}
+
+function samePlayerMap(
+  left: Record<string, string>,
+  right: Record<string, string>,
+): boolean {
+  const leftEntries = Object.entries(left);
+  const rightEntries = Object.entries(right);
+  return (
+    leftEntries.length === rightEntries.length &&
+    leftEntries.every(([playerId, displayName]) => right[playerId] === displayName)
+  );
 }
 
 function readStoredCommand(): StoredCommand | null {

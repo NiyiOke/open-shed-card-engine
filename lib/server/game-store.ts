@@ -4567,12 +4567,46 @@ async function purgeExpiredRows(
   await database.batch([
     database
       .prepare(
+        `DELETE FROM game_message_reports WHERE rowid IN (
+          SELECT rowid FROM game_message_reports
+          WHERE expires_at <= ?
+          ORDER BY expires_at, id
+          LIMIT 128
+        )`,
+      )
+      .bind(now),
+    database
+      .prepare(
         `DELETE FROM public_game_listings WHERE rowid IN (
           SELECT listing.rowid FROM public_game_listings listing
           JOIN games g ON g.id = listing.game_id
           WHERE g.expires_at <= ?
           ORDER BY g.expires_at, listing.game_id
           LIMIT 64
+        )`,
+      )
+      .bind(now),
+    database
+      .prepare(
+        `DELETE FROM game_mutes WHERE rowid IN (
+          SELECT mute.rowid FROM game_mutes mute
+          JOIN games g ON g.id = mute.game_id
+          WHERE g.expires_at <= ?
+          ORDER BY g.expires_at, mute.game_id,
+                   mute.muter_profile_id, mute.muted_profile_id
+          LIMIT 128
+        )`,
+      )
+      .bind(now),
+    database
+      .prepare(
+        `DELETE FROM game_messages WHERE rowid IN (
+          SELECT message.rowid FROM game_messages message
+          JOIN games g ON g.id = message.game_id
+          WHERE g.expires_at <= ?
+          ORDER BY g.expires_at, message.game_id,
+                   message.created_at, message.id
+          LIMIT 128
         )`,
       )
       .bind(now),
@@ -4632,6 +4666,14 @@ async function purgeExpiredRows(
             AND NOT EXISTS (
               SELECT 1 FROM public_game_listings listing
               WHERE listing.game_id = g.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM game_messages message
+              WHERE message.game_id = g.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM game_mutes mute
+              WHERE mute.game_id = g.id
             )
           ORDER BY g.expires_at, g.id
           LIMIT ?
