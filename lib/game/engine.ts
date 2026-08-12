@@ -153,11 +153,15 @@ export function transitionGame(
     (player) => player.userId === context.actorUserId,
   );
   requireRule(actor, "NOT_A_MEMBER", "You are not a member of this game.", 403);
-  if (command.type !== "rematch" && command.type !== "leave_game") {
+  if (
+    command.type !== "rematch" &&
+    command.type !== "claim_host" &&
+    command.type !== "leave_game"
+  ) {
     requireRule(
       state.phase !== "complete",
       "GAME_COMPLETE",
-      "This game is complete and no longer accepts commands.",
+      "This game is complete. Start a rematch, recover hosting, or leave the table.",
       409,
     );
   }
@@ -178,6 +182,9 @@ export function transitionGame(
       break;
     case "rematch":
       startRematchLobby(state, actor, events);
+      break;
+    case "claim_host":
+      claimHost(state, actor, events);
       break;
     case "remove_inactive_player":
       removeInactivePlayer(state, actor, command.targetPlayerId, events);
@@ -798,6 +805,51 @@ function leaveGame(
       data: { reason: "explicit_leave" },
     });
   }
+}
+
+function claimHost(
+  state: GameState,
+  actor: PlayerState,
+  events: GameEvent[],
+): void {
+  const actorIsEligible =
+    state.phase === "complete"
+      ? actor.status !== "left"
+      : actor.status === "active";
+  requireRule(
+    actorIsEligible,
+    "PLAYER_NOT_ACTIVE",
+    state.phase === "complete"
+      ? "Only a current table member can keep the table going."
+      : "Only an active player can keep the table going.",
+    403,
+  );
+  requireRule(
+    actor.userId !== state.hostUserId,
+    "ALREADY_HOST",
+    "You are already the host.",
+    409,
+  );
+  const previousHost = state.players.find(
+    (player) => player.userId === state.hostUserId,
+  );
+  requireRule(
+    previousHost && previousHost.status !== "left",
+    "HOST_UNAVAILABLE",
+    "The current host changed before this claim completed.",
+    409,
+  );
+
+  state.hostUserId = actor.userId;
+  events.push({
+    type: "host_claimed",
+    actorPlayerId: actor.playerId,
+    message: `${actor.displayName} kept the table going as host.`,
+    data: {
+      previousHostPlayerId: previousHost.playerId,
+      newHostPlayerId: actor.playerId,
+    },
+  });
 }
 
 function removeInactivePlayer(

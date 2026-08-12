@@ -2,6 +2,27 @@ import { GameRuleError } from "./errors";
 import type { Card, GameState } from "./types";
 
 export function assertGameInvariants(state: GameState): void {
+  const host = state.players.find(
+    (player) => player.userId === state.hostUserId,
+  );
+  if (!host) {
+    throw new GameRuleError(
+      "INVALID_HOST",
+      "The table host must be a member of the game.",
+      500,
+    );
+  }
+  if (
+    host.status === "left" &&
+    state.players.some((player) => player.status !== "left")
+  ) {
+    throw new GameRuleError(
+      "INVALID_HOST",
+      "A table with current members must have a current host.",
+      500,
+    );
+  }
+
   const cards: Card[] = [
     ...state.drawPile,
     ...state.discardPile,

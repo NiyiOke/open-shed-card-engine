@@ -50,6 +50,30 @@ export const games = sqliteTable(
   ],
 );
 
+export const gameRounds = sqliteTable(
+  "game_rounds",
+  {
+    gameId: text("game_id").notNull(),
+    completionRevision: integer("completion_revision").notNull(),
+    roundNumber: integer("round_number").notNull(),
+    winnerProfileId: text("winner_profile_id").notNull(),
+    winnerDisplayName: text("winner_display_name").notNull(),
+    winnerReason: text("winner_reason").notNull(),
+    completedAt: integer("completed_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.gameId, table.completionRevision] }),
+    uniqueIndex("idx_game_rounds_number").on(
+      table.gameId,
+      table.roundNumber,
+    ),
+    index("idx_game_rounds_winner").on(
+      table.gameId,
+      table.winnerProfileId,
+    ),
+  ],
+);
+
 export const gameMembers = sqliteTable(
   "game_members",
   {

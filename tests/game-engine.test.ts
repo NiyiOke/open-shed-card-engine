@@ -1036,6 +1036,72 @@ test("rematch rejects non-hosts and games that are not complete", () => {
   assert.deepEqual(completed, snapshot);
 });
 
+test("claiming host changes only authority and keeps the former host seated", () => {
+  let lobby = createLobbyState({
+    gameId: "host-recovery",
+    joinCode: "CLAIM1",
+    hostUserId: HOST.userId,
+    hostPlayerId: HOST.playerId,
+    hostDisplayName: HOST.name,
+    now: 1,
+    seed: 17,
+  });
+  lobby = joinLobbyState(lobby, {
+    userId: B.userId,
+    playerId: B.playerId,
+    displayName: B.name,
+    commandId: "join-claimant",
+    now: 2,
+  }).state;
+  const formerHost = structuredClone(lobby.players[0]);
+
+  const result = transitionGame(lobby, { type: "claim_host" }, {
+    actorUserId: B.userId,
+    commandId: "claim-host",
+    now: 3,
+  });
+
+  assert.equal(result.state.hostUserId, B.userId);
+  assert.deepEqual(result.state.players[0], formerHost);
+  assert.equal(result.state.players.length, 2);
+  assert.deepEqual(result.events, [
+    {
+      type: "host_claimed",
+      actorPlayerId: B.playerId,
+      message: "Ben kept the table going as host.",
+      data: {
+        previousHostPlayerId: HOST.playerId,
+        newHostPlayerId: B.playerId,
+      },
+    },
+  ]);
+});
+
+test("a Mercy-eliminated current member can recover a completed table and rematch", () => {
+  const completed = completedGameWithEliminatedAndLeftPlayers();
+  const recovered = run(completed, B.userId, { type: "claim_host" });
+
+  assert.equal(recovered.hostUserId, B.userId);
+  assert.equal(
+    recovered.players.find((player) => player.playerId === B.playerId)?.status,
+    "eliminated",
+  );
+  assert.equal(
+    recovered.players.find((player) => player.playerId === HOST.playerId)?.status,
+    "active",
+  );
+
+  const rematch = run(recovered, B.userId, { type: "rematch" });
+  assert.equal(rematch.phase, "lobby");
+  assert.deepEqual(
+    rematch.players.map((player) => [player.playerId, player.status]),
+    [
+      [HOST.playerId, "active"],
+      [B.playerId, "active"],
+    ],
+  );
+});
+
 test("completed members leave idempotently through host transfer and final room emptying", () => {
   const completed = completedGameWithEliminatedAndLeftPlayers();
   const completedSnapshot = structuredClone(completed);

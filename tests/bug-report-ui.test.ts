@@ -99,7 +99,7 @@ test("safe diagnostics construct only the explicit privacy allowlist", () => {
 });
 
 test("safe diagnostics include the release identity without deployment secrets", () => {
-  assert.equal(SAFE_DIAGNOSTICS.appVersion, "1.5.1");
+  assert.equal(SAFE_DIAGNOSTICS.appVersion, APP_VERSION);
   assert.equal(SAFE_DIAGNOSTICS.buildId, APP_BUILD_ID);
   assert.doesNotMatch(
     JSON.stringify(SAFE_DIAGNOSTICS),

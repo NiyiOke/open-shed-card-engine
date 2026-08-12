@@ -1,6 +1,6 @@
 {
   "name": "open-shed-card-engine",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -15,6 +15,7 @@
     "test:v15-lifecycle": "node scripts/v15-room-lifecycle-acceptance.mjs",
     "test:v15-discovery": "node scripts/v15-discovery-acceptance.mjs",
     "test:v15-chat": "node scripts/v15-chat-acceptance.mjs",
+    "test:v16-continuity": "node scripts/v16-continuity-acceptance.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"

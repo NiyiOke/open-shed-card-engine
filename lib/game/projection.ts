@@ -1,10 +1,17 @@
 import { drawValue } from "./deck";
 import { isNormallyPlayable } from "./engine";
-import type { GameState, GameView, LegalActions, PlayerState } from "./types";
+import type {
+  GameContinuityProjection,
+  GameState,
+  GameView,
+  LegalActions,
+  PlayerState,
+} from "./types";
 
 export function projectGameForUser(
   state: GameState,
   viewerUserId: string,
+  continuity?: GameContinuityProjection,
 ): GameView {
   const viewer = state.players.find((player) => player.userId === viewerUserId);
   if (!viewer) throw new Error("Viewer is not a member of this game.");
@@ -52,7 +59,23 @@ export function projectGameForUser(
       isSelf: player.userId === viewerUserId,
     })),
     hand: viewer.hand,
-    legalActions: legalActionsFor(state, viewer),
+    legalActions: legalActionsFor(
+      state,
+      viewer,
+      continuity?.canClaimHost ?? false,
+    ),
+    series: continuity?.series ?? {
+      roundNumber: 1,
+      completedRounds: 0,
+      scores: state.players
+        .filter((player) => player.status !== "left")
+        .map((player) => ({
+          playerId: player.playerId,
+          displayName: player.displayName,
+          wins: 0,
+        })),
+      recentWinners: [],
+    },
     isHost: state.hostUserId === viewerUserId,
   };
 }
@@ -60,6 +83,7 @@ export function projectGameForUser(
 export function legalActionsFor(
   state: GameState,
   viewer: PlayerState,
+  canClaimHost = false,
 ): LegalActions {
   const isTurn =
     state.phase === "playing" &&
@@ -113,6 +137,7 @@ export function legalActionsFor(
       state.phase === "complete" &&
       state.hostUserId === viewer.userId &&
       viewer.status !== "left",
+    canClaimHost,
     canLeave: viewer.status !== "left",
   };
 }

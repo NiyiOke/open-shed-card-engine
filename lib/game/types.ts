@@ -113,6 +113,7 @@ export type GameCommand =
   | { type: "declare_uno" }
   | { type: "catch_uno"; offenderPlayerId: string }
   | { type: "rematch" }
+  | { type: "claim_host" }
   | { type: "remove_inactive_player"; targetPlayerId: string }
   | { type: "leave_game" };
 
@@ -151,7 +152,33 @@ export type LegalActions = {
   canDeclareUno: boolean;
   catchablePlayerIds: string[];
   canRematch: boolean;
+  canClaimHost: boolean;
   canLeave: boolean;
+};
+
+export type GameSeriesScore = {
+  playerId: string;
+  displayName: string;
+  wins: number;
+};
+
+export type GameSeriesWinner = {
+  roundNumber: number;
+  displayName: string;
+  reason: GameWinner["reason"];
+  completedAt: number;
+};
+
+export type GameSeriesView = {
+  roundNumber: number;
+  completedRounds: number;
+  scores: GameSeriesScore[];
+  recentWinners: GameSeriesWinner[];
+};
+
+export type GameContinuityProjection = {
+  series: GameSeriesView;
+  canClaimHost: boolean;
 };
 
 export type PlayerView = Omit<PlayerState, "userId" | "hand"> & {
@@ -181,6 +208,7 @@ export type GameView = {
   players: PlayerView[];
   hand: Card[];
   legalActions: LegalActions;
+  series: GameSeriesView;
   isHost: boolean;
 };
 

@@ -7,15 +7,16 @@ import {
   APP_VERSION_LABEL,
 } from "../../lib/app-version";
 
-export const NEXT_RELEASE_LABEL = "V1.6.0" as const;
+export const NEXT_RELEASE_LABEL = "V1.6.1" as const;
 
 export const RELEASE_NOTES = Object.freeze([
-  "The app release, rules profile, and table revision now have clear, separate labels.",
-  "Open-table discovery, safer table chat, sound cues, and privacy-safe issue reports form the V1.5 game-night foundation.",
+  "An eligible connected player can recover host controls after the server-verified reconnect grace period, without changing players, cards, or the turn.",
+  "Completed rounds now build a persistent series score and recent-winner history that continues through rematches.",
+  "The app release, rules profile, and per-table revision remain clearly separated.",
 ] as const);
 
 export const NEXT_RELEASE_PREVIEW =
-  "Game Night Continuity adds server-verified host recovery and a round-by-round series score that survives rematches.";
+  "V1.6.1 is reserved for stability, accessibility, and performance fixes discovered during the V1.6 rollout.";
 
 export function tableRevisionLabel(revision: number): string {
   const safeRevision = Number.isSafeInteger(revision) && revision >= 0
@@ -99,7 +100,7 @@ export function ReleaseIdentity({ className = "" }: { className?: string }) {
 
           <section className="release-next" aria-labelledby="release-next-title">
             <span className="eyebrow">Up next</span>
-            <h3 id="release-next-title">{NEXT_RELEASE_LABEL} · Game Night Continuity</h3>
+            <h3 id="release-next-title">{NEXT_RELEASE_LABEL} · Stability pass</h3>
             <p>{NEXT_RELEASE_PREVIEW}</p>
           </section>
 

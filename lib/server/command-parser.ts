@@ -54,6 +54,9 @@ export function parseGameCommand(value: unknown): GameCommand {
       };
     case "rematch":
       return { type: "rematch" };
+    case "claim_host":
+      requireExactKeys(input, ["type"]);
+      return { type: "claim_host" };
     case "remove_inactive_player":
       return {
         type: "remove_inactive_player",
@@ -71,6 +74,20 @@ export function parseGameCommand(value: unknown): GameCommand {
         `Unsupported command type: ${input.type}`,
         400,
       );
+  }
+}
+
+function requireExactKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): void {
+  const allowedKeys = new Set(allowed);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    throw new GameRuleError(
+      "INVALID_COMMAND",
+      "claim_host does not accept additional fields.",
+      400,
+    );
   }
 }
 

@@ -55,7 +55,7 @@ test("command parser rejects unknown privileged command shapes", () => {
   );
 });
 
-test("command parser accepts the exact V1.1 room-management commands", () => {
+test("command parser accepts the exact room-management commands", () => {
   assert.deepEqual(parseGameCommand({ type: "rematch" }), {
     type: "rematch",
   });
@@ -72,6 +72,23 @@ test("command parser accepts the exact V1.1 room-management commands", () => {
   assert.deepEqual(parseGameCommand({ type: "leave_game" }), {
     type: "leave_game",
   });
+  assert.deepEqual(parseGameCommand({ type: "claim_host" }), {
+    type: "claim_host",
+  });
+});
+
+test("host claim rejects all client-supplied authority facts", () => {
+  for (const extra of [
+    { claimantPlayerId: "player-b" },
+    { hostLastSeenAt: 0 },
+    { force: true },
+  ]) {
+    assert.throws(
+      () => parseGameCommand({ type: "claim_host", ...extra }),
+      (error: unknown) =>
+        error instanceof GameRuleError && error.code === "INVALID_COMMAND",
+    );
+  }
 });
 
 test("inactive-player removal parser requires a bounded target player id", () => {

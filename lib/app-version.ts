@@ -5,7 +5,7 @@
  * revisions are per-table counters. Neither should be presented as the app
  * version.
  */
-export const APP_VERSION = "1.5.1" as const;
+export const APP_VERSION = "1.6.0" as const;
 export const APP_VERSION_LABEL = `V${APP_VERSION}` as const;
 export const APP_RELEASE_LABEL = `Open Shed ${APP_VERSION_LABEL}` as const;
 

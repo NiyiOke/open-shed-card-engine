@@ -23,6 +23,13 @@ import { GameTableCanvas } from "./GameTableCanvas";
 import { SignedOutLanding } from "./SignedOutLanding";
 import { ReleaseIdentity, tableRevisionLabel } from "./release-ui";
 import {
+  canApplyRefreshedGameView,
+  rankSeriesScores,
+  roundLabel,
+  seriesWinLabel,
+  winnerReasonLabel,
+} from "./continuity-ui";
+import {
   createGameAudioController,
   type AudioCapabilities,
   type AudioDebugState,
@@ -274,6 +281,7 @@ export function GameShell({
   const [bugReportError, setBugReportError] = useState<string | null>(null);
   const [bugReportStatus, setBugReportStatus] = useState<string | null>(null);
   const [removeTargetId, setRemoveTargetId] = useState<string | null>(null);
+  const [hostClaimPending, setHostClaimPending] = useState(false);
   const [storedCommand, setStoredCommand] = useState<StoredCommand | null>(null);
   const [sidebarDetailsOpen, setSidebarDetailsOpen] = useState(false);
   const [publicRooms, setPublicRooms] = useState<PublicRoomPage | null>(null);
@@ -611,12 +619,7 @@ export function GameShell({
           }
         }
         const current = gameRef.current;
-        if (
-          !current ||
-          current.gameId !== gameId ||
-          response.view.gameId !== gameId ||
-          response.view.revision <= current.revision
-        ) {
+        if (!canApplyRefreshedGameView(current, response.view, gameId)) {
           return false;
         }
         gameRef.current = response.view;
@@ -1287,12 +1290,16 @@ export function GameShell({
         connection: connectionState,
         effects: {
           reducedMotion,
-          playedCardPulse:
-            playedCardFxRevision?.gameId === game?.gameId &&
-            playedCardFxRevision?.revision === game?.revision,
-          selfTurnPulse:
-            turnFxRevision?.gameId === game?.gameId &&
-            turnFxRevision?.revision === game?.revision,
+          playedCardPulse: Boolean(
+            game &&
+              playedCardFxRevision?.gameId === game.gameId &&
+              playedCardFxRevision.revision === game.revision,
+          ),
+          selfTurnPulse: Boolean(
+            game &&
+              turnFxRevision?.gameId === game.gameId &&
+              turnFxRevision.revision === game.revision,
+          ),
         },
         audio: {
           enabled: soundSettings.enabled,
@@ -1339,6 +1346,7 @@ export function GameShell({
               ownHand: game.hand.map((card) => ({ id: card.id, label: cardLabel(card) })),
               legalActions: game.legalActions,
               winner: game.winner,
+              series: game.series,
               coach: getTurnCoach(game, game.players.find((player) => player.isSelf)?.playerId),
               chat: chatEnabled
                 ? {
@@ -2209,6 +2217,15 @@ export function GameShell({
     if (left) openLobbyBrowser();
   };
 
+  const claimHost = async () => {
+    setHostClaimPending(true);
+    try {
+      await sendCommand({ type: "claim_host" });
+    } finally {
+      setHostClaimPending(false);
+    }
+  };
+
   const openTestPlayerDialog = (trigger: HTMLButtonElement) => {
     if (pendingCard || testPlayerDialogOpen || busy) return;
     testPlayerTriggerRef.current = trigger;
@@ -2734,6 +2751,14 @@ export function GameShell({
     game &&
     (game.legalActions as GameView["legalActions"] & { canRematch?: boolean }).canRematch,
   );
+  const hostClaimSaved = Boolean(
+    storedCommand?.gameId === game?.gameId &&
+    storedCommand?.command.type === "claim_host",
+  );
+  const rankedSeriesScores = game
+    ? rankSeriesScores(game.series.scores, game.players)
+    : [];
+  const nextRoundNumber = game ? game.series.roundNumber + 1 : 1;
   const removeTarget = game?.players.find((player) => player.playerId === removeTargetId) ?? null;
   const publicJoinRoom = publicJoinIntent?.kind === "listing"
     ? publicJoinIntent.room ?? publicRooms?.rooms.find(
@@ -3283,6 +3308,33 @@ export function GameShell({
               </div>
             </div>
 
+            {game.legalActions.canClaimHost ? (
+              <section className="host-continuity" aria-labelledby="host-continuity-title">
+                <span className="sr-only" role="status">
+                  Host recovery is available. You can keep this table going.
+                </span>
+                <div>
+                  <span className="eyebrow">Host unavailable</span>
+                  <h2 id="host-continuity-title">Keep this table going</h2>
+                  <p>
+                    The server&apos;s reconnect grace period has ended. Become host without
+                    removing anyone or changing players, cards, the turn, or this series.
+                  </p>
+                  {hostClaimSaved ? (
+                    <small>Connection interrupted. Retry the saved action above; the same claim will be used safely.</small>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  className="primary-button acid"
+                  disabled={actionPending || hostClaimPending}
+                  onClick={() => void claimHost()}
+                >
+                  {hostClaimPending ? "Taking over…" : hostClaimSaved ? "Claim saved" : "Keep table going"}
+                </button>
+              </section>
+            ) : null}
+
             {game.phase === "lobby" && game.isHost && listing ? (
               <section className={`public-listing-control is-${listing.state}`} aria-labelledby="public-listing-title">
                 <div>
@@ -3368,37 +3420,85 @@ export function GameShell({
 
             {game.phase === "complete" ? (
               <section className="result-sheet" aria-labelledby="result-title">
-                <span className="eyebrow">Round complete</span>
+                <span className="eyebrow">{roundLabel(game.series.roundNumber)} complete</span>
                 <h2 id="result-title">{game.winner?.displayName ?? "The table"} wins.</h2>
                 <p>
                   {game.winner?.reason === "empty_hand"
                     ? "They shed their final card before the table could answer."
                     : "They survived as the last active player under the Mercy rule."}
                 </p>
-                <div className="result-standings" aria-label="Final player standings">
-                  {game.players.map((player) => (
-                    <div key={player.playerId} className={player.playerId === game.winner?.playerId ? "is-winner" : ""}>
-                      <strong>{player.displayName}{player.isSelf ? " (you)" : ""}</strong>
-                      <span>
-                        {player.playerId === game.winner?.playerId
-                          ? "Winner"
-                          : player.status === "eliminated"
-                            ? "Mercy knockout"
-                            : player.status === "left"
-                              ? "Left table"
-                              : `${player.cardCount} cards remaining`}
-                      </span>
+                <div className="result-dashboard">
+                  <section className="result-round-panel" aria-labelledby="round-finish-title">
+                    <span className="eyebrow">Round finish</span>
+                    <h3 id="round-finish-title">This round</h3>
+                    <div className="result-standings" aria-label={`${roundLabel(game.series.roundNumber)} final player standings`}>
+                      {game.players.map((player) => (
+                        <div key={player.playerId} className={player.playerId === game.winner?.playerId ? "is-winner" : ""}>
+                          <strong>{player.displayName}{player.isSelf ? " (you)" : ""}</strong>
+                          <span>
+                            {player.playerId === game.winner?.playerId
+                              ? "Winner"
+                              : player.status === "eliminated"
+                                ? "Mercy knockout"
+                                : player.status === "left"
+                                  ? "Left table"
+                                  : `${player.cardCount} cards remaining`}
+                          </span>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  </section>
+
+                  <section className="result-series" aria-labelledby="series-score-title">
+                    <div className="result-section-heading">
+                      <div>
+                        <span className="eyebrow">Series to date</span>
+                        <h3 id="series-score-title">Series score</h3>
+                      </div>
+                      <span>{game.series.completedRounds} {game.series.completedRounds === 1 ? "round" : "rounds"}</span>
+                    </div>
+                    <ol className="series-score-list">
+                      {rankedSeriesScores.map(({ rank, score }, index) => {
+                        const player = game.players.find((candidate) => candidate.playerId === score.playerId);
+                        return (
+                          <li key={score.playerId} className={index === 0 && score.wins > 0 ? "is-leading" : ""}>
+                            <span className="series-rank" aria-label={`Rank ${rank}`}>{String(rank).padStart(2, "0")}</span>
+                            <strong>{score.displayName}{player?.isSelf ? " (you)" : ""}</strong>
+                            <span>{seriesWinLabel(score.wins)}</span>
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  </section>
                 </div>
+
+                {game.series.recentWinners.length ? (
+                  <section className="recent-winners" aria-labelledby="recent-winners-title">
+                    <div className="result-section-heading">
+                      <div>
+                        <span className="eyebrow">Last five at most</span>
+                        <h3 id="recent-winners-title">Recent winners</h3>
+                      </div>
+                    </div>
+                    <ol>
+                      {game.series.recentWinners.map((winner) => (
+                        <li key={`${winner.roundNumber}-${winner.completedAt}`}>
+                          <strong>{roundLabel(winner.roundNumber)} — {winner.displayName}</strong>
+                          <span>{winnerReasonLabel(winner.reason)}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  </section>
+                ) : null}
                 <div className="result-actions">
                   {canRematch ? (
                     <button className="primary-button acid" disabled={actionPending} onClick={() => void sendCommand({ type: "rematch" })}>
-                      Rematch with this table
+                      Play round {nextRoundNumber}
                     </button>
                   ) : game.isHost ? null : (
-                    <span className="waiting-copy">The host can start a rematch.</span>
+                    <span className="waiting-copy">Waiting for the host to start round {nextRoundNumber}.</span>
                   )}
+                  {canRematch ? <span className="continuity-copy">Keeps this table, players, and series score.</span> : null}
                   <button className="secondary-button" disabled={actionPending} onClick={() => void leaveTable()}>Leave table and go back</button>
                   <button className="secondary-button" disabled={actionPending} onClick={() => void createLobby()}>Create a new table</button>
                 </div>

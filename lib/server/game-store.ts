@@ -9,9 +9,12 @@ import { assertGameInvariants } from "../game/invariants";
 import { projectGameForUser } from "../game/projection";
 import type {
   GameCommand,
+  GameContinuityProjection,
   GameEvent,
+  GameSeriesView,
   GameState,
   GameView,
+  GameWinner,
 } from "../game/types";
 import { GAME_PROTOCOL_VERSION, RULES_VERSION } from "../game/types";
 import type { AuthenticatedUser } from "./auth";
@@ -42,6 +45,12 @@ import {
   presencePlayer,
   type PresenceSnapshot,
 } from "./presence-policy";
+import {
+  assertHostClaimPolicy,
+  buildGameSeriesViewFromAggregate,
+  type HostClaimGuard,
+  type RoundSeriesRecord,
+} from "./game-night-continuity-policy";
 import {
   ABANDONED_WAITING_ROOM_CLOSE_AFTER_MS,
   evaluateWaitingRoomLifecycle,
@@ -114,6 +123,18 @@ type PresenceRosterRow = {
   joined_at: number;
   player_id: string | null;
   last_seen_at: number | null;
+};
+
+type GameSeriesProjectionRow = {
+  row_kind: "score" | "recent";
+  winner_user_id: string;
+  wins: number | null;
+  completed_rounds: number;
+  highest_round: number;
+  completion_revision: number | null;
+  round_number: number | null;
+  winner_reason: string | null;
+  completed_at: number | null;
 };
 
 type MemberAccessRow = {
@@ -207,6 +228,15 @@ type PublicJoinExecutionContext = Readonly<{
 type InactiveRemovalCommand = {
   type: "remove_inactive_player";
   targetPlayerId: string;
+};
+
+type HostClaimCommand = {
+  type: "claim_host";
+};
+
+type PersistedHostClaimGuard = HostClaimGuard & {
+  previousHostProfileId: string;
+  claimantProfileId: string;
 };
 
 type InactiveRemovalGuard = {
@@ -638,7 +668,12 @@ export async function mutateGameListing(
         now,
         updatedListing,
       ),
-      view: projectGameForUser(state, user.userId),
+      view: await projectStoredGameForUser(
+        database,
+        state,
+        user.userId,
+        now,
+      ),
     };
   }
 
@@ -866,7 +901,12 @@ export async function mutateGameListing(
       now,
       publishedListing,
     ),
-    view: projectGameForUser(nextState, user.userId),
+    view: await projectStoredGameForUser(
+      database,
+      nextState,
+      user.userId,
+      now,
+    ),
   };
 }
 
@@ -975,7 +1015,7 @@ export async function createGame(
           )
           .bind(profile.id, commandId, gameId, operation, requestHash, now),
       ]);
-      return projectGameForUser(state, user.userId);
+      return projectStoredGameForUser(database, state, user.userId, now);
     } catch (error) {
       const receipt = await findCommandReceipt(database, profile.id, commandId);
       if (receipt) {
@@ -1089,7 +1129,7 @@ export async function joinGame(
         entry.actorUserId === user.userId && entry.commandId === commandId,
     );
     if (alreadyActive && !recoversAcceptedJoin) {
-      return projectGameForUser(current, user.userId);
+      return projectStoredGameForUser(database, current, user.userId, now);
     }
     if (!quotaCharged) {
       await enforceMutationQuota(database, now, [
@@ -1310,7 +1350,7 @@ export async function joinGame(
       }
       throw error;
     }
-    return projectGameForUser(result.state, user.userId);
+    return projectStoredGameForUser(database, result.state, user.userId, now);
   }
 
   throw new GameRuleError(
@@ -1772,7 +1812,13 @@ export async function getGame(
       )
     : undefined;
   return {
-    view: projectGameForUser(state, user.userId),
+    view: await projectStoredGameForUser(
+      database,
+      state,
+      user.userId,
+      now,
+      presence,
+    ),
     events: feed.events,
     eventCursor: feed.cursor,
     presence,
@@ -2005,9 +2051,10 @@ export async function executeGameCommand(
   requireRule(
     current.phase !== "complete" ||
       command.type === "rematch" ||
+      command.type === "claim_host" ||
       command.type === "leave_game",
     "GAME_COMPLETE",
-    "This game is already complete. Start a rematch or leave the table.",
+    "This game is already complete. Start a rematch, recover hosting, or leave the table.",
     409,
   );
   const inactiveRemoval = readInactiveRemovalCommand(command);
@@ -2017,6 +2064,16 @@ export async function executeGameCommand(
         current,
         user.userId,
         inactiveRemoval.targetPlayerId,
+        now,
+      )
+    : null;
+  const hostClaim = readHostClaimCommand(command);
+  const hostClaimGuard = hostClaim
+    ? await assertHostClaimAllowed(
+        database,
+        current,
+        user.userId,
+        profile.id,
         now,
       )
     : null;
@@ -2066,6 +2123,23 @@ export async function executeGameCommand(
     : now +
       (result.state.phase === "lobby" ? LOBBY_LIFETIME_MS : ACTIVE_LIFETIME_MS);
   const memberProfiles = await profilesForState(database, result.state);
+  const completedRoundWinner =
+    current.phase === "playing" &&
+    result.state.phase === "complete" &&
+    result.state.winner !== null
+      ? result.state.players.find(
+          (player) => player.playerId === result.state.winner?.playerId,
+        )
+      : undefined;
+  const completedRoundWinnerProfile = completedRoundWinner
+    ? memberProfiles.get(completedRoundWinner.userId)
+    : undefined;
+  requireRule(
+    !completedRoundWinner || completedRoundWinnerProfile,
+    "CORRUPT_MEMBERSHIP",
+    "The round winner membership record is unavailable.",
+    500,
+  );
   const memberStatements = result.state.players.map((player) =>
     guardedMembershipUpsertStatement(
       database,
@@ -2160,7 +2234,20 @@ export async function executeGameCommand(
 
   try {
     const batch = await database.batch([
-      inactiveRemovalGuard
+      hostClaimGuard
+        ? guardedHostClaimReceiptStatement(
+            database,
+            row,
+            profile.id,
+            commandId,
+            operation,
+            requestHash,
+            result.state.revision,
+            now,
+            current.phase,
+            hostClaimGuard,
+          )
+        : inactiveRemovalGuard
         ? guardedInactiveRemovalReceiptStatement(
             database,
             row,
@@ -2207,6 +2294,23 @@ export async function executeGameCommand(
         now,
         requestHash,
       ),
+      ...(completedRoundWinner && completedRoundWinnerProfile
+        ? [
+            guardedRoundLedgerStatement(
+              database,
+              gameId,
+              result.state.revision,
+              completedRoundWinnerProfile.id,
+              completedRoundWinner.displayName,
+              result.state.winner!.reason,
+              now,
+              profile.id,
+              commandId,
+              requestHash,
+              nextHash,
+            ),
+          ]
+        : []),
       ...memberStatements,
       ...presenceCleanupStatements,
       ...voiceCleanupStatements,
@@ -2222,6 +2326,8 @@ export async function executeGameCommand(
         commandId,
         requestHash,
         roomLifecycle,
+        commandId,
+        completedRoundWinner ? result.state.revision : null,
       ),
     ]);
     if ((batch.at(-1)?.meta.changes ?? 0) !== 1) {
@@ -2297,7 +2403,7 @@ export async function executeGameCommand(
   }
 
   return {
-    view: commandViewForUser(result.state, user.userId),
+    view: await commandViewForUser(database, result.state, user.userId),
     events: persistedEvents,
     replayed: result.replayed,
   };
@@ -2353,6 +2459,10 @@ function readInactiveRemovalCommand(
   return command;
 }
 
+function readHostClaimCommand(command: GameCommand): HostClaimCommand | null {
+  return command.type === "claim_host" ? command : null;
+}
+
 function requireCurrentMember(
   state: GameState,
   userId: string,
@@ -2403,6 +2513,238 @@ async function buildPresenceSnapshot(
         return presencePlayer(player.playerId, lastSeenAt, now);
       }),
   };
+}
+
+async function assertHostClaimAllowed(
+  database: D1Database,
+  state: GameState,
+  actorUserId: string,
+  actorProfileId: string,
+  now: number,
+): Promise<PersistedHostClaimGuard> {
+  const presence = await buildPresenceSnapshot(database, state, now);
+  const guard = assertHostClaimPolicy(
+    state,
+    actorUserId,
+    presence.players,
+    now,
+  );
+  const previousHostProfile = await findProfileForUser(
+    database,
+    guard.previousHostUserId,
+  );
+  requireRule(
+    previousHostProfile,
+    "CORRUPT_MEMBERSHIP",
+    "The current host membership record is unavailable.",
+    500,
+  );
+  return {
+    ...guard,
+    previousHostProfileId: previousHostProfile.id,
+    claimantProfileId: actorProfileId,
+  };
+}
+
+async function readGameSeriesView(
+  database: D1Database,
+  state: GameState,
+): Promise<GameSeriesView> {
+  const currentPlayers = state.players
+    .filter((player) => player.status !== "left")
+    .sort((left, right) => left.seat - right.seat);
+  if (currentPlayers.length === 0) {
+    return buildGameSeriesViewFromAggregate(state, {
+      completedRounds: 0,
+      highestRound: 0,
+      winsByUserId: new Map(),
+      recentWinners: [],
+    });
+  }
+  const currentValues = currentPlayers.map(() => "(?)").join(", ");
+  const currentUserIds = currentPlayers.map((player) => player.userId);
+  const rows = await database
+    .prepare(
+      `WITH current_players(user_id) AS (VALUES ${currentValues}),
+       ledger AS (
+         SELECT completion_revision, round_number, winner_profile_id,
+                winner_reason, completed_at
+         FROM game_rounds
+         WHERE game_id = ? AND completion_revision <= ?
+       ),
+       summary AS (
+         SELECT COUNT(*) AS completed_rounds,
+                COALESCE(MAX(round_number), 0) AS highest_round
+         FROM ledger
+       ),
+       scores AS (
+         SELECT current_players.user_id AS winner_user_id,
+                COUNT(ledger.completion_revision) AS wins
+         FROM current_players
+         LEFT JOIN profiles winner_profile
+           ON winner_profile.auth_subject = current_players.user_id
+         LEFT JOIN ledger
+           ON ledger.winner_profile_id = winner_profile.id
+         GROUP BY current_players.user_id
+       ),
+       recent AS (
+         SELECT ledger.completion_revision, ledger.round_number,
+                winner_profile.auth_subject AS winner_user_id,
+                ledger.winner_reason, ledger.completed_at
+         FROM ledger
+         JOIN profiles winner_profile
+           ON winner_profile.id = ledger.winner_profile_id
+         JOIN current_players
+           ON current_players.user_id = winner_profile.auth_subject
+         ORDER BY ledger.round_number DESC
+         LIMIT 5
+       )
+       SELECT 'score' AS row_kind, scores.winner_user_id, scores.wins,
+              summary.completed_rounds, summary.highest_round,
+              NULL AS completion_revision, NULL AS round_number,
+              NULL AS winner_reason, NULL AS completed_at
+       FROM scores CROSS JOIN summary
+       UNION ALL
+       SELECT 'recent' AS row_kind, recent.winner_user_id, NULL AS wins,
+              summary.completed_rounds, summary.highest_round,
+              recent.completion_revision, recent.round_number,
+              recent.winner_reason, recent.completed_at
+       FROM recent CROSS JOIN summary`,
+    )
+    .bind(...currentUserIds, state.gameId, state.revision)
+    .all<GameSeriesProjectionRow>();
+  requireRule(
+    rows.results.length <= currentPlayers.length + 5,
+    "CORRUPT_ROUND_LEDGER",
+    "Stored game-night scores are unavailable.",
+    500,
+  );
+  const scoreRows = rows.results.filter((row) => row.row_kind === "score");
+  const recentRows = rows.results.filter((row) => row.row_kind === "recent");
+  requireRule(
+    scoreRows.length === currentPlayers.length,
+    "CORRUPT_ROUND_LEDGER",
+    "Stored game-night scores are unavailable.",
+    500,
+  );
+  const completedRounds = Number(scoreRows[0]?.completed_rounds ?? 0);
+  const highestRound = Number(scoreRows[0]?.highest_round ?? 0);
+  const winsByUserId = new Map<string, number>();
+  for (const row of scoreRows) {
+    const wins = Number(row.wins);
+    const rowCompletedRounds = Number(row.completed_rounds);
+    const rowHighestRound = Number(row.highest_round);
+    if (
+      typeof row.winner_user_id !== "string" ||
+      !currentUserIds.includes(row.winner_user_id) ||
+      !Number.isSafeInteger(wins) ||
+      wins < 0 ||
+      !Number.isSafeInteger(rowCompletedRounds) ||
+      rowCompletedRounds < 0 ||
+      !Number.isSafeInteger(rowHighestRound) ||
+      rowHighestRound < 0 ||
+      rowCompletedRounds !== completedRounds ||
+      rowHighestRound !== highestRound ||
+      row.completion_revision !== null ||
+      row.round_number !== null ||
+      row.winner_reason !== null ||
+      row.completed_at !== null ||
+      winsByUserId.has(row.winner_user_id)
+    ) {
+      throw corruptState();
+    }
+    winsByUserId.set(row.winner_user_id, wins);
+  }
+  const currentByUserId = new Map(
+    currentPlayers.map((player) => [player.userId, player] as const),
+  );
+  const recentWinners: RoundSeriesRecord[] = recentRows.map((row) => {
+    const completionRevision = Number(row.completion_revision);
+    const roundNumber = Number(row.round_number);
+    const completedAt = Number(row.completed_at);
+    const currentWinner = currentByUserId.get(row.winner_user_id);
+    if (
+      !Number.isSafeInteger(completionRevision) ||
+      completionRevision < 1 ||
+      completionRevision > state.revision ||
+      !Number.isSafeInteger(roundNumber) ||
+      roundNumber < 1 ||
+      !currentWinner ||
+      row.wins !== null ||
+      Number(row.completed_rounds) !== completedRounds ||
+      Number(row.highest_round) !== highestRound ||
+      (row.winner_reason !== "empty_hand" &&
+        row.winner_reason !== "last_active") ||
+      !Number.isSafeInteger(completedAt) ||
+      completedAt < 0
+    ) {
+      throw corruptState();
+    }
+    return {
+      completionRevision,
+      roundNumber,
+      winnerUserId: currentWinner.userId,
+      // The immutable snapshot remains in D1 for audit only. A viewer always
+      // receives the current in-table alias from state.
+      winnerDisplayName: currentWinner.displayName,
+      winnerReason: row.winner_reason,
+      completedAt,
+    };
+  });
+  return buildGameSeriesViewFromAggregate(state, {
+    completedRounds,
+    highestRound,
+    winsByUserId,
+    recentWinners,
+  });
+}
+
+async function continuityProjectionForUser(
+  database: D1Database,
+  state: GameState,
+  viewerUserId: string,
+  now: number,
+  presence?: PresenceSnapshot,
+): Promise<GameContinuityProjection> {
+  const series = await readGameSeriesView(database, state);
+  const currentPresence =
+    presence ?? (await buildPresenceSnapshot(database, state, now));
+  let canClaimHost = false;
+  try {
+    assertHostClaimPolicy(
+      state,
+      viewerUserId,
+      currentPresence.players,
+      now,
+    );
+    canClaimHost = true;
+  } catch (error) {
+    if (!(error instanceof GameRuleError)) throw error;
+  }
+  return {
+    series,
+    canClaimHost,
+  };
+}
+
+async function projectStoredGameForUser(
+  database: D1Database,
+  state: GameState,
+  viewerUserId: string,
+  now = Date.now(),
+  presence?: PresenceSnapshot,
+): Promise<GameView> {
+  return projectGameForUser(
+    state,
+    viewerUserId,
+    await continuityProjectionForUser(
+      database,
+      state,
+      viewerUserId,
+      now,
+      presence,
+    ),
+  );
 }
 
 async function assertInactiveRemovalAllowed(
@@ -2891,7 +3233,12 @@ async function listingResultFromReceipt(
       profile.id,
       now,
     ),
-    view: projectGameForUser(state, user.userId),
+    view: await projectStoredGameForUser(
+      database,
+      state,
+      user.userId,
+      now,
+    ),
   };
 }
 
@@ -2974,7 +3321,7 @@ async function viewFromReceipt(
     "You are not a member of this game.",
     403,
   );
-  return projectGameForUser(state, user.userId);
+  return projectStoredGameForUser(database, state, user.userId);
 }
 
 async function commandViewFromReceipt(
@@ -2990,14 +3337,18 @@ async function commandViewFromReceipt(
   if (forceNull) return null;
   const row = await getGameRow(database, receipt.game_id);
   const state = await parseAndValidateState(row);
-  return commandViewForUser(state, user.userId);
+  return commandViewForUser(database, state, user.userId);
 }
 
-function commandViewForUser(state: GameState, userId: string): GameView | null {
+async function commandViewForUser(
+  database: D1Database,
+  state: GameState,
+  userId: string,
+): Promise<GameView | null> {
   return state.players.some(
     (player) => player.userId === userId && player.status !== "left",
   )
-    ? projectGameForUser(state, userId)
+    ? projectStoredGameForUser(database, state, userId)
     : null;
 }
 
@@ -3596,6 +3947,127 @@ function guardedInactiveRemovalReceiptStatement(
     );
 }
 
+function guardedHostClaimReceiptStatement(
+  database: D1Database,
+  row: GameRow,
+  profileId: string,
+  commandId: string,
+  operation: string,
+  requestHash: string,
+  resultVersion: number,
+  now: number,
+  phase: GameState["phase"],
+  guard: PersistedHostClaimGuard,
+): D1PreparedStatement {
+  const eligibleStatus = phase === "complete" ? "non_left" : "active";
+  return database
+    .prepare(
+      `INSERT INTO command_receipts (
+        actor_profile_id, command_id, game_id, operation,
+        request_hash, result_version, created_at
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1
+        FROM games g
+        JOIN game_members previous_host
+          ON previous_host.game_id = g.id
+         AND previous_host.profile_id = ?
+        JOIN profiles previous_host_profile
+          ON previous_host_profile.id = previous_host.profile_id
+        LEFT JOIN game_presence previous_host_presence
+          ON previous_host_presence.game_id = previous_host.game_id
+         AND previous_host_presence.profile_id = previous_host.profile_id
+         AND previous_host_presence.player_id = ?
+        JOIN game_members claimant
+          ON claimant.game_id = g.id
+         AND claimant.profile_id = ?
+        JOIN profiles claimant_profile
+          ON claimant_profile.id = claimant.profile_id
+        LEFT JOIN game_presence claimant_presence
+          ON claimant_presence.game_id = claimant.game_id
+         AND claimant_presence.profile_id = claimant.profile_id
+         AND claimant_presence.player_id = ?
+        WHERE g.id = ? AND g.version = ? AND g.state_hash = ?
+          AND g.room_status = 'open' AND g.status = ?
+          AND g.host_profile_id = ? AND g.expires_at > ?
+          AND previous_host_profile.auth_subject = ?
+          AND previous_host.seat = ?
+          AND previous_host.status <> 'left'
+          AND COALESCE(
+            previous_host_presence.last_seen_at,
+            previous_host.joined_at
+          ) <= ?
+          AND claimant_profile.auth_subject = ?
+          AND claimant.seat = ?
+          AND (
+            (? = 'non_left' AND claimant.status <> 'left')
+            OR (? = 'active' AND claimant.status = 'active')
+          )
+          AND COALESCE(
+            claimant_presence.last_seen_at,
+            claimant.joined_at
+          ) > ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM game_members contender
+            LEFT JOIN game_presence contender_presence
+              ON contender_presence.game_id = contender.game_id
+             AND contender_presence.profile_id = contender.profile_id
+            WHERE contender.game_id = g.id
+              AND contender.profile_id <> previous_host.profile_id
+              AND (
+                (? = 'non_left' AND contender.status <> 'left')
+                OR (? = 'active' AND contender.status = 'active')
+              )
+              AND COALESCE(
+                contender_presence.last_seen_at,
+                contender.joined_at
+              ) > ?
+              AND CASE
+                WHEN contender.seat > previous_host.seat
+                  THEN contender.seat
+                ELSE contender.seat + 100000
+              END < CASE
+                WHEN claimant.seat > previous_host.seat
+                  THEN claimant.seat
+                ELSE claimant.seat + 100000
+              END
+          )
+      )`,
+    )
+    .bind(
+      profileId,
+      commandId,
+      row.id,
+      operation,
+      requestHash,
+      resultVersion,
+      now,
+      guard.previousHostProfileId,
+      guard.previousHostPlayerId,
+      guard.claimantProfileId,
+      guard.claimantPlayerId,
+      row.id,
+      row.version,
+      row.state_hash,
+      databaseStatus(phase),
+      guard.previousHostProfileId,
+      now,
+      guard.previousHostUserId,
+      guard.previousHostSeat,
+      guard.staleCutoff,
+      guard.claimantUserId,
+      guard.claimantSeat,
+      eligibleStatus,
+      eligibleStatus,
+      guard.connectedCutoff,
+      eligibleStatus,
+      eligibleStatus,
+      guard.connectedCutoff,
+    );
+}
+
 function guardedEventStatement(
   database: D1Database,
   row: GameRow,
@@ -3642,6 +4114,75 @@ function guardedEventStatement(
       row.id,
       row.version,
       row.state_hash,
+    );
+}
+
+function guardedRoundLedgerStatement(
+  database: D1Database,
+  gameId: string,
+  completionRevision: number,
+  winnerProfileId: string,
+  winnerDisplayName: string,
+  winnerReason: GameWinner["reason"],
+  completedAt: number,
+  receiptProfileId: string,
+  commandId: string,
+  requestHash: string,
+  stateHash: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO game_rounds (
+        game_id, completion_revision, round_number, winner_profile_id,
+        winner_display_name, winner_reason, completed_at
+      )
+      SELECT
+        ?, ?,
+        COALESCE((
+          SELECT MAX(existing.round_number) + 1
+          FROM game_rounds existing
+          WHERE existing.game_id = ?
+        ), 1),
+        ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM command_receipts receipt
+        WHERE receipt.actor_profile_id = ?
+          AND receipt.command_id = ?
+          AND receipt.game_id = ?
+          AND receipt.request_hash = ?
+          AND receipt.result_version = ?
+      )
+        AND EXISTS (
+          SELECT 1 FROM game_events event
+          WHERE event.game_id = ?
+            AND event.version = ?
+            AND event.command_id = ?
+            AND event.actor_profile_id = ?
+            AND event.state_hash = ?
+            AND EXISTS (
+              SELECT 1 FROM json_each(event.public_payload_json) payload
+              WHERE json_extract(payload.value, '$.type') = 'game_won'
+            )
+        )`,
+    )
+    .bind(
+      gameId,
+      completionRevision,
+      gameId,
+      winnerProfileId,
+      winnerDisplayName,
+      winnerReason,
+      completedAt,
+      receiptProfileId,
+      commandId,
+      gameId,
+      requestHash,
+      completionRevision,
+      gameId,
+      completionRevision,
+      commandId,
+      receiptProfileId,
+      stateHash,
     );
 }
 
@@ -3968,6 +4509,7 @@ function guardedGameUpdateStatement(
   requestHash: string,
   roomLifecycle: RoomLifecycleUpdate = OPEN_ROOM_LIFECYCLE,
   eventCommandId = commandId,
+  requiredRoundCompletionRevision: number | null = null,
 ): D1PreparedStatement {
   return database
     .prepare(
@@ -3990,6 +4532,12 @@ function guardedGameUpdateStatement(
            SELECT 1 FROM game_events
            WHERE game_id = ? AND version = ? AND actor_profile_id = ?
              AND command_id = ? AND state_hash = ?
+         )
+         AND (
+           ? IS NULL OR EXISTS (
+             SELECT 1 FROM game_rounds round
+             WHERE round.game_id = ? AND round.completion_revision = ?
+           )
          )`,
     )
     .bind(
@@ -4016,6 +4564,9 @@ function guardedGameUpdateStatement(
       receiptProfileId,
       eventCommandId,
       stateHash,
+      requiredRoundCompletionRevision,
+      row.id,
+      requiredRoundCompletionRevision,
     );
 }
 
@@ -4787,6 +5338,17 @@ async function purgeExpiredRows(
       .bind(now),
     database
       .prepare(
+        `DELETE FROM game_rounds WHERE rowid IN (
+          SELECT round.rowid FROM game_rounds round
+          JOIN games g ON g.id = round.game_id
+          WHERE g.expires_at <= ?
+          ORDER BY g.expires_at, round.game_id, round.round_number
+          LIMIT 128
+        )`,
+      )
+      .bind(now),
+    database
+      .prepare(
         `DELETE FROM command_receipts WHERE rowid IN (
           SELECT r.rowid FROM command_receipts r
           JOIN games g ON g.id = r.game_id
@@ -4813,6 +5375,7 @@ async function purgeExpiredRows(
           SELECT g.id FROM games g
           WHERE g.expires_at <= ?
             AND NOT EXISTS (SELECT 1 FROM game_events e WHERE e.game_id = g.id)
+            AND NOT EXISTS (SELECT 1 FROM game_rounds round WHERE round.game_id = g.id)
             AND NOT EXISTS (SELECT 1 FROM command_receipts r WHERE r.game_id = g.id)
             AND NOT EXISTS (SELECT 1 FROM game_members m WHERE m.game_id = g.id)
             AND NOT EXISTS (SELECT 1 FROM game_presence p WHERE p.game_id = g.id)
