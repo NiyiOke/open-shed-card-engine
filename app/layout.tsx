@@ -1,6 +1,10 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { headers } from "next/headers";
+import {
+  APP_RELEASE_LABEL,
+  APP_VERSION,
+} from "../lib/app-version";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -23,8 +27,13 @@ export async function generateMetadata(): Promise<Metadata> {
     "Shed your hand, stack draw penalties, and survive the Mercy limit in a complete 2–6 player online card game.";
   return {
     metadataBase: base,
+    applicationName: "Open Shed",
+    generator: APP_RELEASE_LABEL,
     title,
     description,
+    other: {
+      "open-shed-version": APP_VERSION,
+    },
     openGraph: {
       title,
       description,

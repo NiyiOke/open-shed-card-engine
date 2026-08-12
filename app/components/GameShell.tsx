@@ -17,9 +17,11 @@ import {
   type GameView,
 } from "../../lib/game/types";
 import type { LobbySummary } from "../../lib/server/game-store";
+import { APP_RELEASE_IDENTITY } from "../../lib/app-version";
 import { CardFace } from "./CardFace";
 import { GameTableCanvas } from "./GameTableCanvas";
 import { SignedOutLanding } from "./SignedOutLanding";
+import { ReleaseIdentity, tableRevisionLabel } from "./release-ui";
 import {
   createGameAudioController,
   type AudioCapabilities,
@@ -1280,6 +1282,7 @@ export function GameShell({
     window.render_game_to_text = () =>
       JSON.stringify({
         coordinateSystem: "Canvas origin is top-left; x increases right and y increases down.",
+        release: APP_RELEASE_IDENTITY,
         mode: game?.phase ?? (session?.signedIn ? "lobby-browser" : "signed-out"),
         connection: connectionState,
         effects: {
@@ -3478,7 +3481,7 @@ export function GameShell({
               >
                 {game.joinCode}
               </button>
-              <span className="revision">STATE v{game.revision}</span>
+              <span className="table-revision">{tableRevisionLabel(game.revision)}</span>
               {game.phase === "lobby" ? (
                 <button className="text-button room-share" disabled={actionPending} onClick={() => void shareInvite(true)}>
                   Share invite
@@ -3918,6 +3921,7 @@ export function GameShell({
             >
               {game.phase === "complete" ? "Leave table and go back" : "Leave table"}
             </button>
+            <ReleaseIdentity className="release-identity--table" />
           </aside>
           </section>
         )}
@@ -4361,14 +4365,14 @@ export function GameShell({
             <details className="bug-report-diagnostics">
               <summary>Safe diagnostics included</summary>
               <p>
-                Only game phase, rules/protocol versions, connection and turn flags, public
+                Only app/rules/protocol versions, table revision, connection and turn flags, public
                 counts/colors, fixed action IDs, viewport size, and up to three event kinds.
                 No names, table/game/card IDs, messages, screenshots, or private hand data.
               </p>
               {bugReportDiagnostics ? (
                 <dl>
                   <div><dt>Phase</dt><dd>{bugReportDiagnostics.phase}</dd></div>
-                  <div><dt>Revision</dt><dd>{bugReportDiagnostics.revision ?? "none"}</dd></div>
+                  <div><dt>Table revision</dt><dd>{bugReportDiagnostics.revision ?? "none"}</dd></div>
                   <div><dt>Connection</dt><dd>{bugReportDiagnostics.connection}</dd></div>
                   <div><dt>Current turn is yours</dt><dd>{bugReportDiagnostics.currentTurnIsSelf === null ? "not applicable" : bugReportDiagnostics.currentTurnIsSelf ? "yes" : "no"}</dd></div>
                   <div><dt>Roulette choice</dt><dd>{bugReportDiagnostics.rouletteChoice}</dd></div>
@@ -4968,6 +4972,9 @@ function LobbyBrowser({
           <button className="secondary-button" onClick={(event) => openGuide("actions", event.currentTarget)}>Action guide</button>
         </div>
       </div>
+      <footer className="lobby-product-footer">
+        <ReleaseIdentity className="release-identity--lobby" />
+      </footer>
     </section>
   );
 }

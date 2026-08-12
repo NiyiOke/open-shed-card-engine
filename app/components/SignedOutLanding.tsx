@@ -4,6 +4,7 @@ import { ArrowRightIcon, ArrowUpRightIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import type { Card } from "../../lib/game/types";
 import { CardFace } from "./CardFace";
+import { ReleaseIdentity } from "./release-ui";
 import {
   cappedCountLabel,
   parsePublicAvailability,
@@ -292,6 +293,7 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
       </main>
 
       <footer className="public-footer">
+        <ReleaseIdentity className="release-identity--public" />
         <p>Original code and visual system. No commercial card artwork or assets.</p>
         <p>
           Rules adapted for deterministic online play from Mattel&apos;s 2023 instruction sheet. UNO and related names are Mattel trademarks. Open Shed is unofficial and is not affiliated with or endorsed by Mattel.

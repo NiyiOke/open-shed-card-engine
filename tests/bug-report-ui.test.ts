@@ -14,6 +14,7 @@ import {
   validateBugReportDescription,
   viewportBucket,
 } from "../app/components/bug-report";
+import { APP_BUILD_ID, APP_VERSION } from "../lib/app-version";
 
 const SAFE_DIAGNOSTICS = createSafeBugReportDiagnostics({
   phase: "playing",
@@ -68,6 +69,8 @@ test("safe diagnostics construct only the explicit privacy allowlist", () => {
   });
 
   assert.deepEqual(Object.keys(diagnostics), [
+    "appVersion",
+    "buildId",
     "phase",
     "revision",
     "rulesVersion",
@@ -83,6 +86,8 @@ test("safe diagnostics construct only the explicit privacy allowlist", () => {
     "legalActions",
     "recentEventKinds",
   ]);
+  assert.equal(diagnostics.appVersion, APP_VERSION);
+  assert.equal(diagnostics.buildId, APP_BUILD_ID);
   assert.deepEqual(diagnostics.pendingDraw, { total: 10, minimum: 6 });
   assert.equal(diagnostics.playerCount, 6);
   assert.deepEqual(diagnostics.recentEventKinds, [
@@ -91,6 +96,15 @@ test("safe diagnostics construct only the explicit privacy allowlist", () => {
     "roulette_resolved",
   ]);
   assert.doesNotMatch(JSON.stringify(diagnostics), /Neo Oke|X7AV5W|46fb704a|private-player/i);
+});
+
+test("safe diagnostics include the release identity without deployment secrets", () => {
+  assert.equal(SAFE_DIAGNOSTICS.appVersion, "1.5.1");
+  assert.equal(SAFE_DIAGNOSTICS.buildId, APP_BUILD_ID);
+  assert.doesNotMatch(
+    JSON.stringify(SAFE_DIAGNOSTICS),
+    /API_KEY|API_SECRET|LIVEKIT_URL|DATABASE|authorization|cookie/iu,
+  );
 });
 
 test("legal-action diagnostics never contain card or player identifiers", () => {

@@ -4,6 +4,10 @@ import {
   type CardColor,
   type GameView,
 } from "../../lib/game/types";
+import {
+  APP_RELEASE_IDENTITY,
+  APP_VERSION,
+} from "../../lib/app-version";
 
 export const BUG_REPORT_REPOSITORY_URL =
   "https://github.com/NiyiOke/open-shed-card-engine";
@@ -87,6 +91,8 @@ const SAFE_BUG_REPORT_LEGAL_ACTIONS = new Set<SafeBugReportLegalAction>([
 ]);
 
 export type SafeBugReportDiagnostics = {
+  appVersion: typeof APP_VERSION;
+  buildId: string | null;
   phase: BugReportPhase;
   revision: number | null;
   rulesVersion: typeof RULES_VERSION;
@@ -105,7 +111,11 @@ export type SafeBugReportDiagnostics = {
 
 export type BugReportDiagnosticInput = Omit<
   SafeBugReportDiagnostics,
-  "rulesVersion" | "protocolVersion" | "recentEventKinds"
+  | "appVersion"
+  | "buildId"
+  | "rulesVersion"
+  | "protocolVersion"
+  | "recentEventKinds"
 > & {
   recentEventKinds: readonly string[];
 };
@@ -194,6 +204,7 @@ export function createSafeBugReportDiagnostics(
   input: BugReportDiagnosticInput,
 ): SafeBugReportDiagnostics {
   return {
+    ...APP_RELEASE_IDENTITY,
     phase: input.phase,
     revision: input.revision,
     rulesVersion: RULES_VERSION,
