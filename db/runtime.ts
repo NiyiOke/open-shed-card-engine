@@ -4,6 +4,12 @@ let schemaPromise: Promise<void> | null = null;
 
 export async function ensureDatabaseSchema(): Promise<D1Database> {
   const database = getRawDb();
+  // Production schema changes are applied by the packaged Drizzle migrations.
+  // Running the legacy local bootstrap here makes every fresh Worker isolate
+  // wait on DDL, schema PRAGMAs, a backfill, and PRAGMA optimize before serving
+  // its first request.
+  if (process.env.NODE_ENV === "production") return database;
+
   schemaPromise ??= initialize(database).catch((error) => {
     schemaPromise = null;
     throw error;
