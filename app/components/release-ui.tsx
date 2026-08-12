@@ -7,16 +7,16 @@ import {
   APP_VERSION_LABEL,
 } from "../../lib/app-version";
 
-export const NEXT_RELEASE_LABEL = "V1.6.1" as const;
+export const NEXT_RELEASE_LABEL = "V1.7" as const;
 
 export const RELEASE_NOTES = Object.freeze([
-  "An eligible connected player can recover host controls after the server-verified reconnect grace period, without changing players, cards, or the turn.",
-  "Completed rounds now build a persistent series score and recent-winner history that continues through rematches.",
-  "The app release, rules profile, and per-table revision remain clearly separated.",
+  "One canonical rulebook now powers both the public rules page and the in-game guide, including every action card and the complete 168-card inventory.",
+  "Round wins now names the rematch metric clearly, keeping it separate from the optional official points-to-1,000 format.",
+  "Rules navigation, mobile reflow, focus handling, runtime stability, and delivery performance received a dedicated quality pass.",
 ] as const);
 
 export const NEXT_RELEASE_PREVIEW =
-  "V1.6.1 is reserved for stability, accessibility, and performance fixes discovered during the V1.6 rollout.";
+  "V1.7 can add an optional official points-to-1,000 series mode without changing the current Round wins format.";
 
 export function tableRevisionLabel(revision: number): string {
   const safeRevision = Number.isSafeInteger(revision) && revision >= 0
@@ -100,7 +100,7 @@ export function ReleaseIdentity({ className = "" }: { className?: string }) {
 
           <section className="release-next" aria-labelledby="release-next-title">
             <span className="eyebrow">Up next</span>
-            <h3 id="release-next-title">{NEXT_RELEASE_LABEL} · Stability pass</h3>
+            <h3 id="release-next-title">{NEXT_RELEASE_LABEL} · Optional points mode</h3>
             <p>{NEXT_RELEASE_PREVIEW}</p>
           </section>
 

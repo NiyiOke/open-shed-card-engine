@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import { cardLabel, isWild } from "../../lib/game/deck";
+import { OPEN_SHED_RULES_GUIDE } from "../../lib/game/rules-guide";
 import {
   COLORS,
   type Card,
@@ -22,6 +23,12 @@ import { CardFace } from "./CardFace";
 import { GameTableCanvas } from "./GameTableCanvas";
 import { SignedOutLanding } from "./SignedOutLanding";
 import { ReleaseIdentity, tableRevisionLabel } from "./release-ui";
+import {
+  RulesGuideCards,
+  RulesGuideDeckInventory,
+  RulesGuideScoring,
+  RulesGuideSections,
+} from "./RulesGuide";
 import {
   canApplyRefreshedGameView,
   rankSeriesScores,
@@ -199,16 +206,6 @@ const INITIAL_LIVE_VOICE_SNAPSHOT: LiveVoiceSnapshot = Object.freeze({
   error: null,
 });
 
-const ACTION_GUIDE = [
-  ["Draw 2 / Draw 4", "The next player stacks an equal-or-higher draw card or takes the full penalty."],
-  ["Skip / Reverse", "Skip the next active player or reverse direction. With two players, Reverse skips the other player."],
-  ["Discard All", "Discard every other card in your hand that shares this card's color."],
-  ["Skip Everyone", "Skip every other active player and immediately play again."],
-  ["Wild Reverse +4", "Choose a color, reverse direction, and send a four-card penalty in the new direction."],
-  ["Wild +6 / +10", "Choose the continuing color and send the printed draw penalty to the next active player."],
-  ["Color Roulette", "The target chooses a color, then reveals cards until that color appears and takes the full revealed batch."],
-] as const;
-
 declare global {
   interface Window {
     render_game_to_text?: () => string;
@@ -333,6 +330,7 @@ export function GameShell({
   const testPlayerSwitchingRef = useRef(false);
   const utilityDialogRef = useRef<HTMLDivElement>(null);
   const utilityTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const guideCloseButtonRef = useRef<HTMLButtonElement>(null);
   const soundDialogRef = useRef<HTMLDivElement>(null);
   const soundTriggerRef = useRef<HTMLButtonElement | null>(null);
   const audioControllerRef = useRef<GameAudioController | null>(null);
@@ -1994,7 +1992,16 @@ export function GameShell({
 
   const closeGuide = useCallback(() => {
     setGuideTopic(null);
-    window.requestAnimationFrame(() => utilityTriggerRef.current?.focus());
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => utilityTriggerRef.current?.focus());
+    });
+  }, []);
+
+  const jumpToGuideSection = useCallback((targetId: string) => {
+    const target = document.getElementById(targetId);
+    if (!target || !utilityDialogRef.current?.contains(target)) return;
+    target.focus({ preventScroll: true });
+    target.scrollIntoView({ block: "start", behavior: "auto" });
   }, []);
 
   const openSoundDialog = (trigger: HTMLButtonElement) => {
@@ -2795,6 +2802,19 @@ export function GameShell({
     Boolean(removeTargetId) ||
     Boolean(chatDialog) ||
     voiceSheetOpen;
+
+  useEffect(() => {
+    if (!modalOpen) return;
+    const previousRootOverflow = document.documentElement.style.overflow;
+    const previousBodyOverflow = document.body.style.overflow;
+    document.documentElement.style.overflow = "hidden";
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.documentElement.style.overflow = previousRootOverflow;
+      document.body.style.overflow = previousBodyOverflow;
+    };
+  }, [modalOpen]);
+
   const bugReportIssueLink = (() => {
     if (!bugReportOpen) return { href: null, error: null };
     const draft = currentBugReportDraft();
@@ -2916,7 +2936,20 @@ export function GameShell({
         ),
       ).filter((element) => !element.hidden);
     const frame = window.requestAnimationFrame(() => {
-      (focusables()[0] ?? dialog).focus();
+      if (guideTopic) {
+        guideCloseButtonRef.current?.focus();
+        if (guideTopic === "actions") {
+          document.getElementById("game-guide-cards-title")?.scrollIntoView({
+            block: "start",
+            behavior: "auto",
+          });
+        } else {
+          const scrollRegion = dialog.querySelector<HTMLElement>(".rules-guide-scroll");
+          if (scrollRegion) scrollRegion.scrollTop = 0;
+        }
+      } else {
+        (focusables()[0] ?? dialog).focus();
+      }
     });
     const closeUtility = () => {
       if (inviteDialogOpen) dismissInvite();
@@ -3178,6 +3211,7 @@ export function GameShell({
           <button
             className="text-button header-guide-button"
             disabled={busy || Boolean(pendingCard)}
+            aria-haspopup="dialog"
             aria-label="Rules and cards"
             onClick={(event) => openGuide("rules", event.currentTarget)}
           >
@@ -3449,11 +3483,11 @@ export function GameShell({
                     </div>
                   </section>
 
-                  <section className="result-series" aria-labelledby="series-score-title">
+                  <section className="result-series" aria-labelledby="round-wins-title">
                     <div className="result-section-heading">
                       <div>
-                        <span className="eyebrow">Series to date</span>
-                        <h3 id="series-score-title">Series score</h3>
+                        <span className="eyebrow">Game night to date</span>
+                        <h3 id="round-wins-title">Round wins</h3>
                       </div>
                       <span>{game.series.completedRounds} {game.series.completedRounds === 1 ? "round" : "rounds"}</span>
                     </div>
@@ -3498,7 +3532,7 @@ export function GameShell({
                   ) : game.isHost ? null : (
                     <span className="waiting-copy">Waiting for the host to start round {nextRoundNumber}.</span>
                   )}
-                  {canRematch ? <span className="continuity-copy">Keeps this table, players, and series score.</span> : null}
+                  {canRematch ? <span className="continuity-copy">Keeps this table, players, and round wins.</span> : null}
                   <button className="secondary-button" disabled={actionPending} onClick={() => void leaveTable()}>Leave table and go back</button>
                   <button className="secondary-button" disabled={actionPending} onClick={() => void createLobby()}>Create a new table</button>
                 </div>
@@ -4033,6 +4067,7 @@ export function GameShell({
           className="choice-overlay"
           role="dialog"
           aria-modal="true"
+          aria-describedby={guideTopic ? "game-guide-summary" : undefined}
           aria-labelledby={
             inviteDialogOpen
               ? "invite-dialog-title"
@@ -4226,45 +4261,41 @@ export function GameShell({
             </div>
           ) : guideTopic ? (
             <div className="choice-panel guide-panel">
-              <span className="eyebrow">Merciless baseline / v1</span>
-              <h2 id="game-guide-title">Rules &amp; action guide</h2>
-              <div className="guide-tabs" role="tablist" aria-label="Game guide sections">
-                <button
-                  role="tab"
-                  aria-selected={guideTopic === "rules"}
-                  className={guideTopic === "rules" ? "is-selected" : ""}
-                  onClick={() => setGuideTopic("rules")}
-                >
-                  Quick rules
-                </button>
-                <button
-                  role="tab"
-                  aria-selected={guideTopic === "actions"}
-                  className={guideTopic === "actions" ? "is-selected" : ""}
-                  onClick={() => setGuideTopic("actions")}
-                >
-                  Action cards
-                </button>
-              </div>
-              {guideTopic === "rules" ? (
-                <div className="guide-content" role="tabpanel">
-                  <ol>
-                    <li><strong>Match one card.</strong><span>Play the active color, number, symbol, or a Wild. If a legal card exists, you must play.</span></li>
-                    <li><strong>Draw to a match.</strong><span>No match means drawing until the first playable card appears, then playing that exact card.</span></li>
-                    <li><strong>Stack equal or higher.</strong><span>During a draw chain, stack a draw card worth at least the last one or take the whole penalty.</span></li>
-                    <li><strong>Move hands with 0 and 7.</strong><span>A 0 passes all active hands; a 7 forces a swap with one active player.</span></li>
-                    <li><strong>Call UNO. Survive Mercy.</strong><span>Call UNO at one card. Reaching 25 cards knocks you out.</span></li>
-                  </ol>
+              <header className="rules-guide-header">
+                <div>
+                  <span className="eyebrow">Merciless baseline / v1</span>
+                  <h2 id="game-guide-title">Rules &amp; cards</h2>
                 </div>
-              ) : (
-                <div className="guide-content action-guide-list" role="tabpanel">
-                  {ACTION_GUIDE.map(([title, description]) => (
-                    <article key={title}><strong>{title}</strong><span>{description}</span></article>
-                  ))}
+                <button
+                  ref={guideCloseButtonRef}
+                  type="button"
+                  className="rules-guide-close"
+                  aria-label="Close rules guide"
+                  onClick={closeGuide}
+                >
+                  Close
+                </button>
+              </header>
+              <div className="rules-guide-scroll">
+                <p id="game-guide-summary" className="rules-guide-intro">
+                  The full enforced rulebook, all 10 action types, and the complete 168-card inventory—available without leaving your table.
+                </p>
+                <nav className="rules-guide-toc" aria-label="Rules guide sections">
+                  <a href="#game-guide-overview-title" onClick={(event) => { event.preventDefault(); jumpToGuideSection("game-guide-overview-title"); }}>How to play</a>
+                  <a href="#game-guide-cards-title" onClick={(event) => { event.preventDefault(); jumpToGuideSection("game-guide-cards-title"); }}>Action cards</a>
+                  <a href="#game-guide-deck-title" onClick={(event) => { event.preventDefault(); jumpToGuideSection("game-guide-deck-title"); }}>Deck inventory</a>
+                  <a href="#game-guide-scoring-title" onClick={(event) => { event.preventDefault(); jumpToGuideSection("game-guide-scoring-title"); }}>Round wins</a>
+                </nav>
+                <div className="rules-guide-document" role="document" aria-labelledby="game-guide-title">
+                  <RulesGuideSections idPrefix="game-guide" variant="dialog" />
+                  <RulesGuideCards idPrefix="game-guide" variant="dialog" />
+                  <RulesGuideDeckInventory idPrefix="game-guide" variant="dialog" />
+                  <RulesGuideScoring idPrefix="game-guide" variant="dialog" />
+                  <p className="rules-guide-source-note">{OPEN_SHED_RULES_GUIDE.sourceNote}</p>
                 </div>
-              )}
-              <div className="dialog-actions">
-                <button className="primary-button" onClick={closeGuide}>Back to the table</button>
+                <div className="dialog-actions">
+                  <button type="button" className="primary-button" onClick={closeGuide}>Back to the table</button>
+                </div>
               </div>
             </div>
           ) : null}
@@ -5068,8 +5099,8 @@ function LobbyBrowser({
           <p>Stacking, 0/7 hand movement, Mercy at 25, UNO windows, and every action card stay one tap away during play.</p>
         </div>
         <div className="game-guide-entry-actions">
-          <button className="secondary-button" onClick={(event) => openGuide("rules", event.currentTarget)}>Quick rules</button>
-          <button className="secondary-button" onClick={(event) => openGuide("actions", event.currentTarget)}>Action guide</button>
+          <button className="secondary-button" aria-haspopup="dialog" onClick={(event) => openGuide("rules", event.currentTarget)}>Full rules</button>
+          <button className="secondary-button" aria-haspopup="dialog" onClick={(event) => openGuide("actions", event.currentTarget)}>Action cards</button>
         </div>
       </div>
       <footer className="lobby-product-footer">

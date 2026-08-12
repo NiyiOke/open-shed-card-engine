@@ -1,10 +1,17 @@
 "use client";
 
 import { ArrowRightIcon, ArrowUpRightIcon } from "@phosphor-icons/react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
+import { OPEN_SHED_RULES_GUIDE } from "../../lib/game/rules-guide";
 import type { Card } from "../../lib/game/types";
 import { CardFace } from "./CardFace";
 import { ReleaseIdentity } from "./release-ui";
+import {
+  RulesGuideCards,
+  RulesGuideDeckInventory,
+  RulesGuideScoring,
+  RulesGuideSections,
+} from "./RulesGuide";
 import {
   cappedCountLabel,
   parsePublicAvailability,
@@ -20,62 +27,6 @@ const HERO_CARDS: Card[] = [
   { id: "landing-yellow-draw-two", kind: "draw_two", color: "yellow", number: null },
   { id: "landing-wild-reverse-four", kind: "wild_reverse_draw_four", color: null, number: null },
   { id: "landing-green-discard-all", kind: "discard_all", color: "green", number: null },
-];
-
-const COLOR_ACTION_RULES: Array<{ card: Card; description: string; title: string }> = [
-  {
-    card: { id: "rules-red-draw-two", kind: "draw_two", color: "red", number: null },
-    title: "Draw 2",
-    description: "The next active player faces a 2-card penalty and loses their turn unless they stack it.",
-  },
-  {
-    card: { id: "rules-yellow-draw-four", kind: "draw_four", color: "yellow", number: null },
-    title: "Draw 4",
-    description: "The next active player faces a 4-card penalty and loses their turn unless they stack it.",
-  },
-  {
-    card: { id: "rules-blue-skip", kind: "skip", color: "blue", number: null },
-    title: "Skip",
-    description: "The next active player loses their turn.",
-  },
-  {
-    card: { id: "rules-green-reverse", kind: "reverse", color: "green", number: null },
-    title: "Reverse",
-    description: "Reverse play. With two active players, the other player is skipped and you play again.",
-  },
-  {
-    card: { id: "rules-red-discard-all", kind: "discard_all", color: "red", number: null },
-    title: "Discard All",
-    description: "Discard every other card in your hand with this color. Cards placed beneath it do not activate.",
-  },
-  {
-    card: { id: "rules-yellow-skip-everyone", kind: "skip_everyone", color: "yellow", number: null },
-    title: "Skip Everyone",
-    description: "Skip every other active player and immediately take another turn.",
-  },
-];
-
-const WILD_ACTION_RULES: Array<{ card: Card; description: string; title: string }> = [
-  {
-    card: { id: "rules-wild-reverse-four", kind: "wild_reverse_draw_four", color: null, number: null },
-    title: "Wild Reverse Draw 4",
-    description: "Choose the color and reverse play. The next active player in the new direction faces 4. With only two active players, the penalty comes back to you—but it can be stacked.",
-  },
-  {
-    card: { id: "rules-wild-draw-six", kind: "wild_draw_six", color: null, number: null },
-    title: "Wild Draw 6",
-    description: "Choose the continuing color. The next active player faces 6 cards and loses their turn unless they stack.",
-  },
-  {
-    card: { id: "rules-wild-draw-ten", kind: "wild_draw_ten", color: null, number: null },
-    title: "Wild Draw 10",
-    description: "Choose the continuing color. The next active player faces 10 cards and loses their turn unless they stack.",
-  },
-  {
-    card: { id: "rules-wild-roulette", kind: "wild_color_roulette", color: null, number: null },
-    title: "Wild Color Roulette",
-    description: "The next active player chooses a color, then reveals until that color appears. Wilds do not count. They take every revealed card, lose their turn, and their chosen color becomes active.",
-  },
 ];
 
 export function SignedOutLanding({ signInPath }: { signInPath: string }) {
@@ -112,6 +63,15 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
     };
   }, []);
 
+  const focusSection = (event: MouseEvent<HTMLAnchorElement>, id: string) => {
+    const section = document.getElementById(id);
+    if (!section) return;
+    event.preventDefault();
+    section.scrollIntoView({ block: "start", behavior: "auto" });
+    window.requestAnimationFrame(() => section.focus({ preventScroll: true }));
+    window.history.replaceState(window.history.state, "", `#${id}`);
+  };
+
   return (
     <div className="signed-out-page">
       <header className="public-header">
@@ -119,8 +79,8 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
           <span>OPEN</span><span>SHED</span>
         </a>
         <nav className="public-nav" aria-label="Landing page navigation">
-          <a href="#how-to-play">Rules</a>
-          <a href="#action-cards">Action cards</a>
+          <a href="#how-to-play" onClick={(event) => focusSection(event, "how-to-play")}>Rules</a>
+          <a href="#action-cards" onClick={(event) => focusSection(event, "action-cards")}>Action cards</a>
           <a className="public-nav-cta" href={signInPath}>Sign in</a>
         </nav>
       </header>
@@ -137,7 +97,7 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
             <a className="primary-button sign-in-button" href={signInPath}>
               Sign in to play <ArrowRightIcon aria-hidden="true" weight="bold" />
             </a>
-            <a className="secondary-button" href="#how-to-play">Learn the rules</a>
+            <a className="secondary-button" href="#how-to-play" onClick={(event) => focusSection(event, "how-to-play")}>Learn the rules</a>
           </div>
         </div>
 
@@ -168,30 +128,16 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
         <div><dt>Mercy limit</dt><dd>25 cards</dd></div>
       </dl>
 
-      <section id="how-to-play" className="public-rules" aria-labelledby="how-to-play-title">
+      <section id="how-to-play" className="public-rules" aria-labelledby="how-to-play-title" tabIndex={-1}>
         <div className="public-section-heading">
           <span className="eyebrow">How to play</span>
           <h2 id="how-to-play-title">One card per turn. Two ways to win.</h2>
           <p>Play your final card, or become the last active player after the Mercy rule clears the table.</p>
         </div>
-        <ol className="public-rule-steps">
-          <li><span>01</span><h3>Start with seven</h3><p>The server deals seven cards each and skips opening Action Cards until a number starts play clockwise.</p></li>
-          <li><span>02</span><h3>Match one card</h3><p>Match the active color, number, or symbol. Wild cards can set a continuing color. If you have a legal card, you must play one.</p></li>
-          <li><span>03</span><h3>Draw to a match</h3><p>No legal card? Draw until the first playable card appears, then play that exact card.</p></li>
-          <li><span>04</span><h3>Resolve the effect</h3><p>Complete every required color, target, draw, swap, or direction choice before play moves on.</p></li>
-          <li><span>05</span><h3>Call UNO or win</h3><p>Call UNO at one card. Empty your hand—or outlast every other active player—to win.</p></li>
-        </ol>
+        <RulesGuideSections idPrefix="public-rules" variant="public" />
       </section>
 
-      <section className="public-power-rules" aria-labelledby="power-rules-title">
-        <h2 id="power-rules-title" className="sr-only">Merciless table rules</h2>
-        <article><span>Stack</span><h3>Equal or higher</h3><p>During a draw chain, normal matching is suspended. Stack only an equal-or-higher Draw Card; values add until someone takes the full penalty.</p></article>
-        <article><span>0 / 7</span><h3>Move every hand</h3><p>A 0 passes every active hand in the current direction. A 7 forces you to swap with an active player of your choice.</p></article>
-        <article><span>Mercy</span><h3>25 means out</h3><p>Ordinary draws, penalties, and UNO catches eliminate you as card 25 enters. Roulette adds its full batch before checking.</p></article>
-        <article><span>UNO</span><h3>Call it in time</h3><p>Reach exactly one card and call UNO. Until the next substantive turn action is accepted, another player may catch you; if caught, draw 2.</p></article>
-      </section>
-
-      <section id="action-cards" className="public-action-guide" aria-labelledby="action-cards-title">
+      <section id="action-cards" className="public-action-guide" aria-labelledby="action-cards-title" tabIndex={-1}>
         <div className="public-section-heading public-section-heading--split">
           <div>
             <span className="eyebrow">Action card guide</span>
@@ -200,28 +146,12 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
           <p>Draw penalties can be stacked. Every other effect resolves immediately unless the play ends the game.</p>
         </div>
 
-        <div className="public-action-groups">
-          <RuleCardGroup label="Color action cards" rules={COLOR_ACTION_RULES} />
-          <RuleCardGroup label="Wild action cards" rules={WILD_ACTION_RULES} />
-        </div>
+        <RulesGuideCards idPrefix="public-rules" variant="public" />
+        <RulesGuideDeckInventory idPrefix="public-rules" variant="public" />
+        <RulesGuideScoring idPrefix="public-rules" variant="public" />
         <p className="public-scope-note">
-          Only your own hand reaches your screen, while the server decides turns and outcomes. Open Shed currently resolves one hand at a time; the paper game&apos;s optional multi-hand point scoring is not enabled in this rules profile.
+          Only your own hand reaches your screen, while the server decides turns and outcomes. {OPEN_SHED_RULES_GUIDE.sourceNote}
         </p>
-      </section>
-
-      <section className="public-edge-rules" aria-labelledby="online-rules-title">
-        <details>
-          <summary>
-            <span className="eyebrow">Merciless baseline / v1</span>
-            <h2 id="online-rules-title">How edge cases work online</h2>
-          </summary>
-          <div className="public-edge-grid">
-            <article><h3>Final card wins first</h3><p>A final 0, 7, or Draw Card ends the hand before it moves another player&apos;s cards. Discard All removes its matching cards before victory is checked.</p></article>
-            <article><h3>Only new actions open UNO</h3><p>Any move to exactly one card—including a 0 pass or 7 swap—opens a brief call-or-catch window. The next accepted turn action closes it.</p></article>
-            <article><h3>Roulette cannot loop forever</h3><p>If the chosen color is absent after every recyclable card is revealed, the target keeps that full batch and play continues with the chosen color active.</p></article>
-            <article><h3>Mercy timing is exact</h3><p>Ordinary draws stop as card 25 enters. Roulette adds its complete revealed batch first, then checks whether its target has reached the limit.</p></article>
-          </div>
-        </details>
       </section>
 
       {openTables ? (
@@ -303,32 +233,5 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
         </a>
       </footer>
     </div>
-  );
-}
-
-function RuleCardGroup({
-  label,
-  rules,
-}: {
-  label: string;
-  rules: Array<{ card: Card; description: string; title: string }>;
-}) {
-  return (
-    <details className="public-action-group" open>
-      <summary>{label}<span>{rules.length} types</span></summary>
-      <div>
-        {rules.map((rule) => (
-          <article className="public-action-rule" key={rule.card.id}>
-            <CardFace
-              card={rule.card}
-              className="public-rule-card-face"
-              variant="compact"
-              interaction={{ kind: "static", hiddenFromAssistiveTech: true }}
-            />
-            <div><h3>{rule.title}</h3><p>{rule.description}</p></div>
-          </article>
-        ))}
-      </div>
-    </details>
   );
 }

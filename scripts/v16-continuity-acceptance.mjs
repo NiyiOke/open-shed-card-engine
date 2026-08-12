@@ -351,7 +351,7 @@ async function proveBrowserContinuityAndRoundLedger(localDatabase) {
     await page
       .getByRole("heading", { name: `${actors.nextHost.name} wins.` })
       .waitFor({ timeout: 10_000 });
-    await page.getByRole("heading", { name: "Series score" }).waitFor();
+    await page.getByRole("heading", { name: "Round wins" }).waitFor();
     await page.getByText("1 win", { exact: true }).waitFor();
     const rematchButton = page.getByRole("button", {
       name: "Play round 2",

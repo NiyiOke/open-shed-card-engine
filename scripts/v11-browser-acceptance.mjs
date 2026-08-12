@@ -102,10 +102,10 @@ try {
     .waitFor({ timeout: 8_000 });
 
   await host.getByRole("button", { name: "Rules & cards" }).click();
-  await host.getByRole("dialog", { name: "Rules & action guide" }).waitFor();
+  await host.getByRole("dialog", { name: "Rules & cards" }).waitFor();
   await host.keyboard.press("Escape");
   assert.equal(
-    await host.getByRole("dialog", { name: "Rules & action guide" }).count(),
+    await host.getByRole("dialog", { name: "Rules & cards" }).count(),
     0,
     "Escape must close the in-game rules dialog",
   );
