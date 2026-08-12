@@ -86,6 +86,7 @@ test("empty safe pool is generic and selected room reuses the atomic core", () =
   const selected = functionSource("joinSelectedPublicRoom", "getGame");
   for (const atomicWrite of [
     "guardedPublicJoinReceiptStatement",
+    "guardedCommunicationScopeDowngradeStatement",
     "guardedPublicProfileProvisionStatement",
     "guardedPublicMembershipUpsertStatement",
     "guardedPresenceUpsertStatement",

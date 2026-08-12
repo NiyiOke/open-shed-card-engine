@@ -29,15 +29,25 @@ import {
   type GameAudioEvent,
 } from "./game-audio";
 import {
+  createLiveVoiceController,
+  type LiveVoiceController,
+  type LiveVoiceSnapshot,
+  type LiveVoiceStatus,
+} from "./live-voice";
+import {
   CHAT_MESSAGE_LIMIT,
   CHAT_PHRASES,
   CHAT_REACTIONS,
   CHAT_REPORT_REASONS,
+  CHAT_TEXT_MAX_GRAPHEMES,
   chatContentPresentation,
+  countChatGraphemes,
   parseChatPage,
-  type ChatKind,
+  prepareChatText,
+  type ChatContentId,
   type ChatMessage,
   type ChatReportReason,
+  type CuratedChatKind,
 } from "./chat-ui";
 import {
   BUG_REPORT_CATEGORIES,
@@ -149,13 +159,36 @@ type SidebarTab = "chat" | "activity";
 type ChatModerationAction = "mute" | "block" | "report";
 type ChatDialog = {
   action: ChatModerationAction;
-  message: ChatMessage;
+  playerId: string;
+  displayName: string;
+  message: ChatMessage | null;
 };
-
 const COMMAND_STORAGE_KEY = "open-shed-inflight-command-v1";
 const CHAT_TAB_STORAGE_KEY = "open-shed-chat-tab-v1";
 const CHAT_ANNOUNCEMENTS_STORAGE_KEY = "open-shed-chat-announcements-v1";
 const REQUEST_TIMEOUT_MS = 12_000;
+const LIVE_VOICE_STATUS_COPY: Record<LiveVoiceStatus, string> = {
+  unavailable: "Voice setup required",
+  available: "Private voice eligible",
+  prejoin: "Review before joining",
+  requesting_permission: "Waiting for microphone permission",
+  permission_denied: "Microphone permission denied",
+  joining: "Joining voice muted",
+  joined_muted: "In voice · microphone off",
+  joined_live: "In voice · microphone on",
+  reconnecting: "Voice reconnecting",
+  listen_only: "Listening · microphone unavailable",
+  failed: "Voice could not connect",
+  ended: "Voice session ended",
+};
+const INITIAL_LIVE_VOICE_SNAPSHOT: LiveVoiceSnapshot = Object.freeze({
+  status: "unavailable",
+  microphoneEnabled: false,
+  outputMuted: false,
+  audioPlaybackBlocked: false,
+  participants: Object.freeze([]),
+  error: null,
+});
 
 const ACTION_GUIDE = [
   ["Draw 2 / Draw 4", "The next player stacks an equal-or-higher draw card or takes the full penalty."],
@@ -261,6 +294,10 @@ export function GameShell({
   const [chatSending, setChatSending] = useState(false);
   const [chatCoolingDown, setChatCoolingDown] = useState(false);
   const [chatAnnouncements, setChatAnnouncements] = useState(true);
+  const [chatFreeTextEnabled, setChatFreeTextEnabled] = useState(false);
+  const [chatLiveVoiceEnabled, setChatLiveVoiceEnabled] = useState(false);
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatDraftError, setChatDraftError] = useState<string | null>(null);
   const [mutedChatPlayers, setMutedChatPlayers] = useState<Record<string, string>>({});
   const [blockedChatPlayers, setBlockedChatPlayers] = useState<Record<string, string>>({});
   const [chatDialog, setChatDialog] = useState<ChatDialog | null>(null);
@@ -269,6 +306,10 @@ export function GameShell({
   const [chatViewportMobile, setChatViewportMobile] = useState(false);
   const [documentVisible, setDocumentVisible] = useState(true);
   const [chatRefreshTick, setChatRefreshTick] = useState(0);
+  const [voiceSheetOpen, setVoiceSheetOpen] = useState(false);
+  const [liveVoiceSnapshot, setLiveVoiceSnapshot] = useState<LiveVoiceSnapshot>(
+    INITIAL_LIVE_VOICE_SNAPSHOT,
+  );
   const gameRef = useRef<GameView | null>(null);
   const eventCursorRef = useRef<{ gameId: string; revision: number } | null>(null);
   const pollRequestRef = useRef<PollRequest | null>(null);
@@ -303,6 +344,9 @@ export function GameShell({
   const chatDialogRef = useRef<HTMLDivElement>(null);
   const chatDialogTriggerRef = useRef<HTMLButtonElement | null>(null);
   const chatLogRef = useRef<HTMLDivElement>(null);
+  const voiceSheetRef = useRef<HTMLDivElement>(null);
+  const voiceSheetTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const liveVoiceControllerRef = useRef<LiveVoiceController | null>(null);
   const testClock = useRef(0);
   const [reconnectTick, setReconnectTick] = useState(0);
 
@@ -620,12 +664,57 @@ export function GameShell({
         !blockedChatPlayers[message.senderPlayerId],
     );
   }, [blockedChatPlayers, chatMessages, game, mutedChatPlayers]);
+  const chatDraftGraphemes = useMemo(
+    () => countChatGraphemes(chatDraft),
+    [chatDraft],
+  );
+  const preparedChatDraft = useMemo(() => prepareChatText(chatDraft), [chatDraft]);
   const chatPanelVisible = Boolean(
     chatEnabled &&
     sidebarTab === "chat" &&
     documentVisible &&
     (!chatViewportMobile || sidebarDetailsOpen),
   );
+
+  useEffect(() => {
+    let active = true;
+    if (!activeGameId) {
+      liveVoiceControllerRef.current = null;
+      const resetFrame = window.requestAnimationFrame(() => {
+        setLiveVoiceSnapshot(INITIAL_LIVE_VOICE_SNAPSHOT);
+      });
+      return () => window.cancelAnimationFrame(resetFrame);
+    }
+    const voiceFetcher: typeof fetch = (input, init) => {
+      const headers = new Headers(init?.headers);
+      const localIdentity = getLocalIdentity();
+      if (localIdentity) {
+        headers.set("X-Open-Shed-Dev-User", localIdentity.id);
+        headers.set("X-Open-Shed-Dev-Name", localIdentity.name);
+      }
+      return fetch(input, { ...init, headers, cache: "no-store" });
+    };
+    const controller = createLiveVoiceController({
+      gameId: activeGameId,
+      fetcher: voiceFetcher,
+      onChange: (snapshot) => {
+        if (active) setLiveVoiceSnapshot(snapshot);
+      },
+    });
+    liveVoiceControllerRef.current = controller;
+    if (chatLiveVoiceEnabled) controller.markAvailable();
+    const snapshotFrame = window.requestAnimationFrame(() => {
+      if (active) setLiveVoiceSnapshot(controller.getSnapshot());
+    });
+    return () => {
+      active = false;
+      window.cancelAnimationFrame(snapshotFrame);
+      if (liveVoiceControllerRef.current === controller) {
+        liveVoiceControllerRef.current = null;
+      }
+      void controller.dispose();
+    };
+  }, [activeGameId, chatLiveVoiceEnabled]);
 
   useEffect(() => {
     gameRef.current = game;
@@ -855,10 +944,15 @@ export function GameShell({
       setChatStatus(null);
       setChatSending(false);
       setChatCoolingDown(false);
+      setChatFreeTextEnabled(false);
+      setChatLiveVoiceEnabled(false);
+      setChatDraft("");
+      setChatDraftError(null);
       setMutedChatPlayers({});
       setBlockedChatPlayers({});
       setChatDialog(null);
       setChatModerationBusy(false);
+      setVoiceSheetOpen(false);
       if (!activeGameId) return;
 
       const rememberedTab = window.sessionStorage.getItem(CHAT_TAB_STORAGE_KEY);
@@ -908,9 +1002,13 @@ export function GameShell({
     };
     const hideDisabledChat = () => {
       setChatEnabled(false);
+      setChatFreeTextEnabled(false);
+      setChatLiveVoiceEnabled(false);
       setChatMessages([]);
       setChatUnread(0);
       setChatError(null);
+      setChatDraft("");
+      setChatDraftError(null);
       chatMessageIdsRef.current = new Set();
     };
     const poll = () => {
@@ -995,6 +1093,12 @@ export function GameShell({
             chatCursorRef.current = { gameId: activeGameId, cursor: page.nextCursor };
           }
           setChatEnabled(true);
+          setChatFreeTextEnabled(page.viewer.capabilities.freeText);
+          setChatLiveVoiceEnabled(page.viewer.capabilities.liveVoice);
+          if (!page.viewer.capabilities.freeText) {
+            setChatDraft("");
+            setChatDraftError(null);
+          }
           setChatError(null);
         })
         .catch((failure) => {
@@ -1239,13 +1343,32 @@ export function GameShell({
                     tab: sidebarTab,
                     unread: chatUnread,
                     announcements: chatAnnouncements,
-                    latest: visibleChatMessages.slice(-3).map((message) => ({
-                      senderPlayerId: message.senderPlayerId,
-                      kind: message.kind,
-                      contentId: message.contentId,
-                    })),
+                    freeText: chatFreeTextEnabled,
+                    liveVoice: chatLiveVoiceEnabled,
+                    draftLength: chatDraftGraphemes,
+                    latest: visibleChatMessages.slice(-3).map((message) =>
+                      message.kind === "text"
+                        ? {
+                            senderPlayerId: message.senderPlayerId,
+                            kind: "text",
+                            bodyLength: countChatGraphemes(message.body),
+                          }
+                        : {
+                            senderPlayerId: message.senderPlayerId,
+                            kind: message.kind,
+                            contentId: message.contentId,
+                          },
+                    ),
                   }
                 : null,
+              voice: {
+                sheet: voiceSheetOpen ? "open" : "closed",
+                status: liveVoiceSnapshot.status,
+                microphoneEnabled: liveVoiceSnapshot.microphoneEnabled,
+                outputMuted: liveVoiceSnapshot.outputMuted,
+                participantCount: liveVoiceSnapshot.participants.length,
+                hasError: Boolean(liveVoiceSnapshot.error),
+              },
             }
           : null,
       });
@@ -1265,11 +1388,15 @@ export function GameShell({
     bugReportDiagnostics,
     bugReportOpen,
     chatAnnouncements,
+    chatDraftGraphemes,
     chatEnabled,
+    chatFreeTextEnabled,
+    chatLiveVoiceEnabled,
     chatPanelVisible,
     chatUnread,
     connectionState,
     game,
+    liveVoiceSnapshot,
     playedCardFxRevision,
     presence,
     reducedMotion,
@@ -1281,6 +1408,7 @@ export function GameShell({
     storedCommand,
     turnFxRevision,
     visibleChatMessages,
+    voiceSheetOpen,
   ]);
 
   const enterGame = useCallback((
@@ -1746,7 +1874,13 @@ export function GameShell({
                 : response.view.revision,
         };
       }
-      if (listingDialogAction === "publish") setNickname(alias);
+      if (listingDialogAction === "publish") {
+        setNickname(alias);
+        setChatFreeTextEnabled(false);
+        setChatLiveVoiceEnabled(false);
+        setChatDraft("");
+        setChatDraftError(null);
+      }
       setListing(nextListing);
       setListingDialogAction(null);
       setListingAlias("");
@@ -2172,20 +2306,24 @@ export function GameShell({
 
   const hideChatFeature = () => {
     setChatEnabled(false);
+    setChatFreeTextEnabled(false);
+    setChatLiveVoiceEnabled(false);
     setChatMessages([]);
     setChatUnread(0);
     setChatError(null);
     setChatStatus(null);
     setChatDialog(null);
     setChatCoolingDown(false);
+    setChatDraft("");
+    setChatDraftError(null);
     chatMessageIdsRef.current = new Set();
     chatSendMutationRef.current = null;
     chatReportMutationRef.current = null;
   };
 
   const sendCuratedChat = async (
-    kind: ChatKind,
-    contentId: ChatMessage["contentId"],
+    kind: CuratedChatKind,
+    contentId: ChatContentId,
   ) => {
     const currentGame = gameRef.current;
     if (!currentGame || !chatEnabled || chatSending || chatCoolingDown) return;
@@ -2242,6 +2380,142 @@ export function GameShell({
     }
   };
 
+  const sendFreeTextChat = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const currentGame = gameRef.current;
+    if (
+      !currentGame ||
+      !chatEnabled ||
+      !chatFreeTextEnabled ||
+      chatSending ||
+      chatCoolingDown
+    ) {
+      return;
+    }
+    if (!preparedChatDraft) {
+      setChatDraftError(
+        chatDraftGraphemes > CHAT_TEXT_MAX_GRAPHEMES
+          ? `Shorten this message to ${CHAT_TEXT_MAX_GRAPHEMES} visible characters.`
+          : chatDraft.trim()
+            ? "Remove unsupported control characters before sending."
+            : "Type a message before sending.",
+      );
+      return;
+    }
+
+    const fingerprint = JSON.stringify({
+      gameId: currentGame.gameId,
+      kind: "text",
+      body: preparedChatDraft,
+    });
+    const requestCommandId =
+      chatSendMutationRef.current?.fingerprint === fingerprint
+        ? chatSendMutationRef.current.commandId
+        : commandId();
+    chatSendMutationRef.current = { commandId: requestCommandId, fingerprint };
+    setChatSending(true);
+    setChatError(null);
+    setChatDraftError(null);
+    setChatStatus(null);
+    try {
+      await request<unknown>(
+        `/api/games/${encodeURIComponent(currentGame.gameId)}/messages`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            commandId: requestCommandId,
+            kind: "text",
+            body: preparedChatDraft,
+          }),
+        },
+      );
+      if (gameRef.current?.gameId === currentGame.gameId) {
+        chatSendMutationRef.current = null;
+        setChatDraft("");
+        setChatCoolingDown(true);
+        setChatStatus("Message sent.");
+        setChatRefreshTick((current) => current + 1);
+      }
+    } catch (failure) {
+      const code = (failure as RequestFailure).code;
+      if (
+        ["FREE_TEXT_DISABLED", "FREE_TEXT_UNAVAILABLE"].includes(code ?? "")
+      ) {
+        chatSendMutationRef.current = null;
+        setChatFreeTextEnabled(false);
+        if (code === "FREE_TEXT_UNAVAILABLE") setChatLiveVoiceEnabled(false);
+        setChatDraft("");
+        setChatDraftError(null);
+        setChatError(
+          "Private free text is no longer available at this table. Quick phrases still work.",
+        );
+        setChatRefreshTick((current) => current + 1);
+      } else if (
+        ["COMMUNICATION_DISABLED", "FEATURE_DISABLED", "ROUTE_NOT_FOUND"].includes(
+          code ?? "",
+        )
+      ) {
+        hideChatFeature();
+      } else {
+        const recoverable =
+          code === "REQUEST_TIMEOUT" || failure instanceof TypeError || !navigator.onLine;
+        if (!recoverable) chatSendMutationRef.current = null;
+        setChatDraftError(
+          code === "CONTACT_DETAILS_NOT_ALLOWED"
+            ? "Links and contact details aren’t allowed in table chat."
+            : code === "INVALID_FREE_TEXT"
+              ? `Use 1–${CHAT_TEXT_MAX_GRAPHEMES} visible characters and remove hidden control characters.`
+              : code === "RATE_LIMITED"
+            ? "Wait a moment before sending again."
+            : recoverable
+              ? "The response was interrupted. Retry this same message safely."
+              : "That message did not send. Your game actions are unaffected.",
+        );
+      }
+    } finally {
+      setChatSending(false);
+    }
+  };
+
+  const openVoiceSheet = (trigger: HTMLButtonElement) => {
+    voiceSheetTriggerRef.current = trigger;
+    liveVoiceControllerRef.current?.openPrejoin();
+    setVoiceSheetOpen(true);
+  };
+
+  const closeVoiceSheet = useCallback(() => {
+    setVoiceSheetOpen(false);
+    window.requestAnimationFrame(() => voiceSheetTriggerRef.current?.focus());
+  }, []);
+
+  const joinLiveVoice = async () => {
+    await liveVoiceControllerRef.current?.join();
+  };
+
+  const toggleLiveMicrophone = async () => {
+    const controller = liveVoiceControllerRef.current;
+    if (!controller) return;
+    await controller.setMicrophoneEnabled(!controller.getSnapshot().microphoneEnabled);
+  };
+
+  const leaveLiveVoice = async () => {
+    const controller = liveVoiceControllerRef.current;
+    if (!controller) return;
+    await controller.leave();
+    if (chatLiveVoiceEnabled) controller.markAvailable();
+  };
+
+  const toggleLiveVoiceOutput = () => {
+    const controller = liveVoiceControllerRef.current;
+    if (!controller) return;
+    controller.setOutputMuted(!controller.getSnapshot().outputMuted);
+  };
+
+  const resumeLiveVoiceAudio = async () => {
+    await liveVoiceControllerRef.current?.resumeAudio();
+  };
+
   const openChatDialog = (
     action: ChatModerationAction,
     message: ChatMessage,
@@ -2250,7 +2524,28 @@ export function GameShell({
     chatDialogTriggerRef.current = trigger;
     setChatReportReason("harassment");
     setChatError(null);
-    setChatDialog({ action, message });
+    setChatDialog({
+      action,
+      playerId: message.senderPlayerId,
+      displayName: message.senderDisplayName,
+      message,
+    });
+  };
+
+  const openVoiceBlockDialog = (
+    participant: LiveVoiceSnapshot["participants"][number],
+    trigger: HTMLButtonElement,
+  ) => {
+    if (participant.self) return;
+    chatDialogTriggerRef.current = trigger;
+    setVoiceSheetOpen(false);
+    setChatError(null);
+    setChatDialog({
+      action: "block",
+      playerId: participant.playerId,
+      displayName: participant.displayName,
+      message: null,
+    });
   };
 
   const closeChatDialog = useCallback(() => {
@@ -2292,6 +2587,9 @@ export function GameShell({
         else delete next[playerId];
         return next;
       });
+      if (restriction === "block" && enabled) {
+        await liveVoiceControllerRef.current?.leave();
+      }
       setChatUnread(0);
       setChatStatus(
         enabled
@@ -2320,6 +2618,7 @@ export function GameShell({
     const currentDialog = chatDialog;
     if (!currentDialog || chatModerationBusy) return;
     if (currentDialog.action === "report") {
+      if (!currentDialog.message) return;
       const fingerprint = JSON.stringify({
         messageId: currentDialog.message.id,
         reason: chatReportReason,
@@ -2373,14 +2672,25 @@ export function GameShell({
 
     const changed = await changeChatRestriction(
       currentDialog.action,
-      currentDialog.message.senderPlayerId,
-      currentDialog.message.senderDisplayName,
+      currentDialog.playerId,
+      currentDialog.displayName,
       true,
     );
     if (changed) closeChatDialog();
   };
 
   const self = game?.players.find((player) => player.isSelf) ?? null;
+  const liveVoiceJoined = [
+    "joined_muted",
+    "joined_live",
+    "requesting_permission",
+    "permission_denied",
+    "listen_only",
+    "reconnecting",
+  ].includes(liveVoiceSnapshot.status) || liveVoiceSnapshot.participants.length > 0;
+  const liveVoiceBusy = ["joining", "requesting_permission"].includes(
+    liveVoiceSnapshot.status,
+  );
   const soundAvailable = soundCapabilities.effects || soundCapabilities.speech;
   const soundControlState = !soundSettings.enabled
     ? "off"
@@ -2455,7 +2765,8 @@ export function GameShell({
     Boolean(listingDialogAction) ||
     Boolean(guideTopic) ||
     Boolean(removeTargetId) ||
-    Boolean(chatDialog);
+    Boolean(chatDialog) ||
+    voiceSheetOpen;
   const bugReportIssueLink = (() => {
     if (!bugReportOpen) return { href: null, error: null };
     const draft = currentBugReportDraft();
@@ -2671,6 +2982,52 @@ export function GameShell({
       document.removeEventListener("keydown", onKeyDown);
     };
   }, [chatDialog, closeChatDialog]);
+
+  useEffect(() => {
+    if (!voiceSheetOpen) return;
+    const dialog = voiceSheetRef.current;
+    if (!dialog) return;
+    const focusables = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hidden);
+    const frame = window.requestAnimationFrame(() => {
+      (focusables()[0] ?? dialog).focus();
+    });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeVoiceSheet();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (!items.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items.at(-1)!;
+      if (
+        event.shiftKey &&
+        (document.activeElement === first || !dialog.contains(document.activeElement))
+      ) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeVoiceSheet, voiceSheetOpen]);
 
   useEffect(() => {
     if (!soundDialogOpen) return;
@@ -2904,6 +3261,22 @@ export function GameShell({
               <div className="table-status-side">
                 {isSelfTurn ? <span className="turn-alert-chip">Your turn</span> : null}
                 <span>{game.phase === "lobby" ? lobbyReadiness : turnCoach?.detail}</span>
+                {chatEnabled && (chatLiveVoiceEnabled || liveVoiceJoined) ? (
+                  <button
+                    type="button"
+                    className="mobile-talk-control"
+                    aria-haspopup="dialog"
+                    aria-label={`Open table talk. ${LIVE_VOICE_STATUS_COPY[liveVoiceSnapshot.status]}.`}
+                    onClick={(event) => openVoiceSheet(event.currentTarget)}
+                  >
+                    Talk
+                    {chatUnread ? (
+                      <span className="chat-unread" aria-label={`${chatUnread} unread chat messages`}>
+                        {chatUnread}
+                      </span>
+                    ) : null}
+                  </button>
+                ) : null}
               </div>
             </div>
 
@@ -3167,6 +3540,31 @@ export function GameShell({
               </div>
               {chatEnabled ? (
                 <div className="sidebar-communication">
+                  {chatLiveVoiceEnabled || liveVoiceJoined ? (
+                    <section
+                      className="voice-strip"
+                      aria-label="Live table voice"
+                      data-status={liveVoiceSnapshot.status}
+                    >
+                      <div>
+                        <span className="eyebrow">Live voice</span>
+                        <strong>{LIVE_VOICE_STATUS_COPY[liveVoiceSnapshot.status]}</strong>
+                        {liveVoiceJoined ? (
+                          <small>
+                            {liveVoiceSnapshot.participants.length} connected · voice is not recorded
+                          </small>
+                        ) : null}
+                      </div>
+                      <button
+                        type="button"
+                        disabled={liveVoiceBusy}
+                        aria-haspopup="dialog"
+                        onClick={(event) => openVoiceSheet(event.currentTarget)}
+                      >
+                        {liveVoiceJoined ? "Controls" : "Details"}
+                      </button>
+                    </section>
+                  ) : null}
                   <div
                     className="sidebar-tabs"
                     role="tablist"
@@ -3248,12 +3646,11 @@ export function GameShell({
                     >
                       {visibleChatMessages.length ? (
                         visibleChatMessages.map((message) => {
-                          const presentation = chatContentPresentation(
-                            message.kind,
-                            message.contentId,
-                          );
+                          const presentation = message.kind === "text"
+                            ? null
+                            : chatContentPresentation(message.kind, message.contentId);
                           const isSelfMessage = message.senderPlayerId === self?.playerId;
-                          if (!presentation) return null;
+                          if (message.kind !== "text" && !presentation) return null;
                           return (
                             <article
                               className={`chat-message ${isSelfMessage ? "is-self" : ""}`}
@@ -3269,12 +3666,18 @@ export function GameShell({
                                 </time>
                               </div>
                               <div className="chat-message__content">
-                                {presentation.icon ? (
-                                  <span className="chat-message__icon" aria-hidden="true">
-                                    {presentation.icon}
-                                  </span>
-                                ) : null}
-                                <span>{presentation.label}</span>
+                                {message.kind === "text" ? (
+                                  <span className="chat-message__text">{message.body}</span>
+                                ) : (
+                                  <>
+                                    {presentation?.icon ? (
+                                      <span className="chat-message__icon" aria-hidden="true">
+                                        {presentation.icon}
+                                      </span>
+                                    ) : null}
+                                    <span>{presentation?.label}</span>
+                                  </>
+                                )}
                               </div>
                               {!isSelfMessage ? (
                                 <details className="chat-message-actions">
@@ -3308,7 +3711,9 @@ export function GameShell({
                         })
                       ) : (
                         <p className="chat-empty">
-                          No messages yet. Use a quick phrase or reaction—free text stays off.
+                          {chatFreeTextEnabled
+                            ? "No messages yet. Say hello to your private table."
+                            : "No messages yet. Use a quick phrase or reaction—free text stays off."}
                         </p>
                       )}
                     </div>
@@ -3316,37 +3721,129 @@ export function GameShell({
                     {chatError ? <p className="chat-feedback is-error" role="alert">{chatError}</p> : null}
                     {chatStatus ? <p className="chat-feedback" role="status">{chatStatus}</p> : null}
 
-                    <div className="chat-composer" aria-label="Send a curated chat message">
-                      <span className="eyebrow">Quick phrases</span>
-                      <div className="chat-phrase-grid">
-                        {CHAT_PHRASES.map((phrase) => (
-                          <button
-                            key={phrase.id}
-                            type="button"
-                            disabled={chatSending || chatCoolingDown}
-                            aria-label={`Send “${phrase.label}”`}
-                            onClick={() => void sendCuratedChat("phrase", phrase.id)}
+                    {chatFreeTextEnabled ? (
+                      <form className="chat-text-composer" onSubmit={sendFreeTextChat}>
+                        <p id="chat-text-privacy" className="chat-text-privacy">
+                          Invite-only table chat. Plain text only—no links or contact details.
+                          Messages are visible only to current table members and disappear after
+                          24 hours. Mute, Block, and Report stay available.
+                        </p>
+                        <label htmlFor="chat-text-draft">Message your table</label>
+                        <textarea
+                          id="chat-text-draft"
+                          rows={3}
+                          value={chatDraft}
+                          disabled={chatSending}
+                          autoComplete="off"
+                          aria-invalid={Boolean(chatDraftError) || chatDraftGraphemes > CHAT_TEXT_MAX_GRAPHEMES}
+                          aria-describedby="chat-text-privacy chat-text-count chat-text-error"
+                          onChange={(event) => {
+                            setChatDraft(event.target.value);
+                            setChatDraftError(null);
+                          }}
+                          onKeyDown={(event) => {
+                            if (
+                              event.key !== "Enter" ||
+                              event.shiftKey ||
+                              event.nativeEvent.isComposing
+                            ) return;
+                            event.preventDefault();
+                            event.currentTarget.form?.requestSubmit();
+                          }}
+                        />
+                        <div className="chat-text-composer__meta">
+                          <span
+                            id="chat-text-count"
+                            className={chatDraftGraphemes > CHAT_TEXT_MAX_GRAPHEMES ? "is-over" : ""}
                           >
-                            {phrase.label}
-                          </button>
-                        ))}
-                      </div>
-                      <span className="eyebrow">Reactions</span>
-                      <div className="chat-reaction-grid">
-                        {CHAT_REACTIONS.map((reaction) => (
+                            {chatDraftGraphemes} / {CHAT_TEXT_MAX_GRAPHEMES}
+                          </span>
                           <button
-                            key={reaction.id}
-                            type="button"
-                            disabled={chatSending || chatCoolingDown}
-                            aria-label={`Send ${reaction.label}`}
-                            title={reaction.label}
-                            onClick={() => void sendCuratedChat("reaction", reaction.id)}
+                            type="submit"
+                            disabled={
+                              chatSending ||
+                              chatCoolingDown ||
+                              !preparedChatDraft ||
+                              chatDraftGraphemes > CHAT_TEXT_MAX_GRAPHEMES
+                            }
                           >
-                            <span aria-hidden="true">{reaction.icon}</span>
+                            {chatSending ? "Sending…" : chatCoolingDown ? "Wait…" : "Send"}
                           </button>
-                        ))}
+                        </div>
+                        <p id="chat-text-error" className="chat-draft-error" aria-live="polite">
+                          {chatDraftError}
+                        </p>
+                      </form>
+                    ) : null}
+
+                    {chatFreeTextEnabled ? (
+                      <details className="chat-quick-controls">
+                        <summary>Quick phrases &amp; reactions</summary>
+                        <div className="chat-composer" aria-label="Send a quick chat message">
+                          <span className="eyebrow">Quick phrases</span>
+                          <div className="chat-phrase-grid">
+                            {CHAT_PHRASES.map((phrase) => (
+                              <button
+                                key={phrase.id}
+                                type="button"
+                                disabled={chatSending || chatCoolingDown}
+                                aria-label={`Send “${phrase.label}”`}
+                                onClick={() => void sendCuratedChat("phrase", phrase.id)}
+                              >
+                                {phrase.label}
+                              </button>
+                            ))}
+                          </div>
+                          <span className="eyebrow">Reactions</span>
+                          <div className="chat-reaction-grid">
+                            {CHAT_REACTIONS.map((reaction) => (
+                              <button
+                                key={reaction.id}
+                                type="button"
+                                disabled={chatSending || chatCoolingDown}
+                                aria-label={`Send ${reaction.label}`}
+                                title={reaction.label}
+                                onClick={() => void sendCuratedChat("reaction", reaction.id)}
+                              >
+                                <span aria-hidden="true">{reaction.icon}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </details>
+                    ) : (
+                      <div className="chat-composer" aria-label="Send a curated chat message">
+                        <span className="eyebrow">Quick phrases</span>
+                        <div className="chat-phrase-grid">
+                          {CHAT_PHRASES.map((phrase) => (
+                            <button
+                              key={phrase.id}
+                              type="button"
+                              disabled={chatSending || chatCoolingDown}
+                              aria-label={`Send “${phrase.label}”`}
+                              onClick={() => void sendCuratedChat("phrase", phrase.id)}
+                            >
+                              {phrase.label}
+                            </button>
+                          ))}
+                        </div>
+                        <span className="eyebrow">Reactions</span>
+                        <div className="chat-reaction-grid">
+                          {CHAT_REACTIONS.map((reaction) => (
+                            <button
+                              key={reaction.id}
+                              type="button"
+                              disabled={chatSending || chatCoolingDown}
+                              aria-label={`Send ${reaction.label}`}
+                              title={reaction.label}
+                              onClick={() => void sendCuratedChat("reaction", reaction.id)}
+                            >
+                              <span aria-hidden="true">{reaction.icon}</span>
+                            </button>
+                          ))}
+                        </div>
                       </div>
-                    </div>
+                    )}
 
                     {Object.keys(mutedChatPlayers).length || Object.keys(blockedChatPlayers).length ? (
                       <details className="chat-safety-controls">
@@ -3956,17 +4453,17 @@ export function GameShell({
             <span className="eyebrow">Chat safety</span>
             <h2 id="chat-moderation-title">
               {chatDialog.action === "mute"
-                ? `Mute ${chatDialog.message.senderDisplayName}?`
+                ? `Mute ${chatDialog.displayName}?`
                 : chatDialog.action === "block"
-                  ? `Block ${chatDialog.message.senderDisplayName}?`
+                  ? `Block ${chatDialog.displayName}?`
                   : "Report this message?"}
             </h2>
             <p className="dialog-copy">
               {chatDialog.action === "mute"
                 ? "Their table messages will be hidden for you. You can unmute them from chat safety controls."
                 : chatDialog.action === "block"
-                  ? "Their messages will be hidden and the service will prevent future matching where possible. You can unblock them from chat safety controls."
-                  : `Tell us why you’re reporting ${chatDialog.message.senderDisplayName}. Reports never include free-text notes.`}
+                  ? "Their messages will be hidden, and both of you will be removed from live voice at this table. You can unblock them from chat safety controls."
+                  : `Tell us why you’re reporting ${chatDialog.displayName}. Reports never include free-text notes.`}
             </p>
             {chatDialog.action === "report" ? (
               <fieldset className="chat-report-reasons">
@@ -4005,11 +4502,157 @@ export function GameShell({
                 {chatModerationBusy
                   ? "Saving…"
                   : chatDialog.action === "mute"
-                    ? `Mute ${chatDialog.message.senderDisplayName}`
+                    ? `Mute ${chatDialog.displayName}`
                     : chatDialog.action === "block"
-                      ? `Block ${chatDialog.message.senderDisplayName}`
+                      ? `Block ${chatDialog.displayName}`
                       : "Report message"}
               </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {voiceSheetOpen ? (
+        <div
+          ref={voiceSheetRef}
+          className="choice-overlay voice-sheet-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="voice-sheet-title"
+          aria-describedby="voice-sheet-consent"
+          tabIndex={-1}
+        >
+          <div className="choice-panel voice-sheet">
+            <span className="eyebrow">Table talk</span>
+            <h2 id="voice-sheet-title">Live voice</h2>
+            <p id="voice-sheet-consent" className="dialog-copy voice-consent-copy">
+              Live voice is optional and is not recorded by Open Shed. You always join
+              muted. Your browser can ask for microphone access only after you explicitly
+              choose to turn your microphone on.
+            </p>
+            <div
+              className="voice-state-card"
+              data-status={liveVoiceSnapshot.status}
+              role="status"
+              aria-live="polite"
+            >
+              <span className="voice-state-dot" aria-hidden="true" />
+              <div>
+                <strong>{LIVE_VOICE_STATUS_COPY[liveVoiceSnapshot.status]}</strong>
+                {liveVoiceSnapshot.status === "unavailable" ? (
+                  <p>
+                    {liveVoiceSnapshot.error ??
+                      "Voice is not available at this table. Private text and quick chat still work normally."}
+                  </p>
+                ) : liveVoiceSnapshot.status === "prejoin" ||
+                  liveVoiceSnapshot.status === "available" ? (
+                  <p>Join to listen first. Turning on your microphone is a separate action.</p>
+                ) : liveVoiceSnapshot.error ? (
+                  <p>{liveVoiceSnapshot.error}</p>
+                ) : null}
+              </div>
+            </div>
+
+            {liveVoiceSnapshot.participants.length ? (
+              <div className="voice-participants" aria-label="People in live voice">
+                <span className="eyebrow">In voice</span>
+                {liveVoiceSnapshot.participants.map((participant) => (
+                  <div key={participant.playerId}>
+                    <span>
+                      <strong>
+                        {participant.displayName}{participant.self ? " (you)" : ""}
+                      </strong>
+                      <small>
+                        {participant.speaking
+                          ? "Speaking"
+                          : participant.microphoneEnabled
+                            ? "Microphone on"
+                            : "Muted"}
+                      </small>
+                      {!participant.self ? (
+                        <button
+                          type="button"
+                          className="text-button voice-participant-block"
+                          disabled={chatModerationBusy}
+                          onClick={(event) =>
+                            openVoiceBlockDialog(participant, event.currentTarget)
+                          }
+                        >
+                          Block &amp; disconnect
+                        </button>
+                      ) : null}
+                    </span>
+                    <span className={participant.speaking ? "is-speaking" : ""}>
+                      {participant.connected ? "Connected" : "Reconnecting"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            {liveVoiceSnapshot.audioPlaybackBlocked ? (
+              <button
+                type="button"
+                className="secondary-button voice-resume-button"
+                onClick={() => void resumeLiveVoiceAudio()}
+              >
+                Start voice audio
+              </button>
+            ) : null}
+
+            <p className="voice-safety-note">
+              No voice notes are stored. Other people may still record outside Open Shed.
+              Blocking a player ends your voice connection; audio is not attached to reports.
+            </p>
+
+            <div className="dialog-actions voice-sheet-actions">
+              <button type="button" className="secondary-button" onClick={closeVoiceSheet}>
+                Close
+              </button>
+              {(liveVoiceSnapshot.status === "prejoin" ||
+                liveVoiceSnapshot.status === "available" ||
+                (liveVoiceSnapshot.status === "failed" && !liveVoiceJoined)) ? (
+                <button
+                  type="button"
+                  className="primary-button acid"
+                  disabled={liveVoiceBusy}
+                  onClick={() => void joinLiveVoice()}
+                >
+                  Join muted
+                </button>
+              ) : null}
+              {liveVoiceJoined ? (
+                <>
+                  <button
+                    type="button"
+                    className={liveVoiceSnapshot.microphoneEnabled ? "primary-button danger" : "primary-button acid"}
+                    disabled={liveVoiceBusy || liveVoiceSnapshot.status === "reconnecting"}
+                    aria-pressed={liveVoiceSnapshot.microphoneEnabled}
+                    onClick={() => void toggleLiveMicrophone()}
+                  >
+                    {liveVoiceSnapshot.status === "requesting_permission"
+                      ? "Requesting permission…"
+                      : liveVoiceSnapshot.microphoneEnabled
+                        ? "Turn microphone off"
+                        : "Turn microphone on"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    aria-pressed={liveVoiceSnapshot.outputMuted}
+                    onClick={toggleLiveVoiceOutput}
+                  >
+                    {liveVoiceSnapshot.outputMuted ? "Hear table voice" : "Mute table voice"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button danger-outline"
+                    onClick={() => void leaveLiveVoice()}
+                  >
+                    Leave voice
+                  </button>
+                </>
+              ) : null}
             </div>
           </div>
         </div>

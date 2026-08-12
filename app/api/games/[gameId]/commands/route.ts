@@ -11,6 +11,7 @@ import {
   requireCommandId,
   routeErrorResponse,
 } from "../../../../../lib/server/responses";
+import { reconcileLiveVoiceCleanupForGame } from "../../../../../lib/server/live-voice-cleanup";
 
 type RouteContext = { params: Promise<{ gameId: string }> };
 
@@ -41,6 +42,9 @@ export async function POST(request: Request, context: RouteContext) {
       commandId,
       command,
     );
+    // A replay returns no events, so reconcile the durable cleanup outbox on
+    // every accepted response. Provider failures never change game success.
+    await reconcileLiveVoiceCleanupForGame(gameId);
     const listing = result.view
       ? await getViewerListingForGame(user, gameId)
       : undefined;

@@ -25,6 +25,9 @@ export const games = sqliteTable(
     closedAt: integer("closed_at"),
     closeReason: text("close_reason"),
     abandonedSince: integer("abandoned_since"),
+    communicationScope: text("communication_scope")
+      .notNull()
+      .default("invite_only"),
     version: integer("version").notNull().default(0),
     stateJson: text("state_json").notNull(),
     stateHash: text("state_hash").notNull(),
@@ -116,6 +119,7 @@ export const gameMessages = sqliteTable(
     senderDisplayName: text("sender_display_name").notNull(),
     kind: text("kind").notNull(),
     contentId: text("content_id").notNull(),
+    bodyText: text("body_text"),
     commandId: text("command_id").notNull(),
     createdAt: integer("created_at").notNull(),
     expiresAt: integer("expires_at").notNull(),
@@ -146,6 +150,7 @@ export const gameMessageReports = sqliteTable(
     evidenceSenderDisplayName: text("evidence_sender_display_name").notNull(),
     evidenceKind: text("evidence_kind").notNull(),
     evidenceContentId: text("evidence_content_id").notNull(),
+    evidenceBodyText: text("evidence_body_text"),
     evidenceCreatedAt: integer("evidence_created_at").notNull(),
     reason: text("reason").notNull(),
     moderationState: text("moderation_state").notNull().default("pending"),
@@ -166,6 +171,22 @@ export const gameMessageReports = sqliteTable(
   ],
 );
 
+export const gameMessageReceipts = sqliteTable(
+  "game_message_receipts",
+  {
+    gameId: text("game_id").notNull(),
+    messageId: text("message_id").notNull(),
+    recipientProfileId: text("recipient_profile_id").notNull(),
+    receivedAt: integer("received_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.recipientProfileId, table.messageId] }),
+    index("idx_game_message_receipts_game").on(table.gameId),
+    index("idx_game_message_receipts_expiry").on(table.expiresAt),
+  ],
+);
+
 export const gameMutes = sqliteTable(
   "game_mutes",
   {
@@ -179,6 +200,28 @@ export const gameMutes = sqliteTable(
       columns: [table.gameId, table.muterProfileId, table.mutedProfileId],
     }),
     index("idx_game_mutes_muted").on(table.gameId, table.mutedProfileId),
+  ],
+);
+
+export const liveVoiceCleanupJobs = sqliteTable(
+  "live_voice_cleanup_jobs",
+  {
+    jobKey: text("job_key").primaryKey(),
+    kind: text("kind").notNull(),
+    gameId: text("game_id").notNull(),
+    playerId: text("player_id"),
+    requestedAt: integer("requested_at").notNull(),
+    nextAttemptAt: integer("next_attempt_at").notNull(),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (table) => [
+    index("idx_live_voice_cleanup_due").on(
+      table.nextAttemptAt,
+      table.jobKey,
+    ),
+    index("idx_live_voice_cleanup_game").on(table.gameId, table.jobKey),
+    index("idx_live_voice_cleanup_expiry").on(table.expiresAt),
   ],
 );
 

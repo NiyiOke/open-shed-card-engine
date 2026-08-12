@@ -54,9 +54,10 @@ Short polling is intentional because the Sites binding contract currently expose
 The stable seams are the command union, rules profile, `GameState`, event bundle, viewer projection, and repository boundary.
 
 - Real-time updates: move per-game coordination to Durable Objects and broadcast the same public events over hibernatable WebSockets.
-- Chat: add a separate moderated bounded context; do not mix messages into authoritative rules state.
+- Communication: keep curated/public chat, private text, reports, and voice authorization in separate moderated boundaries; never mix them into authoritative rules state.
 - Sound: map public event kinds to optional client audio cues.
-- Video/voice: add WebRTC signaling, STUN/TURN, consent, block/report controls, and a specialist provider.
+- Live voice: the provider-neutral LiveKit adapter supplies managed WebRTC signaling/TURN, explicit consent, listen-only join, microphone-only grants, and lifecycle revocation; keep it independently disabled until provider credentials and operational safety gates are configured.
+- Voice notes/video: require separate private media storage/lifecycle or a specialist provider, with explicit retention, consent, block/report, and moderation controls.
 - New modes: add a new rules profile and card manifest; never mutate the meaning of an in-progress game's pinned version.
 - Replays: retain private command payloads in an access-controlled audit store and verify hashes against snapshots.
 

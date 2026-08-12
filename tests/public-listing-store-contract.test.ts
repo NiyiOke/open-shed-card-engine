@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { getOptionalPublicDiscoveryUser } from "../lib/server/auth";
 
 const STORE_SOURCE = read("../lib/server/game-store.ts");
+const RUNTIME_SOURCE = read("../db/runtime.ts");
 const AVAILABILITY_ROUTE_SOURCE = read(
   "../app/api/public/availability/route.ts",
 );
@@ -100,6 +101,7 @@ test("publish persists alias, state, consent, listing, event and receipt in one 
   const publishBatch = mutation.slice(batchStart, mutation.indexOf("]);", batchStart));
   for (const guard of [
     "guardedPublishReceiptStatement",
+    "guardedCommunicationScopeDowngradeStatement",
     "guardedProfileNicknameStatement",
     "guardedEventStatement",
     "guardedHostDiscoveryConsentStatement",
@@ -110,6 +112,59 @@ test("publish persists alias, state, consent, listing, event and receipt in one 
   }
   assert.match(mutation, /nextHost\.displayName = alias/u);
   assert.match(mutation, /eventFloorVersion|nextState\.revision/u);
+});
+
+test("publication permanently downgrades communication behind its exact receipt", () => {
+  const downgrade = functionSource(
+    "guardedCommunicationScopeDowngradeStatement",
+    "guardedPublishListingStatement",
+  );
+  assert.match(downgrade, /UPDATE games/u);
+  assert.match(
+    downgrade,
+    /WHEN communication_scope = 'invite_only' THEN 'public_safe'/u,
+  );
+  assert.doesNotMatch(
+    downgrade,
+    /SET communication_scope = 'invite_only'/u,
+  );
+  for (const receiptBoundary of [
+    "actor_profile_id = ?",
+    "command_id = ?",
+    "game_id = ?",
+    "request_hash = ?",
+  ]) {
+    assert.ok(
+      downgrade.includes(receiptBoundary),
+      `missing communication-scope receipt guard: ${receiptBoundary}`,
+    );
+  }
+
+  const create = functionSource("createGame", "joinGame");
+  assert.match(
+    create,
+    /status, communication_scope, version,[\s\S]*'lobby', 'invite_only', 0/u,
+  );
+  assert.match(
+    RUNTIME_SOURCE,
+    /UPDATE games[\s\S]*SET communication_scope = 'public_safe'[\s\S]*communication_scope = 'invite_only'[\s\S]*FROM public_game_listings listing[\s\S]*listing\.game_id = games\.id[\s\S]*member\.join_source = 'public'/u,
+  );
+});
+
+test("ordinary game purge cannot orphan durable message receipts", () => {
+  const purge = functionSource("purgeExpiredRows", "normalizeJoinCode");
+  assert.match(
+    purge,
+    /DELETE FROM game_message_receipts[\s\S]*receipt\.expires_at <= \?/u,
+  );
+  assert.match(
+    purge,
+    /DELETE FROM game_messages[\s\S]*message\.expires_at <= \?/u,
+  );
+  assert.match(
+    purge,
+    /NOT EXISTS \([\s\S]*FROM game_message_receipts receipt[\s\S]*receipt\.game_id = g\.id/u,
+  );
 });
 
 test("terminal lifecycle closes only locators that remain publicly listed", () => {

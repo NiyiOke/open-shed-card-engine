@@ -50,6 +50,7 @@ const PAGE = {
   viewer: {
     mutedPlayerIds: ["22222222-2222-4222-8222-222222222222"],
     blockedPlayerIds: ["33333333-3333-4333-8333-333333333333"],
+    capabilities: { freeText: false, liveVoice: false },
   },
 };
 
@@ -164,6 +165,7 @@ test("chat mutations are confined to communication, receipt, quota, and safety t
     [...mutatedTables].sort(),
     [
       "command_receipts",
+      "game_message_receipts",
       "game_message_reports",
       "game_messages",
       "game_mutes",
@@ -179,7 +181,12 @@ test("chat mutations are confined to communication, receipt, quota, and safety t
 
   const messageColumns = schemaTableSlice(SCHEMA_SOURCE, "gameMessages", "gameMessageReports");
   assert.match(messageColumns, /contentId/u);
-  assert.doesNotMatch(messageColumns, /rendered|freeText|messageText|bodyText|labelText/u);
+  assert.match(messageColumns, /bodyText/u);
+  assert.doesNotMatch(messageColumns, /rendered|freeText|messageText|labelText/u);
+  assert.match(
+    schemaTableSlice(SCHEMA_SOURCE, "gameMessageReports", "gameMutes"),
+    /evidenceBodyText[\s\S]*gameMessageReceipts/u,
+  );
 });
 
 test("chat content cannot enter general logs, game events, or serialized GameState", () => {
@@ -213,19 +220,22 @@ test("report evidence survives ordinary game purge until its own 90-day boundary
   );
   assert.match(ordinaryPurge, /DELETE FROM game_message_reports[\s\S]*expires_at <= \?/u);
   assert.match(ordinaryPurge, /DELETE FROM game_messages/u);
+  assert.match(ordinaryPurge, /DELETE FROM game_message_receipts/u);
   assert.match(ordinaryPurge, /DELETE FROM games WHERE id IN/u);
   const gameDelete = ordinaryPurge.slice(
     ordinaryPurge.indexOf("DELETE FROM games WHERE id IN"),
     ordinaryPurge.indexOf("DELETE FROM mutation_quotas"),
   );
   assert.doesNotMatch(gameDelete, /game_message_reports/u);
+  assert.match(gameDelete, /NOT EXISTS \([\s\S]*FROM game_message_receipts/u);
   assert.match(
     RUNTIME_SOURCE,
-    /CREATE TABLE IF NOT EXISTS game_message_reports[\s\S]*evidence_sender_display_name[\s\S]*expires_at INTEGER NOT NULL/u,
+    /CREATE TABLE IF NOT EXISTS game_message_reports[\s\S]*evidence_sender_display_name[\s\S]*evidence_body_text[\s\S]*expires_at INTEGER NOT NULL/u,
   );
+  assert.match(RUNTIME_SOURCE, /CREATE TABLE IF NOT EXISTS game_message_receipts/u);
 });
 
-test("the UI keeps Chat and Activity distinct and touch-safe at 320px", () => {
+test("the UI keeps curated public chat and private text distinct and touch-safe at 320px", () => {
   assert.match(SHELL_SOURCE, /id="chat-tab"[\s\S]*id="activity-tab"/u);
   assert.match(SHELL_SOURCE, /role="log"[\s\S]*aria-label="Table chat"/u);
   assert.match(SHELL_SOURCE, /aria-label="Recent game events"/u);
@@ -236,7 +246,13 @@ test("the UI keeps Chat and Activity distinct and touch-safe at 320px", () => {
     SHELL_SOURCE.indexOf('id="chat-panel"'),
     SHELL_SOURCE.indexOf('id="activity-panel"'),
   );
-  assert.doesNotMatch(chatPanel, /<textarea|contentEditable|type="text"/u);
+  assert.match(chatPanel, /chatFreeTextEnabled \? \(/u);
+  assert.match(chatPanel, /<form className="chat-text-composer"/u);
+  assert.match(chatPanel, /<textarea[\s\S]*value=\{chatDraft\}/u);
+  assert.match(chatPanel, /Invite-only table chat[\s\S]*disappear after[\s\S]*24 hours/u);
+  assert.match(chatPanel, /<span className="chat-message__text">\{message\.body\}<\/span>/u);
+  assert.doesNotMatch(chatPanel, /dangerouslySetInnerHTML|contentEditable/u);
+  assert.match(chatPanel, /aria-label="Send a curated chat message"/u);
   assert.match(chatPanel, /Send “\$\{phrase\.label\}”/u);
   assert.match(chatPanel, /Send \$\{reaction\.label\}/u);
 
@@ -247,6 +263,14 @@ test("the UI keeps Chat and Activity distinct and touch-safe at 320px", () => {
   assert.match(
     CSS_SOURCE,
     /\.chat-phrase-grid button,[\s\S]*\.chat-reaction-grid button \{[\s\S]*min-height: 44px;/u,
+  );
+  assert.match(
+    CSS_SOURCE,
+    /\.mobile-talk-control \{[\s\S]*min-height: 44px;/u,
+  );
+  assert.match(
+    CSS_SOURCE,
+    /\.chat-text-composer__meta button \{[\s\S]*min-height: 44px;/u,
   );
 });
 

@@ -50,6 +50,20 @@
       "when": 1786472113173,
       "tag": "0006_ordinary_ego",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1786479799798,
+      "tag": "0007_small_excalibur",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1786482160187,
+      "tag": "0008_giant_mister_sinister",
+      "breakpoints": true
     }
   ]
 }

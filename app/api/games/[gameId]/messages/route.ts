@@ -10,8 +10,10 @@ import {
 import {
   assertCommunicationEnabled,
   assertExactJsonKeys,
+  assertFreeTextEnabled,
   hasRecognizedFreeTextField,
   parseCommunicationMessage,
+  parseFreeTextMessage,
   requireOpaqueCommunicationId,
 } from "../../../../../lib/server/communication-policy";
 import {
@@ -58,6 +60,24 @@ export async function POST(request: Request, context: RouteContext) {
     assertCommunicationEnabled();
     const { gameId } = await context.params;
     const body = await readJsonObject(request);
+    const commandId = requireCommandId(body.commandId);
+    if (body.kind === "text") {
+      assertFreeTextEnabled();
+      assertExactJsonKeys(
+        body,
+        ["commandId", "kind", "body"],
+        "INVALID_MESSAGE",
+        "Send exactly one private-table text message.",
+      );
+      return jsonResponse(
+        await sendTableMessage(
+          user,
+          gameId,
+          commandId,
+          parseFreeTextMessage(body.body),
+        ),
+      );
+    }
     if (
       hasRecognizedFreeTextField(body, ["commandId", "kind", "contentId"])
     ) {
@@ -73,16 +93,9 @@ export async function POST(request: Request, context: RouteContext) {
       "INVALID_MESSAGE",
       "Send exactly one available phrase or reaction.",
     );
-    const commandId = requireCommandId(body.commandId);
     const message = parseCommunicationMessage(body.kind, body.contentId);
     return jsonResponse(
-      await sendTableMessage(
-        user,
-        gameId,
-        commandId,
-        message.kind,
-        message.contentId,
-      ),
+      await sendTableMessage(user, gameId, commandId, message),
     );
   } catch (error) {
     return routeErrorResponse(error);

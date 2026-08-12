@@ -123,6 +123,7 @@ test("all public join writes are receipt-gated in one ordered batch", () => {
   const batch = join.slice(batchStart, batchEnd);
   const ordered = [
     "guardedPublicJoinReceiptStatement",
+    "guardedCommunicationScopeDowngradeStatement",
     "guardedPublicProfileProvisionStatement",
     "guardedEventStatement",
     "staleSeatCleanupStatement",

@@ -36,6 +36,18 @@ assert.ok(
   expectedMode === "enabled" || expectedMode === "disabled",
   "V15_CHAT_EXPECT_MODE must be enabled or disabled.",
 );
+const expectedFreeTextMode =
+  process.env.V15_CHAT_EXPECT_FREE_TEXT_MODE ?? "enabled";
+assert.ok(
+  expectedFreeTextMode === "enabled" || expectedFreeTextMode === "disabled",
+  "V15_CHAT_EXPECT_FREE_TEXT_MODE must be enabled or disabled.",
+);
+const expectedLiveVoiceMode =
+  process.env.V15_CHAT_EXPECT_LIVE_VOICE_MODE ?? "disabled";
+assert.ok(
+  expectedLiveVoiceMode === "enabled" || expectedLiveVoiceMode === "disabled",
+  "V15_CHAT_EXPECT_LIVE_VOICE_MODE must be enabled or disabled.",
+);
 
 const runToken = `${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
 const shortToken = randomBytes(4).toString("hex");
@@ -56,6 +68,8 @@ const applicationLogPath = path.resolve(
 );
 const messageRetentionMs = 86_400_000;
 const reportRetentionMs = 7_776_000_000;
+const privateTextRaw = "  Ｎｉｃｅ   move 👏🏽  ";
+const privateTextNormalized = "Nice move 👏🏽";
 
 const phrases = [
   ["your_turn", "Your turn"],
@@ -120,6 +134,8 @@ const restrictedValues = new Set([
   ...Object.values(identities).map((actor) => actor.name),
   ...Object.values(aliases),
   ...messageSequence.flatMap(({ contentId, label }) => [contentId, label]),
+  privateTextRaw,
+  privateTextNormalized,
   ...reportReasons,
 ]);
 const browserConsole = [];
@@ -135,6 +151,7 @@ const summary = {
   runToken,
   baseUrl: baseUrl.origin,
   expectedMode,
+  expectedFreeTextMode,
   localDatabase: null,
   scenarios: {},
   browserConsole,
@@ -185,6 +202,12 @@ try {
         browserSession,
       );
       summary.scenarios.allowlistedExchange = exchange.result;
+      const privateText = await provePrivateText(
+        databasePath,
+        main,
+        expectedFreeTextMode,
+      );
+      summary.scenarios.privateText = privateText.result;
       summary.scenarios.idempotency = await proveMessageIdempotency(
         databasePath,
         main,
@@ -194,6 +217,7 @@ try {
         databasePath,
         main,
         exchange,
+        privateText.record,
         browserSession,
       );
       summary.scenarios.mute = await proveMuteScope(
@@ -445,6 +469,10 @@ async function proveAllowlistedExchange(localDatabase, main, browserSession) {
   assert.deepEqual(hostPage.viewer, {
     mutedPlayerIds: [],
     blockedPlayerIds: [],
+    capabilities: {
+      freeText: expectedFreeTextMode === "enabled",
+      liveVoice: expectedLiveVoiceMode === "enabled",
+    },
   });
 
   const stored = queryRows(
@@ -475,6 +503,125 @@ async function proveAllowlistedExchange(localDatabase, main, browserSession) {
       exchangedByBothMembers: true,
       chronological: true,
       unreadClearedOnChatOpen: true,
+    },
+  };
+}
+
+async function provePrivateText(localDatabase, main, expectedMode) {
+  const before = messageCount(localDatabase, main.gameId);
+  const rejected = await apiRequest(
+    identities.host,
+    `/api/games/${encodeURIComponent(main.gameId)}/messages`,
+    {
+      method: "POST",
+      body: {
+        commandId: nextCommandId("private-text-contact"),
+        kind: "text",
+        body: "Find me at https://example.com",
+      },
+    },
+  );
+  if (expectedMode === "disabled") {
+    assertApiError(rejected, 404, "FREE_TEXT_DISABLED");
+    assert.equal(messageCount(localDatabase, main.gameId), before);
+    const page = await readMessages(identities.host, main.gameId);
+    assert.equal(page.viewer.capabilities.freeText, false);
+    assert.equal(
+      page.viewer.capabilities.liveVoice,
+      expectedLiveVoiceMode === "enabled",
+    );
+    return {
+      record: null,
+      result: { enabled: false, writesRejected: true, rowsChanged: false },
+    };
+  }
+  assertApiError(rejected, 400, "CONTACT_DETAILS_NOT_ALLOWED");
+  assert.equal(messageCount(localDatabase, main.gameId), before);
+
+  await waitForActorSendWindow(identities.host);
+  const commandId = nextCommandId("private-text");
+  const body = {
+    commandId,
+    kind: "text",
+    body: privateTextRaw,
+  };
+  const response = await apiRequest(
+    identities.host,
+    `/api/games/${encodeURIComponent(main.gameId)}/messages`,
+    { method: "POST", body },
+  );
+  assert.equal(response.status, 200, response.raw);
+  assert.deepEqual(response.body.replayed, false);
+  assertMessageDto(response.body.message);
+  assert.equal(response.body.message.kind, "text");
+  assert.equal(response.body.message.body, privateTextNormalized);
+  actorLastSendAt.set(identities.host.id, Date.now());
+
+  const replay = await apiRequest(
+    identities.host,
+    `/api/games/${encodeURIComponent(main.gameId)}/messages`,
+    { method: "POST", body },
+  );
+  assert.equal(replay.status, 200, replay.raw);
+  assert.equal(replay.body.replayed, true);
+  assert.deepEqual(replay.body.message, response.body.message);
+  const mismatch = await apiRequest(
+    identities.host,
+    `/api/games/${encodeURIComponent(main.gameId)}/messages`,
+    {
+      method: "POST",
+      body: { ...body, body: "Different safe text" },
+    },
+  );
+  assertApiError(mismatch, 409, "IDEMPOTENCY_KEY_REUSED");
+  assert.equal(messageCount(localDatabase, main.gameId), before + 1);
+
+  const guestPage = await readMessages(identities.guest, main.gameId);
+  assert.equal(guestPage.viewer.capabilities.freeText, true);
+  assert.equal(
+    guestPage.viewer.capabilities.liveVoice,
+    expectedLiveVoiceMode === "enabled",
+  );
+  assert.deepEqual(
+    guestPage.messages.find(({ id }) => id === response.body.message.id),
+    response.body.message,
+  );
+  const stored = queryOne(
+    localDatabase,
+    `SELECT kind, content_id AS contentId, body_text AS body,
+            created_at AS createdAt, expires_at AS expiresAt
+     FROM game_messages
+     WHERE id = ${sqlString(response.body.message.id)}`,
+  );
+  assert.deepEqual(
+    { kind: stored.kind, contentId: stored.contentId, body: stored.body },
+    { kind: "text", contentId: "", body: privateTextNormalized },
+  );
+  assert.equal(Number(stored.expiresAt) - Number(stored.createdAt), messageRetentionMs);
+  assert.equal(
+    queryScalar(
+      localDatabase,
+      `SELECT COUNT(*) AS value FROM game_message_receipts
+       WHERE message_id = ${sqlString(response.body.message.id)}
+         AND recipient_profile_id = ${profileIdSql(localDatabase, identities.guest)}`,
+    ),
+    1,
+  );
+
+  return {
+    record: {
+      actor: identities.host,
+      item: { kind: "text", body: privateTextNormalized },
+      commandId,
+      body,
+      message: response.body.message,
+    },
+    result: {
+      enabled: true,
+      normalized: true,
+      contactRejected: true,
+      replayed: true,
+      deliveryReceiptRecorded: true,
     },
   };
 }
@@ -513,11 +660,12 @@ async function proveReportEvidence(
   localDatabase,
   main,
   exchange,
+  privateText,
   browserSession,
 ) {
-  const target = exchange.records.find(
-    (record) => record.actor === identities.host,
-  );
+  const target =
+    privateText ??
+    exchange.records.find((record) => record.actor === identities.host);
   assert.ok(target, "The exchange must contain a host message to report.");
   await browserSession.proveReportDialog(target.message);
 
@@ -537,6 +685,7 @@ async function proveReportEvidence(
             evidence_sender_player_id AS senderPlayerId,
             evidence_sender_display_name AS senderDisplayName,
             evidence_kind AS kind, evidence_content_id AS contentId,
+            evidence_body_text AS body,
             evidence_created_at AS messageCreatedAt, reason,
             moderation_state AS moderationState,
             command_id AS commandId, created_at AS createdAt,
@@ -553,6 +702,7 @@ async function proveReportEvidence(
       senderDisplayName: evidence.senderDisplayName,
       kind: evidence.kind,
       contentId: evidence.contentId,
+      body: evidence.body,
       messageCreatedAt: Number(evidence.messageCreatedAt),
     },
     {
@@ -561,7 +711,8 @@ async function proveReportEvidence(
       senderPlayerId: target.message.senderPlayerId,
       senderDisplayName: target.message.senderDisplayName,
       kind: target.message.kind,
-      contentId: target.message.contentId,
+      contentId: target.message.kind === "text" ? "" : target.message.contentId,
+      body: target.message.kind === "text" ? target.message.body : null,
       messageCreatedAt: target.message.createdAt,
     },
   );
@@ -583,6 +734,7 @@ async function proveReportEvidence(
       `SELECT message_id AS messageId, evidence_sender_player_id AS senderPlayerId,
               evidence_sender_display_name AS senderDisplayName,
               evidence_kind AS kind, evidence_content_id AS contentId,
+              evidence_body_text AS body,
               evidence_created_at AS messageCreatedAt, reason,
               moderation_state AS moderationState, created_at AS createdAt,
               expires_at AS expiresAt
@@ -596,6 +748,7 @@ async function proveReportEvidence(
       senderDisplayName: evidence.senderDisplayName,
       kind: evidence.kind,
       contentId: evidence.contentId,
+      body: evidence.body,
       messageCreatedAt: evidence.messageCreatedAt,
       reason: evidence.reason,
       moderationState: evidence.moderationState,
@@ -933,7 +1086,20 @@ async function proveLeaveDenial(localDatabase, main) {
      WHERE game_id = ${sqlString(main.gameId)}
      ORDER BY created_at ASC, id ASC LIMIT 1`,
   ).id;
-  const attempts = [
+  const report = await apiRequest(
+    identities.guest,
+    `/api/messages/${encodeURIComponent(messageId)}/report`,
+    {
+      method: "POST",
+      body: {
+        commandId: nextCommandId("left-report"),
+        reason: "harassment",
+      },
+    },
+  );
+  assert.equal(report.status, 200, report.raw);
+  assert.deepEqual(report.body, { received: true, replayed: false });
+  const deniedAttempts = [
     await apiRequest(
       identities.guest,
       `/api/games/${encodeURIComponent(main.gameId)}/messages`,
@@ -948,17 +1114,6 @@ async function proveLeaveDenial(localDatabase, main) {
           commandId: nextCommandId("left-send"),
           kind: "phrase",
           contentId: "ready",
-        },
-      },
-    ),
-    await apiRequest(
-      identities.guest,
-      `/api/messages/${encodeURIComponent(messageId)}/report`,
-      {
-        method: "POST",
-        body: {
-          commandId: nextCommandId("left-report"),
-          reason: "harassment",
         },
       },
     ),
@@ -977,15 +1132,18 @@ async function proveLeaveDenial(localDatabase, main) {
       "PUT",
     ),
   ];
-  for (const [index, attempt] of attempts.entries()) {
-    if (index === 2) {
-      assertApiError(attempt, 404, "CHAT_MESSAGE_NOT_FOUND");
-    } else {
-      assertApiError(attempt, 403, "NOT_A_MEMBER");
-    }
+  for (const attempt of deniedAttempts) {
+    assertApiError(attempt, 403, "NOT_A_MEMBER");
   }
-  assert.deepEqual(communicationCounts(localDatabase, main.gameId), before);
-  return { readDenied: true, allMutationsDenied: true, rowsChanged: false };
+  assert.deepEqual(communicationCounts(localDatabase, main.gameId), {
+    ...before,
+    reports: before.reports + 1,
+  });
+  return {
+    feedReadDenied: true,
+    sendAndRelationshipsDenied: true,
+    exactDeliveredMessageReportAccepted: true,
+  };
 }
 
 async function proveGeneralLogRedaction(localDatabase, main) {
@@ -1119,18 +1277,32 @@ function legalTurnCommand(view) {
 
 async function sendMessage(actor, gameId, kind, contentId, label) {
   await waitForActorSendWindow(actor);
-  const response = await apiRequest(
+  const body = {
+    commandId: nextCommandId(label),
+    kind,
+    contentId,
+  };
+  let response = await apiRequest(
     actor,
     `/api/games/${encodeURIComponent(gameId)}/messages`,
     {
       method: "POST",
-      body: {
-        commandId: nextCommandId(label),
-        kind,
-        contentId,
-      },
+      body,
     },
   );
+  if (response.status === 429 && response.body?.error?.code === "RATE_LIMITED") {
+    // The acceptance journey intentionally exercises every phrase/reaction and
+    // multiple safety scenarios with one profile. Cross the fixed one-minute
+    // quota boundary, then retry the exact same idempotency envelope.
+    const nextBucket = Math.floor(Date.now() / 60_000) * 60_000 + 60_000;
+    await delay(Math.min(59_000, Math.max(100, nextBucket - Date.now() + 250)));
+    if (Date.now() <= nextBucket) await delay(nextBucket - Date.now() + 250);
+    response = await apiRequest(
+      actor,
+      `/api/games/${encodeURIComponent(gameId)}/messages`,
+      { method: "POST", body },
+    );
+  }
   assert.equal(response.status, 200, response.raw);
   assertExactKeys(response.body, ["message", "replayed"], "message send");
   assert.equal(response.body.replayed, false);
@@ -1228,7 +1400,7 @@ function assertChatPage(value) {
   assertPlainObject(value.viewer, "chat viewer state");
   assertExactKeys(
     value.viewer,
-    ["mutedPlayerIds", "blockedPlayerIds"],
+    ["mutedPlayerIds", "blockedPlayerIds", "capabilities"],
     "chat viewer state",
   );
   for (const field of ["mutedPlayerIds", "blockedPlayerIds"]) {
@@ -1239,22 +1411,27 @@ function assertChatPage(value) {
       assert.ok(playerId.length > 0 && playerId.length <= 128);
     }
   }
+  assertPlainObject(value.viewer.capabilities, "chat viewer capabilities");
+  assertExactKeys(
+    value.viewer.capabilities,
+    ["freeText", "liveVoice"],
+    "chat viewer capabilities",
+  );
+  assert.equal(typeof value.viewer.capabilities.freeText, "boolean");
+  assert.equal(typeof value.viewer.capabilities.liveVoice, "boolean");
 }
 
 function assertMessageDto(value) {
   assertPlainObject(value, "chat message");
-  assertExactKeys(
-    value,
-    [
-      "contentId",
-      "createdAt",
-      "id",
-      "kind",
-      "senderDisplayName",
-      "senderPlayerId",
-    ],
-    "chat message",
-  );
+  const contentKey = value.kind === "text" ? "body" : "contentId";
+  assertExactKeys(value, [
+    contentKey,
+    "createdAt",
+    "id",
+    "kind",
+    "senderDisplayName",
+    "senderPlayerId",
+  ], "chat message");
   assert.match(value.id, /^[a-f0-9]{32}$/);
   assert.equal(typeof value.senderPlayerId, "string");
   assert.ok(value.senderPlayerId.length > 0 && value.senderPlayerId.length <= 128);
@@ -1262,11 +1439,16 @@ function assertMessageDto(value) {
   assert.ok(
     value.senderDisplayName.length > 0 && value.senderDisplayName.length <= 48,
   );
-  const allowed = value.kind === "phrase" ? phrases : reactions;
-  assert.equal(
-    allowed.some(([contentId]) => contentId === value.contentId),
-    true,
-  );
+  if (value.kind === "text") {
+    assert.equal(typeof value.body, "string");
+    assert.ok(value.body.length > 0 && value.body.length <= 640);
+  } else {
+    const allowed = value.kind === "phrase" ? phrases : reactions;
+    assert.equal(
+      allowed.some(([contentId]) => contentId === value.contentId),
+      true,
+    );
+  }
   assert.equal(Number.isSafeInteger(value.createdAt), true);
   assert.ok(value.createdAt >= 0);
 }
@@ -1446,6 +1628,10 @@ async function openChatBrowsers(main, soloTable) {
     await soloPage.locator("#chat-tab").tap();
     const soloLog = soloPage.getByRole("log", { name: "Table chat" });
     await soloLog.waitFor({ timeout: pollWaitMs });
+    const privateQuickControls = soloPage.locator(".chat-quick-controls");
+    if (await privateQuickControls.count()) {
+      await privateQuickControls.locator("summary").tap();
+    }
     for (const [, label] of phrases) {
       await soloPage
         .getByRole("button", { name: `Send “${label}”` })
@@ -1678,7 +1864,9 @@ async function openChatBrowsers(main, soloTable) {
       const controlCount = await controls.count();
       assert.ok(controlCount >= phrases.length + reactions.length + 2);
       for (let index = 0; index < controlCount; index += 1) {
-        const box = await controls.nth(index).boundingBox();
+        const control = controls.nth(index);
+        if (!(await control.isVisible())) continue;
+        const box = await control.boundingBox();
         if (!box) continue;
         assert.ok(box.height >= 44, `Chat touch target ${index} is shorter than 44px.`);
         assert.ok(box.width >= 44, `Chat touch target ${index} is narrower than 44px.`);
@@ -1742,12 +1930,12 @@ async function waitForGamePage(page) {
 async function ensureSidebarOpen(page) {
   const toggle = page.locator(".sidebar-toggle");
   if (await toggle.isVisible()) {
-    if ((await toggle.getAttribute("aria-expanded")) !== "true") {
+    const panel = page.locator(".sidebar-details-panel.is-open");
+    for (let attempt = 0; attempt < 3 && !(await panel.isVisible()); attempt += 1) {
       await toggle.tap();
+      await delay(120);
     }
-    await page.locator(".sidebar-details-panel.is-open").waitFor({
-      timeout: pollWaitMs,
-    });
+    await panel.waitFor({ timeout: pollWaitMs });
   }
 }
 
@@ -1897,6 +2085,7 @@ async function discoverLocalGameDatabase() {
 function assertCommunicationSchema(localDatabase) {
   for (const table of [
     "game_messages",
+    "game_message_receipts",
     "game_message_reports",
     "game_mutes",
     "profile_blocks",
@@ -1921,15 +2110,26 @@ function assertCommunicationSchema(localDatabase) {
     "sender_display_name",
     "kind",
     "content_id",
+    "body_text",
     "command_id",
     "created_at",
     "expires_at",
   ]) {
     assert.equal(messageColumns.has(column), true, `Missing game_messages.${column}`);
   }
-  assert.equal(messageColumns.has("body"), false);
-  assert.equal(messageColumns.has("text"), false);
-  assert.equal(messageColumns.has("message"), false);
+  const reportColumns = new Set(
+    queryRows(
+      localDatabase,
+      "SELECT name FROM pragma_table_info('game_message_reports')",
+    ).map((row) => row.name),
+  );
+  assert.equal(reportColumns.has("evidence_body_text"), true);
+  const gameColumns = new Set(
+    queryRows(localDatabase, "SELECT name FROM pragma_table_info('games')").map(
+      (row) => row.name,
+    ),
+  );
+  assert.equal(gameColumns.has("communication_scope"), true);
 }
 
 async function apiRequest(actor, pathname, { method, body } = {}) {

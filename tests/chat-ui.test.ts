@@ -5,8 +5,11 @@ import {
   CHAT_PHRASES,
   CHAT_REACTIONS,
   CHAT_REPORT_REASONS,
+  CHAT_TEXT_MAX_GRAPHEMES,
   chatContentPresentation,
+  countChatGraphemes,
   parseChatPage,
+  prepareChatText,
 } from "../app/components/chat-ui";
 
 const MESSAGE = {
@@ -27,6 +30,7 @@ test("chat parser accepts only the exact viewer-safe page contract", () => {
       viewer: {
         mutedPlayerIds: ["22222222-2222-4222-8222-222222222222"],
         blockedPlayerIds: [],
+        capabilities: { freeText: false, liveVoice: false },
       },
     }),
     {
@@ -36,6 +40,7 @@ test("chat parser accepts only the exact viewer-safe page contract", () => {
       viewer: {
         mutedPlayerIds: ["22222222-2222-4222-8222-222222222222"],
         blockedPlayerIds: [],
+        capabilities: { freeText: false, liveVoice: false },
       },
     },
   );
@@ -52,13 +57,76 @@ test("chat parser accepts only the exact viewer-safe page contract", () => {
   );
   assert.equal(
     parseChatPage({
-      messages: [{ ...MESSAGE, profileId: "secret" }],
+      messages: [MESSAGE],
       nextCursor: null,
       serverTime: 1_786_468_001_000,
       viewer: { mutedPlayerIds: [], blockedPlayerIds: [] },
     }),
     null,
   );
+  assert.equal(
+    parseChatPage({
+      messages: [{ ...MESSAGE, profileId: "secret" }],
+      nextCursor: null,
+      serverTime: 1_786_468_001_000,
+      viewer: {
+        mutedPlayerIds: [],
+        blockedPlayerIds: [],
+        capabilities: { freeText: false, liveVoice: false },
+      },
+    }),
+    null,
+  );
+});
+
+test("private capability admits only exact, normalized, bounded text DTOs", () => {
+  const textMessage = {
+    id: "abcdef0123456789abcdef0123456789",
+    senderPlayerId: "22222222-2222-4222-8222-222222222222",
+    senderDisplayName: "Invite Ace",
+    kind: "text",
+    body: "Good luck — have fun!",
+    createdAt: 1_786_468_000_001,
+  } as const;
+  const page = (freeText: boolean, message: unknown) => ({
+    messages: [message],
+    nextCursor: null,
+    serverTime: 1_786_468_001_000,
+    viewer: {
+      mutedPlayerIds: [],
+      blockedPlayerIds: [],
+      capabilities: { freeText, liveVoice: false },
+    },
+  });
+
+  assert.deepEqual(parseChatPage(page(true, textMessage))?.messages, [textMessage]);
+  assert.equal(parseChatPage(page(false, textMessage)), null);
+  assert.equal(parseChatPage(page(true, { ...textMessage, contentId: "nice_play" })), null);
+  assert.equal(parseChatPage(page(true, { ...textMessage, body: " padded " })), null);
+  assert.equal(parseChatPage(page(true, { ...textMessage, body: "line\tbreak" })), null);
+  assert.equal(
+    parseChatPage(page(true, { ...textMessage, body: "x".repeat(CHAT_TEXT_MAX_GRAPHEMES + 1) })),
+    null,
+  );
+  assert.equal(
+    parseChatPage({
+      ...page(true, textMessage),
+      viewer: {
+        mutedPlayerIds: [],
+        blockedPlayerIds: [],
+        capabilities: { freeText: true, liveVoice: false, voice: true },
+      },
+    }),
+    null,
+  );
+});
+
+test("the composer counts graphemes and prepares normalized plain text", () => {
+  assert.equal(countChatGraphemes("👨‍👩‍👧‍👦"), 1);
+  assert.equal(prepareChatText("  hello  "), "hello");
+  assert.equal(prepareChatText("Ａ card"), "A card");
+  assert.equal(prepareChatText("\t"), null);
+  assert.equal(prepareChatText("x".repeat(CHAT_TEXT_MAX_GRAPHEMES + 1)), null);
 });
 
 test("chat parser fails closed for invalid semantic IDs, cursors, and bounds", () => {
@@ -66,7 +134,11 @@ test("chat parser fails closed for invalid semantic IDs, cursors, and bounds", (
     messages: [message],
     nextCursor,
     serverTime: 1_786_468_001_000,
-    viewer: { mutedPlayerIds: [], blockedPlayerIds: [] },
+    viewer: {
+      mutedPlayerIds: [],
+      blockedPlayerIds: [],
+      capabilities: { freeText: false, liveVoice: false },
+    },
   });
   assert.equal(parseChatPage(page({ ...MESSAGE, contentId: "write_anything" })), null);
   assert.equal(parseChatPage(page({ ...MESSAGE, kind: "text" })), null);
@@ -80,7 +152,11 @@ test("chat parser fails closed for invalid semantic IDs, cursors, and bounds", (
       })),
       nextCursor: null,
       serverTime: 1_786_468_001_000,
-      viewer: { mutedPlayerIds: [], blockedPlayerIds: [] },
+      viewer: {
+        mutedPlayerIds: [],
+        blockedPlayerIds: [],
+        capabilities: { freeText: false, liveVoice: false },
+      },
     }),
     null,
   );

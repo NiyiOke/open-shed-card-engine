@@ -1,9 +1,13 @@
 import { GameRuleError } from "../game/errors";
 import { getV15FeaturePolicy } from "./v15-feature-policy";
 
-export const COMMUNICATION_MESSAGE_KINDS = ["phrase", "reaction"] as const;
+export const COMMUNICATION_MESSAGE_KINDS = ["phrase", "reaction", "text"] as const;
 export type CommunicationMessageKind =
   (typeof COMMUNICATION_MESSAGE_KINDS)[number];
+export type CuratedCommunicationMessageKind = Exclude<
+  CommunicationMessageKind,
+  "text"
+>;
 
 export const QUICK_PHRASE_IDS = [
   "your_turn",
@@ -38,6 +42,17 @@ export const REPORT_REASON_IDS = [
 export type ReportReasonId = (typeof REPORT_REASON_IDS)[number];
 
 export type CommunicationContentId = QuickPhraseId | ReactionId;
+export type CuratedCommunicationMessage = Readonly<{
+  kind: CuratedCommunicationMessageKind;
+  contentId: CommunicationContentId;
+}>;
+export type FreeTextCommunicationMessage = Readonly<{
+  kind: "text";
+  body: string;
+}>;
+export type CommunicationMessage =
+  | CuratedCommunicationMessage
+  | FreeTextCommunicationMessage;
 
 export const COMMUNICATION_LIMITS = Object.freeze({
   messageRetentionMs: 24 * 60 * 60_000,
@@ -51,9 +66,20 @@ export const COMMUNICATION_LIMITS = Object.freeze({
   relationshipUserMinuteLimit: 30,
   relationshipRoomMinuteLimit: 120,
   cleanupBatchSize: 128,
+  freeTextGraphemeLimit: 160,
 });
 
 const OPAQUE_ID_PATTERN = /^[a-f0-9]{32}$/;
+const CONTROL_OR_BIDI_PATTERN =
+  /[\p{Cc}\u061c\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/u;
+const URL_PATTERN = /(?:\bhttps?:\/\/|\bwww\.|\b[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)+\b)/iu;
+const OBFUSCATED_URL_PATTERN =
+  /\b(?:dot|period)\s*(?:com|net|org|co|io|gg|me|app|uk)\b/iu;
+const EMAIL_PATTERN =
+  /[\p{L}\p{N}._%+-]+\s*(?:@|\bat\b)\s*[\p{L}\p{N}-]+(?:\s*\.\s*[\p{L}\p{N}-]+)+/iu;
+const PHONE_PATTERN = /(?:\+?\d[\s().-]*){7,}/u;
+const SOCIAL_CONTACT_PATTERN =
+  /(?:@[\p{L}\p{N}_.-]{2,}|\b(?:discord|facebook|instagram|insta|snapchat|telegram|tiktok|twitter|whatsapp)\b\s*(?:[:@-]\s*)?[\p{L}\p{N}_.-]{2,}|\b(?:add|contact|dm|message)\s+me\b)/iu;
 const FREE_TEXT_FIELD_NAMES = new Set([
   "body",
   "caption",
@@ -69,10 +95,7 @@ const FREE_TEXT_FIELD_NAMES = new Set([
 export function parseCommunicationMessage(
   kind: unknown,
   contentId: unknown,
-): {
-  kind: CommunicationMessageKind;
-  contentId: CommunicationContentId;
-} {
+): CuratedCommunicationMessage {
   if (kind !== "phrase" && kind !== "reaction") {
     throw new GameRuleError(
       "INVALID_MESSAGE",
@@ -92,6 +115,31 @@ export function parseCommunicationMessage(
     );
   }
   return { kind, contentId: contentId as CommunicationContentId };
+}
+
+/** Normalizes a private-table message without ever logging or echoing rejected input. */
+export function parseFreeTextMessage(body: unknown): FreeTextCommunicationMessage {
+  if (typeof body !== "string") throw invalidFreeText();
+  const normalized = body.normalize("NFKC");
+  if (CONTROL_OR_BIDI_PATTERN.test(normalized)) throw invalidFreeText();
+  const compact = normalized.replace(/\s+/gu, " ").trim();
+  if (!compact || graphemeCount(compact) > COMMUNICATION_LIMITS.freeTextGraphemeLimit) {
+    throw invalidFreeText();
+  }
+  if (
+    URL_PATTERN.test(compact) ||
+    OBFUSCATED_URL_PATTERN.test(compact) ||
+    EMAIL_PATTERN.test(compact) ||
+    PHONE_PATTERN.test(compact) ||
+    SOCIAL_CONTACT_PATTERN.test(compact)
+  ) {
+    throw new GameRuleError(
+      "CONTACT_DETAILS_NOT_ALLOWED",
+      "Links and contact details are not allowed in table chat.",
+      400,
+    );
+  }
+  return { kind: "text", body: compact };
 }
 
 export function parseReportReason(value: unknown): ReportReasonId {
@@ -161,4 +209,27 @@ export function assertCommunicationEnabled(): void {
       404,
     );
   }
+}
+
+export function assertFreeTextEnabled(): void {
+  if (!getV15FeaturePolicy().freeTextEnabled) {
+    throw new GameRuleError(
+      "FREE_TEXT_DISABLED",
+      "Free-text table messages are not available.",
+      404,
+    );
+  }
+}
+
+function invalidFreeText(): GameRuleError {
+  return new GameRuleError(
+    "INVALID_FREE_TEXT",
+    `Write a message of 1–${COMMUNICATION_LIMITS.freeTextGraphemeLimit} characters without hidden controls.`,
+    400,
+  );
+}
+
+function graphemeCount(value: string): number {
+  const segmenter = new Intl.Segmenter("und", { granularity: "grapheme" });
+  return [...segmenter.segment(value)].length;
 }

@@ -51,6 +51,13 @@ import {
   type RoomCloseReason,
   type RoomStatus,
 } from "./room-lifecycle-policy";
+import {
+  expiredGameLiveVoiceCleanupStatements,
+  guardedCommandLiveVoiceCleanupStatement,
+  guardedEventLiveVoiceCleanupStatement,
+  maybeReconcileLiveVoiceCleanupJobs,
+  reconcileLiveVoiceCleanupJobs,
+} from "./live-voice-cleanup";
 import { getV15FeaturePolicy } from "./v15-feature-policy";
 
 type ProfileRow = {
@@ -704,6 +711,32 @@ export async function mutateGameListing(
       message: "The host listed this table publicly.",
     },
   ];
+  const publicationVoiceCleanupStatements = [
+    ...state.players.map((player) =>
+      guardedCommandLiveVoiceCleanupStatement(
+        database,
+        { kind: "participant", gameId, playerId: player.playerId },
+        {
+          actorProfileId: profile.id,
+          commandId: input.commandId,
+          operation,
+          requestHash,
+          now,
+        },
+      ),
+    ),
+    guardedCommandLiveVoiceCleanupStatement(
+      database,
+      { kind: "room", gameId },
+      {
+        actorProfileId: profile.id,
+        commandId: input.commandId,
+        operation,
+        requestHash,
+        now,
+      },
+    ),
+  ];
 
   try {
     const batch = await database.batch([
@@ -717,6 +750,13 @@ export async function mutateGameListing(
         nextState.revision,
         now,
         input.expectedListingVersion,
+      ),
+      guardedCommunicationScopeDowngradeStatement(
+        database,
+        gameId,
+        profile.id,
+        input.commandId,
+        requestHash,
       ),
       guardedProfileNicknameStatement(
         database,
@@ -759,6 +799,7 @@ export async function mutateGameListing(
         input.commandId,
         requestHash,
       ),
+      ...publicationVoiceCleanupStatements,
       guardedGameUpdateStatement(
         database,
         row,
@@ -886,9 +927,9 @@ export async function createGame(
           .prepare(
             `INSERT INTO games (
               id, join_code, host_profile_id, rules_version, protocol_version,
-              status, version, state_json, state_hash, created_at,
+              status, communication_scope, version, state_json, state_hash, created_at,
               last_activity_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, 'lobby', 0, ?, ?, ?, ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, 'lobby', 'invite_only', 0, ?, ?, ?, ?, ?)`,
           )
           .bind(
             gameId,
@@ -1566,6 +1607,13 @@ async function joinSelectedPublicRoom(
           joinedResult.state.revision,
           now,
         ),
+        guardedCommunicationScopeDowngradeStatement(
+          database,
+          target.id,
+          actorProfileId,
+          commandId,
+          requestHash,
+        ),
         guardedPublicProfileProvisionStatement(
           database,
           actorProfileId,
@@ -2052,17 +2100,17 @@ export async function executeGameCommand(
       .filter((player) => player.status !== "left")
       .map((player) => player.playerId),
   );
-  const departedPlayerIds = current.players
+  const newlyDepartedPlayerIds = current.players
     .filter(
       (player) =>
         player.status !== "left" && !remainingPlayerIds.has(player.playerId),
     )
-    .map((player) => player.playerId)
-    .concat(
-      result.state.players
-        .filter((player) => player.status === "left")
-        .map((player) => player.playerId),
-    );
+    .map((player) => player.playerId);
+  const departedPlayerIds = newlyDepartedPlayerIds.concat(
+    result.state.players
+      .filter((player) => player.status === "left")
+      .map((player) => player.playerId),
+  );
   const presenceCleanupStatements = [...new Set(departedPlayerIds)].map(
     (playerId) =>
       guardedPresenceDeleteStatement(
@@ -2074,6 +2122,41 @@ export async function executeGameCommand(
         requestHash,
       ),
   );
+  const voiceCleanupPlayerIds = new Set(newlyDepartedPlayerIds);
+  if (closesEmptyRoom) {
+    for (const player of [...current.players, ...result.state.players]) {
+      voiceCleanupPlayerIds.add(player.playerId);
+    }
+  }
+  const voiceCleanupStatements = [...voiceCleanupPlayerIds].map(
+    (playerId) =>
+      guardedCommandLiveVoiceCleanupStatement(
+        database,
+        { kind: "participant", gameId, playerId },
+        {
+          actorProfileId: profile.id,
+          commandId,
+          operation,
+          requestHash,
+          now,
+        },
+      ),
+  );
+  if (closesEmptyRoom) {
+    voiceCleanupStatements.push(
+      guardedCommandLiveVoiceCleanupStatement(
+        database,
+        { kind: "room", gameId },
+        {
+          actorProfileId: profile.id,
+          commandId,
+          operation,
+          requestHash,
+          now,
+        },
+      ),
+    );
+  }
 
   try {
     const batch = await database.batch([
@@ -2126,6 +2209,7 @@ export async function executeGameCommand(
       ),
       ...memberStatements,
       ...presenceCleanupStatements,
+      ...voiceCleanupStatements,
       guardedGameUpdateStatement(
         database,
         row,
@@ -3334,6 +3418,37 @@ function guardedHostDiscoveryConsentStatement(
     );
 }
 
+function guardedCommunicationScopeDowngradeStatement(
+  database: D1Database,
+  gameId: string,
+  receiptProfileId: string,
+  commandId: string,
+  requestHash: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `UPDATE games
+       SET communication_scope = CASE
+         WHEN communication_scope = 'invite_only' THEN 'public_safe'
+         ELSE communication_scope
+       END
+       WHERE id = ?
+         AND communication_scope IN ('invite_only', 'public_safe')
+         AND EXISTS (
+           SELECT 1 FROM command_receipts
+           WHERE actor_profile_id = ? AND command_id = ?
+             AND game_id = ? AND request_hash = ?
+         )`,
+    )
+    .bind(
+      gameId,
+      receiptProfileId,
+      commandId,
+      gameId,
+      requestHash,
+    );
+}
+
 function guardedPublishListingStatement(
   database: D1Database,
   gameId: string,
@@ -4189,6 +4304,9 @@ async function maintainRooms(
 ): Promise<void> {
   await maybeMaintainRoomLifecycles(database, now);
   await maybePurgeExpiredGames(database, now);
+  await maybeReconcileLiveVoiceCleanupJobs(database, now).catch(
+    () => undefined,
+  );
 }
 
 async function maybeMaintainRoomLifecycles(
@@ -4504,6 +4622,25 @@ async function closeRoomFromMaintenance(
         commandId,
         stateHash,
       ),
+    ...[
+      ...state.players.map((player) => ({
+        kind: "participant" as const,
+        gameId: row.id,
+        playerId: player.playerId,
+      })),
+      { kind: "room" as const, gameId: row.id },
+    ].map((target) =>
+      guardedEventLiveVoiceCleanupStatement(
+        database,
+        target,
+        {
+          version: state.revision,
+          commandId,
+          stateHash,
+          now,
+        },
+      ),
+    ),
     database
       .prepare(
         `UPDATE games
@@ -4538,6 +4675,10 @@ async function closeRoomFromMaintenance(
   ]);
 
   if ((batch.at(-1)?.meta.changes ?? 0) === 1) {
+    await reconcileLiveVoiceCleanupJobs(database, {
+      gameId: row.id,
+      now,
+    }).catch(() => undefined);
     return;
   }
 }
@@ -4565,6 +4706,7 @@ async function purgeExpiredRows(
   now: number,
 ): Promise<void> {
   await database.batch([
+    ...expiredGameLiveVoiceCleanupStatements(database, now),
     database
       .prepare(
         `DELETE FROM game_message_reports WHERE rowid IN (
@@ -4600,11 +4742,22 @@ async function purgeExpiredRows(
       .bind(now),
     database
       .prepare(
+        `DELETE FROM game_message_receipts WHERE rowid IN (
+          SELECT receipt.rowid FROM game_message_receipts receipt
+          WHERE receipt.expires_at <= ?
+          ORDER BY receipt.expires_at, receipt.game_id,
+                   receipt.received_at, receipt.message_id,
+                   receipt.recipient_profile_id
+          LIMIT 128
+        )`,
+      )
+      .bind(now),
+    database
+      .prepare(
         `DELETE FROM game_messages WHERE rowid IN (
           SELECT message.rowid FROM game_messages message
-          JOIN games g ON g.id = message.game_id
-          WHERE g.expires_at <= ?
-          ORDER BY g.expires_at, message.game_id,
+          WHERE message.expires_at <= ?
+          ORDER BY message.expires_at, message.game_id,
                    message.created_at, message.id
           LIMIT 128
         )`,
@@ -4670,6 +4823,10 @@ async function purgeExpiredRows(
             AND NOT EXISTS (
               SELECT 1 FROM game_messages message
               WHERE message.game_id = g.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM game_message_receipts receipt
+              WHERE receipt.game_id = g.id
             )
             AND NOT EXISTS (
               SELECT 1 FROM game_mutes mute

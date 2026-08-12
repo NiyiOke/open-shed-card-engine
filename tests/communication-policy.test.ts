@@ -7,6 +7,7 @@ import {
   createOpaqueCommunicationId,
   hasRecognizedFreeTextField,
   parseCommunicationMessage,
+  parseFreeTextMessage,
   parseReportReason,
   QUICK_PHRASE_IDS,
   REACTION_IDS,
@@ -15,7 +16,7 @@ import {
 } from "../lib/server/communication-policy";
 
 test("safe communication allowlists are exact and stable", () => {
-  assert.deepEqual(COMMUNICATION_MESSAGE_KINDS, ["phrase", "reaction"]);
+  assert.deepEqual(COMMUNICATION_MESSAGE_KINDS, ["phrase", "reaction", "text"]);
   assert.deepEqual(QUICK_PHRASE_IDS, [
     "your_turn",
     "nice_play",
@@ -42,6 +43,54 @@ test("safe communication allowlists are exact and stable", () => {
     "cheating",
     "other",
   ]);
+});
+
+test("private-table text is NFKC-normalized and grapheme bounded", () => {
+  assert.deepEqual(parseFreeTextMessage("  Ｎｉｃｅ   play 👨‍👩‍👧‍👦  "), {
+    kind: "text",
+    body: "Nice play 👨‍👩‍👧‍👦",
+  });
+  assert.equal(
+    parseFreeTextMessage("👍🏽".repeat(160)).body,
+    "👍🏽".repeat(160),
+  );
+  for (const body of [
+    null,
+    "",
+    "   ",
+    "hello\nworld",
+    "hidden\u202eorder",
+    "a".repeat(161),
+    "👍🏽".repeat(161),
+  ]) {
+    assert.throws(
+      () => parseFreeTextMessage(body),
+      (error: unknown) =>
+        error instanceof GameRuleError && error.code === "INVALID_FREE_TEXT",
+    );
+  }
+});
+
+test("private-table text rejects links and off-platform contact details", () => {
+  for (const body of [
+    "https://example.com/table",
+    "visit www.example.com",
+    "example dot com",
+    "email me@example.com",
+    "email me at example.co.uk",
+    "call +44 (0) 7700 900123",
+    "Discord: card_player",
+    "@card_player",
+    "DM me",
+  ]) {
+    assert.throws(
+      () => parseFreeTextMessage(body),
+      (error: unknown) =>
+        error instanceof GameRuleError &&
+        error.code === "CONTACT_DETAILS_NOT_ALLOWED",
+      body,
+    );
+  }
 });
 
 test("message content IDs are bound to their declared kind", () => {
@@ -119,6 +168,7 @@ test("retention, paging, and rate limits remain bounded", () => {
   assert.equal(COMMUNICATION_LIMITS.messageCooldownMs, 2_000);
   assert.equal(COMMUNICATION_LIMITS.messageUserMinuteLimit, 10);
   assert.equal(COMMUNICATION_LIMITS.messageRoomMinuteLimit, 60);
+  assert.equal(COMMUNICATION_LIMITS.freeTextGraphemeLimit, 160);
   assert.ok(COMMUNICATION_LIMITS.reportUserHourLimit > 0);
   assert.ok(COMMUNICATION_LIMITS.reportRoomHourLimit >= 6);
 });

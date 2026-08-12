@@ -25,7 +25,14 @@ test("all communication routes fail closed before parsing request bodies", () =>
   }
 });
 
-test("message route accepts only the exact curated send envelope", () => {
+test("message route accepts only exact discriminated send envelopes", () => {
+  assert.match(MESSAGE_ROUTE, /body\.kind === "text"/u);
+  assert.match(MESSAGE_ROUTE, /assertFreeTextEnabled\(\)/u);
+  assert.match(
+    MESSAGE_ROUTE,
+    /assertExactJsonKeys\([\s\S]*\["commandId", "kind", "body"\][\s\S]*"INVALID_MESSAGE"/u,
+  );
+  assert.match(MESSAGE_ROUTE, /parseFreeTextMessage\(body\.body\)/u);
   assert.match(
     MESSAGE_ROUTE,
     /hasRecognizedFreeTextField\(body, \["commandId", "kind", "contentId"\]\)/u,

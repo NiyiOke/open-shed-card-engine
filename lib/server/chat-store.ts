@@ -3,23 +3,38 @@ import { GameRuleError, requireRule } from "../game/errors";
 import type { GameState, PlayerState } from "../game/types";
 import type { AuthenticatedUser } from "./auth";
 import {
+  guardedBlockLiveVoiceCleanupStatement,
+  reconcileLiveVoiceCleanupForGame,
+} from "./live-voice-cleanup";
+import { getLiveVoiceProviderConfig } from "./live-voice-provider";
+import {
   assertCommunicationEnabled,
+  assertFreeTextEnabled,
   COMMUNICATION_LIMITS,
   createOpaqueCommunicationId,
   parseCommunicationMessage,
+  parseFreeTextMessage,
   type CommunicationContentId,
-  type CommunicationMessageKind,
+  type CommunicationMessage,
+  type CuratedCommunicationMessageKind,
   type ReportReasonId,
 } from "./communication-policy";
+import { getV15FeaturePolicy } from "./v15-feature-policy";
 
-export type TableMessage = Readonly<{
+type TableMessageBase = Readonly<{
   id: string;
   senderPlayerId: string;
   senderDisplayName: string;
-  kind: CommunicationMessageKind;
-  contentId: CommunicationContentId;
   createdAt: number;
 }>;
+
+export type TableMessage =
+  | (TableMessageBase &
+      Readonly<{
+        kind: CuratedCommunicationMessageKind;
+        contentId: CommunicationContentId;
+      }>)
+  | (TableMessageBase & Readonly<{ kind: "text"; body: string }>);
 
 export type TableMessagePage = Readonly<{
   messages: TableMessage[];
@@ -28,6 +43,10 @@ export type TableMessagePage = Readonly<{
   viewer: Readonly<{
     mutedPlayerIds: string[];
     blockedPlayerIds: string[];
+    capabilities: Readonly<{
+      freeText: boolean;
+      liveVoice: boolean;
+    }>;
   }>;
 }>;
 
@@ -45,6 +64,7 @@ type MemberGameRow = {
   id: string;
   state_json: string;
   room_status: string;
+  communication_scope: string;
   expires_at: number;
   profile_id: string | null;
   membership_status: string | null;
@@ -55,6 +75,7 @@ type CurrentMemberContext = {
   profileId: string;
   state: GameState;
   player: PlayerState;
+  communicationScope: string;
 };
 
 type TargetMember = {
@@ -70,6 +91,7 @@ type MessageRow = {
   sender_display_name: string;
   kind: string;
   content_id: string;
+  body_text: string | null;
   command_id: string;
   created_at: number;
   expires_at: number;
@@ -105,7 +127,6 @@ type ReportReplayRow = {
 
 type ReportTargetRow = MessageRow & {
   reporter_profile_id: string;
-  state_json: string;
 };
 
 type ViewerSafetyRow = {
@@ -114,6 +135,11 @@ type ViewerSafetyRow = {
   viewer_muted: number;
   viewer_blocked: number;
 };
+
+type ViewerSafetyState = Readonly<{
+  mutedPlayerIds: string[];
+  blockedPlayerIds: string[];
+}>;
 
 type QuotaRule = {
   scope: string;
@@ -138,6 +164,12 @@ export async function listTableMessages(
   const now = Date.now();
   await maybeCleanupCommunication(database, now);
   const viewer = await requireCurrentMember(database, user, gameId, now);
+  const privateCommunicationAvailable =
+    await isInviteOnlyCommunicationAvailable(database, viewer);
+  const freeTextAvailable =
+    getV15FeaturePolicy().freeTextEnabled && privateCommunicationAvailable;
+  const liveVoiceAvailable =
+    privateCommunicationAvailable && getLiveVoiceProviderConfig() !== null;
   const cursorRow = cursor
     ? await requireCursor(database, gameId, cursor)
     : null;
@@ -146,7 +178,8 @@ export async function listTableMessages(
     ? database.prepare(
         `SELECT message.id, message.game_id, message.sender_profile_id,
                 message.sender_player_id, message.sender_display_name,
-                message.kind, message.content_id, message.command_id,
+                message.kind, message.content_id, message.body_text,
+                message.command_id,
                 message.created_at, message.expires_at,
                 EXISTS (
                   SELECT 1 FROM game_mutes mute
@@ -170,6 +203,7 @@ export async function listTableMessages(
           AND sender.profile_id = message.sender_profile_id
           AND sender.status <> 'left'
          WHERE message.game_id = ? AND message.expires_at > ?
+           AND (? = 1 OR message.kind <> 'text')
            AND (
              message.created_at > ?
              OR (message.created_at = ? AND message.id > ?)
@@ -183,6 +217,7 @@ export async function listTableMessages(
           viewer.profileId,
           gameId,
           now,
+          freeTextAvailable ? 1 : 0,
           cursorRow.created_at,
           cursorRow.created_at,
           cursorRow.id,
@@ -191,7 +226,8 @@ export async function listTableMessages(
     : database.prepare(
         `SELECT message.id, message.game_id, message.sender_profile_id,
                 message.sender_player_id, message.sender_display_name,
-                message.kind, message.content_id, message.command_id,
+                message.kind, message.content_id, message.body_text,
+                message.command_id,
                 message.created_at, message.expires_at,
                 EXISTS (
                   SELECT 1 FROM game_mutes mute
@@ -215,6 +251,7 @@ export async function listTableMessages(
           AND sender.profile_id = message.sender_profile_id
           AND sender.status <> 'left'
          WHERE message.game_id = ? AND message.expires_at > ?
+           AND (? = 1 OR message.kind <> 'text')
          ORDER BY message.created_at, message.id
          LIMIT ?`,
       ).bind(
@@ -223,22 +260,37 @@ export async function listTableMessages(
         viewer.profileId,
         gameId,
         now,
+        freeTextAvailable ? 1 : 0,
         COMMUNICATION_LIMITS.messageScanLimit,
       );
 
   const scanned = await query.all<ScannedMessageRow>();
   const safety = await readViewerSafetyState(database, viewer);
+  const visibleRows = scanned.results.filter(
+    (message) =>
+      Number(message.viewer_muted) === 0 &&
+      Number(message.pair_blocked) === 0,
+  );
+  const messages = visibleRows.map(messageDto);
+  await recordMessageReceipts(
+    database,
+    user,
+    viewer,
+    visibleRows,
+    now,
+    freeTextAvailable,
+  );
   return {
-    messages: scanned.results
-      .filter(
-        (message) =>
-          Number(message.viewer_muted) === 0 &&
-          Number(message.pair_blocked) === 0,
-      )
-      .map(messageDto),
+    messages,
     nextCursor: scanned.results.at(-1)?.id ?? cursor,
     serverTime: now,
-    viewer: safety,
+    viewer: {
+      ...safety,
+      capabilities: {
+        freeText: freeTextAvailable,
+        liveVoice: liveVoiceAvailable,
+      },
+    },
   };
 }
 
@@ -246,11 +298,14 @@ export async function sendTableMessage(
   user: AuthenticatedUser,
   gameId: string,
   commandId: string,
-  kind: CommunicationMessageKind,
-  contentId: CommunicationContentId,
+  message: CommunicationMessage,
 ): Promise<SendTableMessageResult> {
   assertCommunicationEnabled();
-  const normalized = parseCommunicationMessage(kind, contentId);
+  const normalized =
+    message.kind === "text"
+      ? parseFreeTextMessage(message.body)
+      : parseCommunicationMessage(message.kind, message.contentId);
+  if (normalized.kind === "text") assertFreeTextEnabled();
   const database = await ensureDatabaseSchema();
   const now = Date.now();
   await maybeCleanupCommunication(database, now);
@@ -260,7 +315,9 @@ export async function sendTableMessage(
       operation: MESSAGE_OPERATION,
       gameId,
       kind: normalized.kind,
-      contentId: normalized.contentId,
+      ...(normalized.kind === "text"
+        ? { body: normalized.body }
+        : { contentId: normalized.contentId }),
     }),
   );
 
@@ -272,6 +329,9 @@ export async function sendTableMessage(
   if (existingReceipt) {
     assertReceipt(existingReceipt, MESSAGE_OPERATION, requestHash, gameId);
     return replayMessage(database, actor.profileId, commandId, now);
+  }
+  if (normalized.kind === "text") {
+    await requireFreeTextAvailable(database, actor);
   }
 
   await enforceCommunicationQuota(database, now, [
@@ -308,6 +368,18 @@ export async function sendTableMessage(
              AND member.status <> 'left'
             WHERE game.id = ? AND profile.auth_subject = ?
               AND game.room_status = 'open' AND game.expires_at > ?
+              AND (
+                ? = 0 OR (
+                  game.communication_scope = 'invite_only'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM game_members communication_member
+                    WHERE communication_member.game_id = game.id
+                      AND communication_member.status <> 'left'
+                      AND COALESCE(communication_member.join_source, '')
+                        NOT IN ('host', 'invite')
+                  )
+                )
+              )
               AND NOT EXISTS (
                 SELECT 1 FROM game_messages recent
                 WHERE recent.game_id = game.id
@@ -327,6 +399,7 @@ export async function sendTableMessage(
           gameId,
           user.userId,
           now,
+          normalized.kind === "text" ? 1 : 0,
           now - COMMUNICATION_LIMITS.messageCooldownMs,
         ),
       database
@@ -334,9 +407,9 @@ export async function sendTableMessage(
           `INSERT INTO game_messages (
             id, game_id, sender_profile_id, sender_player_id,
             sender_display_name, kind, content_id, command_id,
-            created_at, expires_at
+            body_text, created_at, expires_at
           )
-          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
           WHERE EXISTS (
             SELECT 1 FROM command_receipts
             WHERE actor_profile_id = ? AND command_id = ?
@@ -350,8 +423,9 @@ export async function sendTableMessage(
           actor.player.playerId,
           actor.player.displayName,
           normalized.kind,
-          normalized.contentId,
+          normalized.kind === "text" ? "" : normalized.contentId,
           commandId,
+          normalized.kind === "text" ? normalized.body : null,
           now,
           expiresAt,
           actor.profileId,
@@ -389,7 +463,10 @@ export async function sendTableMessage(
     assertReceipt(racedReceipt, MESSAGE_OPERATION, requestHash, gameId);
     return replayMessage(database, actor.profileId, commandId, now);
   }
-  await requireCurrentMember(database, user, gameId, now);
+  const currentActor = await requireCurrentMember(database, user, gameId, now);
+  if (normalized.kind === "text") {
+    await requireFreeTextAvailable(database, currentActor);
+  }
   throw rateLimited();
 }
 
@@ -427,7 +504,7 @@ export async function reportTableMessage(
     await requireReportReplayAccess(
       database,
       user,
-      existingReport.game_id,
+      existingReport.message_id,
       now,
     );
     return { received: true, replayed: true };
@@ -499,16 +576,27 @@ export async function reportTableMessage(
           )
           SELECT ?, ?, message.game_id, ?, ?, 0, ?
           FROM game_messages message
-          JOIN games game ON game.id = message.game_id
-          JOIN game_members viewer
-            ON viewer.game_id = message.game_id
-           AND viewer.profile_id = ?
-           AND viewer.status <> 'left'
-          JOIN profiles profile ON profile.id = viewer.profile_id
+          JOIN profiles profile ON profile.id = ? AND profile.auth_subject = ?
           WHERE message.id = ? AND message.expires_at > ?
-            AND game.room_status = 'open' AND game.expires_at > ?
-            AND profile.auth_subject = ?
-            AND message.sender_profile_id <> viewer.profile_id`,
+            AND message.sender_profile_id <> profile.id
+            AND (
+              EXISTS (
+                SELECT 1
+                FROM games game
+                JOIN game_members viewer
+                  ON viewer.game_id = game.id
+                 AND viewer.profile_id = profile.id
+                 AND viewer.status <> 'left'
+                WHERE game.id = message.game_id
+                  AND game.room_status = 'open' AND game.expires_at > ?
+              ) OR EXISTS (
+                SELECT 1 FROM game_message_receipts receipt
+                WHERE receipt.game_id = message.game_id
+                  AND receipt.message_id = message.id
+                  AND receipt.recipient_profile_id = profile.id
+                  AND receipt.expires_at > ?
+              )
+            )`,
         )
         .bind(
           target.reporter_profile_id,
@@ -517,10 +605,11 @@ export async function reportTableMessage(
           requestHash,
           now,
           target.reporter_profile_id,
+          user.userId,
           messageId,
           now,
           now,
-          user.userId,
+          now,
         ),
       database
         .prepare(
@@ -528,13 +617,13 @@ export async function reportTableMessage(
             id, game_id, message_id, reporter_profile_id,
             reported_profile_id, evidence_sender_player_id,
             evidence_sender_display_name, evidence_kind,
-            evidence_content_id, evidence_created_at, reason,
+            evidence_content_id, evidence_body_text, evidence_created_at, reason,
             moderation_state, command_id, created_at, expires_at
           )
           SELECT ?, message.game_id, message.id, ?,
                  message.sender_profile_id, message.sender_player_id,
                  message.sender_display_name, message.kind,
-                 message.content_id, message.created_at, ?,
+                 message.content_id, message.body_text, message.created_at, ?,
                  'pending', ?, ?, ?
           FROM game_messages message
           WHERE message.id = ? AND message.expires_at > ?
@@ -622,6 +711,7 @@ export async function setProfileBlock(
   blocked: boolean,
 ): Promise<{ blocked: boolean }> {
   await setSafetyRelationship(user, gameId, targetPlayerId, "block", blocked);
+  if (blocked) await reconcileLiveVoiceCleanupForGame(gameId);
   return { blocked };
 }
 
@@ -656,6 +746,15 @@ export async function cleanupExpiredCommunicationRows(
       ),
     database
       .prepare(
+        `DELETE FROM game_message_receipts WHERE rowid IN (
+          SELECT rowid FROM game_message_receipts
+          WHERE expires_at <= ?
+          ORDER BY expires_at, recipient_profile_id, message_id LIMIT ?
+        )`,
+      )
+      .bind(now, COMMUNICATION_LIMITS.cleanupBatchSize),
+    database
+      .prepare(
         `DELETE FROM command_receipts WHERE rowid IN (
           SELECT rowid FROM command_receipts
           WHERE operation = ? AND created_at <= ?
@@ -677,6 +776,104 @@ export async function cleanupExpiredCommunicationRows(
       )
       .bind(now, COMMUNICATION_LIMITS.cleanupBatchSize),
   ]);
+}
+
+async function isInviteOnlyCommunicationAvailable(
+  database: D1Database,
+  viewer: CurrentMemberContext,
+): Promise<boolean> {
+  if (viewer.communicationScope !== "invite_only") return false;
+  const invalidMember = await database
+    .prepare(
+      `SELECT 1 AS present
+       FROM game_members
+       WHERE game_id = ? AND status <> 'left'
+         AND COALESCE(join_source, '') NOT IN ('host', 'invite')
+       LIMIT 1`,
+    )
+    .bind(viewer.gameId)
+    .first<{ present: number }>();
+  return !invalidMember;
+}
+
+async function requireFreeTextAvailable(
+  database: D1Database,
+  viewer: CurrentMemberContext,
+): Promise<void> {
+  assertFreeTextEnabled();
+  requireRule(
+    await isInviteOnlyCommunicationAvailable(database, viewer),
+    "FREE_TEXT_UNAVAILABLE",
+    "Free-text chat is available only at private invite-only tables.",
+    403,
+  );
+}
+
+async function recordMessageReceipts(
+  database: D1Database,
+  user: AuthenticatedUser,
+  viewer: CurrentMemberContext,
+  messages: ScannedMessageRow[],
+  now: number,
+  freeTextAvailable: boolean,
+): Promise<void> {
+  const received = messages.filter(
+    (message) => message.sender_profile_id !== viewer.profileId,
+  );
+  if (!received.length) return;
+  await database.batch(
+    received.map((message) =>
+      database
+        .prepare(
+          `INSERT OR IGNORE INTO game_message_receipts (
+             game_id, message_id, recipient_profile_id, received_at, expires_at
+           )
+           SELECT message.game_id, message.id, recipient.id, ?, message.expires_at
+           FROM game_messages message
+           JOIN games game ON game.id = message.game_id
+           JOIN profiles recipient ON recipient.id = ? AND recipient.auth_subject = ?
+           JOIN game_members recipient_member
+             ON recipient_member.game_id = message.game_id
+            AND recipient_member.profile_id = recipient.id
+            AND recipient_member.status <> 'left'
+           JOIN game_members sender_member
+             ON sender_member.game_id = message.game_id
+            AND sender_member.profile_id = message.sender_profile_id
+            AND sender_member.status <> 'left'
+           WHERE message.id = ? AND message.game_id = ?
+             AND message.expires_at > ?
+             AND game.room_status = 'open' AND game.expires_at > ?
+             AND message.sender_profile_id <> recipient.id
+             AND (? = 1 OR message.kind <> 'text')
+             AND NOT EXISTS (
+               SELECT 1 FROM game_mutes mute
+               WHERE mute.game_id = message.game_id
+                 AND mute.muter_profile_id = recipient.id
+                 AND mute.muted_profile_id = message.sender_profile_id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM profile_blocks block
+               WHERE (
+                 block.blocker_profile_id = recipient.id
+                 AND block.blocked_profile_id = message.sender_profile_id
+               ) OR (
+                 block.blocker_profile_id = message.sender_profile_id
+                 AND block.blocked_profile_id = recipient.id
+               )
+             )`,
+        )
+        .bind(
+          now,
+          viewer.profileId,
+          user.userId,
+          message.id,
+          viewer.gameId,
+          now,
+          now,
+          freeTextAvailable ? 1 : 0,
+        ),
+    ),
+  );
 }
 
 async function setSafetyRelationship(
@@ -710,7 +907,26 @@ async function setSafetyRelationship(
     target.profileId,
     relationship,
   );
-  if (currentlyEnabled === enabled) return;
+  const voiceCleanupStatements = relationship === "block" && enabled
+    ? [actor.player.playerId, target.player.playerId].map((playerId) =>
+        guardedBlockLiveVoiceCleanupStatement(
+          database,
+          { kind: "participant", gameId, playerId },
+          {
+            blockerProfileId: actor.profileId,
+            blockedProfileId: target.profileId,
+            blockerAuthSubject: user.userId,
+            now,
+          },
+        )
+      )
+    : [];
+  if (currentlyEnabled === enabled) {
+    if (voiceCleanupStatements.length) {
+      await database.batch(voiceCleanupStatements);
+    }
+    return;
+  }
   await enforceCommunicationQuota(database, now, [
     {
       scope: `user:${actor.profileId}:chat-safety`,
@@ -733,7 +949,11 @@ async function setSafetyRelationship(
     now,
     user.userId,
   );
-  await statement.run();
+  if (voiceCleanupStatements.length) {
+    await database.batch([statement, ...voiceCleanupStatements]);
+  } else {
+    await statement.run();
+  }
 
   await requireCurrentMember(database, user, gameId, now);
   await requireTargetMember(database, actor, targetPlayerId);
@@ -882,7 +1102,8 @@ async function requireCurrentMember(
 ): Promise<CurrentMemberContext> {
   const row = await database
     .prepare(
-      `SELECT game.id, game.state_json, game.room_status, game.expires_at,
+      `SELECT game.id, game.state_json, game.room_status,
+              game.communication_scope, game.expires_at,
               profile.id AS profile_id, member.status AS membership_status
        FROM games game
        LEFT JOIN profiles profile ON profile.auth_subject = ?
@@ -922,32 +1143,55 @@ async function requireCurrentMember(
     "You are not a current member of this game.",
     403,
   );
-  return { gameId, profileId: row.profile_id, state, player };
+  return {
+    gameId,
+    profileId: row.profile_id,
+    state,
+    player,
+    communicationScope: row.communication_scope,
+  };
 }
 
 async function requireReportReplayAccess(
   database: D1Database,
   user: AuthenticatedUser,
-  gameId: string,
+  messageId: string,
   now: number,
 ): Promise<void> {
-  try {
-    await requireCurrentMember(database, user, gameId, now);
-  } catch (error) {
-    if (
-      error instanceof GameRuleError &&
-      ["GAME_NOT_FOUND", "ROOM_CLOSED", "GAME_EXPIRED", "NOT_A_MEMBER"].includes(
-        error.code,
-      )
-    ) {
-      throw new GameRuleError(
-        "CHAT_MESSAGE_NOT_FOUND",
-        "That message is no longer available.",
-        404,
-      );
-    }
-    throw error;
-  }
+  const row = await database
+    .prepare(
+      `SELECT 1 AS present
+       FROM game_messages message
+       JOIN profiles profile ON profile.auth_subject = ?
+       WHERE message.id = ? AND message.expires_at > ?
+         AND (
+           EXISTS (
+             SELECT 1
+             FROM games game
+             JOIN game_members member
+               ON member.game_id = game.id
+              AND member.profile_id = profile.id
+              AND member.status <> 'left'
+             WHERE game.id = message.game_id
+               AND game.room_status = 'open' AND game.expires_at > ?
+           ) OR EXISTS (
+             SELECT 1 FROM game_message_receipts receipt
+             WHERE receipt.game_id = message.game_id
+               AND receipt.message_id = message.id
+               AND receipt.recipient_profile_id = profile.id
+               AND receipt.expires_at > ?
+           )
+         )
+       LIMIT 1`,
+    )
+    .bind(user.userId, messageId, now, now, now)
+    .first<{ present: number }>();
+  requireRule(
+    row,
+    "CHAT_MESSAGE_NOT_FOUND",
+    "That message is no longer available.",
+    404,
+  );
 }
 
 async function requireTargetMember(
@@ -994,33 +1238,37 @@ async function resolveReportTarget(
     .prepare(
       `SELECT message.id, message.game_id, message.sender_profile_id,
               message.sender_player_id, message.sender_display_name,
-              message.kind, message.content_id, message.command_id,
+              message.kind, message.content_id, message.body_text,
+              message.command_id,
               message.created_at, message.expires_at,
-              viewer_profile.id AS reporter_profile_id, game.state_json
+              viewer_profile.id AS reporter_profile_id
        FROM game_messages message
-       JOIN games game ON game.id = message.game_id
        JOIN profiles viewer_profile ON viewer_profile.auth_subject = ?
-       JOIN game_members viewer_member
-         ON viewer_member.game_id = message.game_id
-        AND viewer_member.profile_id = viewer_profile.id
-        AND viewer_member.status <> 'left'
        WHERE message.id = ? AND message.expires_at > ?
-         AND game.room_status = 'open' AND game.expires_at > ?
+         AND (
+           EXISTS (
+             SELECT 1
+             FROM games game
+             JOIN game_members viewer_member
+               ON viewer_member.game_id = game.id
+              AND viewer_member.profile_id = viewer_profile.id
+              AND viewer_member.status <> 'left'
+             WHERE game.id = message.game_id
+               AND game.room_status = 'open' AND game.expires_at > ?
+           ) OR EXISTS (
+             SELECT 1 FROM game_message_receipts receipt
+             WHERE receipt.game_id = message.game_id
+               AND receipt.message_id = message.id
+               AND receipt.recipient_profile_id = viewer_profile.id
+               AND receipt.expires_at > ?
+           )
+         )
        LIMIT 1`,
     )
-    .bind(actorUserId, messageId, now, now)
+    .bind(actorUserId, messageId, now, now, now)
     .first<ReportTargetRow>();
   requireRule(
     row,
-    "CHAT_MESSAGE_NOT_FOUND",
-    "That message is no longer available.",
-    404,
-  );
-  const state = parseStoredState(row.state_json);
-  requireRule(
-    state.players.some(
-      (player) => player.userId === actorUserId && player.status !== "left",
-    ),
     "CHAT_MESSAGE_NOT_FOUND",
     "That message is no longer available.",
     404,
@@ -1031,7 +1279,7 @@ async function resolveReportTarget(
 async function readViewerSafetyState(
   database: D1Database,
   viewer: CurrentMemberContext,
-): Promise<TableMessagePage["viewer"]> {
+): Promise<ViewerSafetyState> {
   const rows = await database
     .prepare(
       `SELECT member.profile_id, profile.auth_subject,
@@ -1123,7 +1371,7 @@ async function findMessageByCommand(
   return database
     .prepare(
       `SELECT id, game_id, sender_profile_id, sender_player_id,
-              sender_display_name, kind, content_id, command_id,
+              sender_display_name, kind, content_id, body_text, command_id,
               created_at, expires_at
        FROM game_messages
        WHERE sender_profile_id = ? AND command_id = ? LIMIT 1`,
@@ -1245,9 +1493,35 @@ function parseStoredState(value: string): GameState {
 }
 
 function messageDto(row: MessageRow): TableMessage {
-  let normalized: ReturnType<typeof parseCommunicationMessage>;
+  const base = {
+    id: row.id,
+    senderPlayerId: row.sender_player_id,
+    senderDisplayName: row.sender_display_name,
+    createdAt: Number(row.created_at),
+  };
   try {
-    normalized = parseCommunicationMessage(row.kind, row.content_id);
+    if (row.kind === "text") {
+      requireRule(
+        row.content_id === "" && row.body_text !== null,
+        "CORRUPT_MESSAGE",
+        "Stored table communication is invalid.",
+        500,
+      );
+      const normalized = parseFreeTextMessage(row.body_text);
+      return { ...base, kind: "text", body: normalized.body };
+    }
+    requireRule(
+      row.body_text === null,
+      "CORRUPT_MESSAGE",
+      "Stored table communication is invalid.",
+      500,
+    );
+    const normalized = parseCommunicationMessage(row.kind, row.content_id);
+    return {
+      ...base,
+      kind: normalized.kind,
+      contentId: normalized.contentId,
+    };
   } catch {
     throw new GameRuleError(
       "CORRUPT_MESSAGE",
@@ -1255,14 +1529,6 @@ function messageDto(row: MessageRow): TableMessage {
       500,
     );
   }
-  return {
-    id: row.id,
-    senderPlayerId: row.sender_player_id,
-    senderDisplayName: row.sender_display_name,
-    kind: normalized.kind,
-    contentId: normalized.contentId,
-    createdAt: Number(row.created_at),
-  };
 }
 
 async function maybeCleanupCommunication(
@@ -1273,9 +1539,11 @@ async function maybeCleanupCommunication(
   if (now - lastCleanupAt < COMMUNICATION_CLEANUP_INTERVAL_MS) return;
   lastCleanupAt = now;
   cleanupPromise = cleanupExpiredCommunicationRows(database, now)
-    .catch((error) => {
+    .catch(() => {
       lastCleanupAt = 0;
-      throw error;
+      // Retention maintenance is best-effort on the request path. A transient
+      // D1 cleanup failure must not take down an otherwise valid chat read,
+      // send, report, mute, or block operation; the next request retries it.
     })
     .finally(() => {
       cleanupPromise = null;

@@ -14,6 +14,7 @@ import {
   requireCommandId,
   routeErrorResponse,
 } from "../../../../../lib/server/responses";
+import { reconcileLiveVoiceCleanupForGame } from "../../../../../lib/server/live-voice-cleanup";
 
 type RouteContext = { params: Promise<{ gameId: string }> };
 
@@ -90,7 +91,9 @@ export async function POST(request: Request, context: RouteContext) {
         expectedListingVersion: expectedListingVersion as number,
       };
     }
-    return jsonResponse(await mutateGameListing(user, gameId, input));
+    const result = await mutateGameListing(user, gameId, input);
+    if (action === "publish") await reconcileLiveVoiceCleanupForGame(gameId);
+    return jsonResponse(result);
   } catch (error) {
     return routeErrorResponse(error);
   }
