@@ -1014,6 +1014,35 @@ export async function createGame(
             ) VALUES (?, ?, ?, ?, ?, 0, ?)`,
           )
           .bind(profile.id, commandId, gameId, operation, requestHash, now),
+        database
+          .prepare(
+            `UPDATE lobby_invitations
+             SET state = 'expired', pending_key = NULL, responded_at = ?
+             WHERE recipient_profile_id = ? AND state = 'pending'
+               AND EXISTS (
+                 SELECT 1 FROM command_receipts receipt
+                 WHERE receipt.actor_profile_id = ? AND receipt.command_id = ?
+                   AND receipt.game_id = ? AND receipt.request_hash = ?
+               )`,
+          )
+          .bind(
+            now,
+            profile.id,
+            profile.id,
+            commandId,
+            gameId,
+            requestHash,
+          ),
+        database
+          .prepare(
+            `DELETE FROM lobby_presence
+             WHERE profile_id = ? AND EXISTS (
+               SELECT 1 FROM command_receipts receipt
+               WHERE receipt.actor_profile_id = ? AND receipt.command_id = ?
+                 AND receipt.game_id = ? AND receipt.request_hash = ?
+             )`,
+          )
+          .bind(profile.id, profile.id, commandId, gameId, requestHash),
       ]);
       return projectStoredGameForUser(database, state, user.userId, now);
     } catch (error) {
@@ -1199,6 +1228,21 @@ export async function joinGame(
             commandId,
             requestHash,
           ),
+          guardedLobbyPresenceExpireStatement(
+            database,
+            profile.id,
+            now,
+            commandId,
+            requestHash,
+            row.id,
+          ),
+          guardedLobbyPresenceDeleteStatement(
+            database,
+            profile.id,
+            commandId,
+            requestHash,
+            row.id,
+          ),
         ]);
       } catch (error) {
         const receipt = await findCommandReceipt(database, profile.id, commandId);
@@ -1306,6 +1350,21 @@ export async function joinGame(
           profile.id,
           commandId,
           requestHash,
+        ),
+        guardedLobbyPresenceExpireStatement(
+          database,
+          profile.id,
+          now,
+          commandId,
+          requestHash,
+          row.id,
+        ),
+        guardedLobbyPresenceDeleteStatement(
+          database,
+          profile.id,
+          commandId,
+          requestHash,
+          row.id,
         ),
         guardedGameUpdateStatement(
           database,
@@ -1704,6 +1763,21 @@ async function joinSelectedPublicRoom(
           actorProfileId,
           commandId,
           requestHash,
+        ),
+        guardedLobbyPresenceExpireStatement(
+          database,
+          actorProfileId,
+          now,
+          commandId,
+          requestHash,
+          target.id,
+        ),
+        guardedLobbyPresenceDeleteStatement(
+          database,
+          actorProfileId,
+          commandId,
+          requestHash,
+          target.id,
         ),
         guardedGameUpdateStatement(
           database,
@@ -4316,6 +4390,54 @@ function guardedPresenceDeleteStatement(
       gameId,
       requestHash,
     );
+}
+
+function guardedLobbyPresenceExpireStatement(
+  database: D1Database,
+  profileId: string,
+  now: number,
+  commandId: string,
+  requestHash: string,
+  gameId: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `UPDATE lobby_invitations
+       SET state = 'expired', pending_key = NULL, responded_at = ?
+       WHERE recipient_profile_id = ? AND state = 'pending'
+         AND EXISTS (
+           SELECT 1 FROM command_receipts receipt
+           WHERE receipt.actor_profile_id = ? AND receipt.command_id = ?
+             AND receipt.game_id = ? AND receipt.request_hash = ?
+         )`,
+    )
+    .bind(
+      now,
+      profileId,
+      profileId,
+      commandId,
+      gameId,
+      requestHash,
+    );
+}
+
+function guardedLobbyPresenceDeleteStatement(
+  database: D1Database,
+  profileId: string,
+  commandId: string,
+  requestHash: string,
+  gameId: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `DELETE FROM lobby_presence
+       WHERE profile_id = ? AND EXISTS (
+         SELECT 1 FROM command_receipts receipt
+         WHERE receipt.actor_profile_id = ? AND receipt.command_id = ?
+           AND receipt.game_id = ? AND receipt.request_hash = ?
+       )`,
+    )
+    .bind(profileId, profileId, commandId, gameId, requestHash);
 }
 
 function staleSeatCleanupStatement(

@@ -703,6 +703,282 @@ button:disabled {
   margin-top: 74px;
 }
 
+.lobby-presence-panel,
+.lobby-presence-directory {
+  margin-top: 74px;
+  border: 1px solid var(--ink);
+  background: var(--paper);
+}
+
+.lobby-presence-panel {
+  padding: 24px;
+}
+
+.lobby-presence-panel:focus-visible,
+.lobby-presence-directory:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 3px;
+}
+
+.lobby-presence-heading p,
+.lobby-presence-directory-heading p,
+.lobby-presence-active p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.lobby-presence-opt-in {
+  margin-top: 20px;
+  display: grid;
+  grid-template-columns: minmax(220px, 420px) minmax(220px, 1fr) auto;
+  gap: 16px;
+  align-items: end;
+}
+
+.lobby-presence-opt-in .input-label {
+  margin: 0;
+}
+
+.lobby-presence-opt-in .dialog-privacy-note {
+  margin: 0 0 5px;
+}
+
+.lobby-presence-active {
+  margin-top: 20px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 20px;
+}
+
+.incoming-lobby-invites {
+  margin-top: 24px;
+  border-top: 1px solid var(--ink);
+}
+
+.lobby-presence-peers {
+  margin-top: 24px;
+  padding-top: 18px;
+  border-top: 1px solid var(--ink);
+}
+
+.lobby-presence-peers h3 {
+  margin: 0 0 10px;
+  font-size: 18px;
+  text-transform: uppercase;
+}
+
+.lobby-presence-peers ul {
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  list-style: none;
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+}
+
+.lobby-presence-peers li {
+  min-height: 62px;
+  padding: 10px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.lobby-presence-peers > p {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.incoming-lobby-invites h3 {
+  margin: 18px 0 10px;
+  font-size: 18px;
+  text-transform: uppercase;
+}
+
+.incoming-lobby-invite {
+  min-height: 76px;
+  padding: 12px 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.incoming-lobby-invite > div:first-child {
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.incoming-lobby-invite strong,
+.lobby-presence-list strong {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.incoming-lobby-invite span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.incoming-invite-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lobby-presence-feedback {
+  min-height: 18px;
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.lobby-presence-directory {
+  margin: 18px 0 0;
+}
+
+.lobby-presence-directory-heading {
+  padding: 18px;
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid var(--ink);
+}
+
+.lobby-presence-directory-heading h2 {
+  margin: 4px 0 0;
+  font-size: 26px;
+  letter-spacing: -0.04em;
+  text-transform: uppercase;
+}
+
+.lobby-presence-directory-heading p {
+  max-width: 360px;
+  text-align: right;
+}
+
+.lobby-presence-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lobby-presence-list li {
+  min-height: 70px;
+  padding: 12px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.lobby-presence-list li > div {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.lobby-presence-safety-actions {
+  justify-content: flex-end;
+}
+
+.lobby-presence-safety-actions > span {
+  max-width: 28ch;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.lobby-presence-safety-actions > button {
+  min-height: 44px;
+}
+
+.lobby-presence-block-confirmation {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px 12px;
+}
+
+.lobby-presence-block-confirmation > span {
+  max-width: 28ch;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.lobby-presence-block-confirmation > button {
+  min-height: 44px;
+}
+
+.lobby-player-invite-panel {
+  width: min(610px, 100%);
+}
+
+.lobby-player-invite-panel h2 {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.invite-auth-note,
+.invite-auth-help p,
+.public-invite-auth p {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.invite-auth-note {
+  margin: 14px 0 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--blue);
+}
+
+.invite-auth-help,
+.public-invite-auth details {
+  margin-top: 10px;
+  font-size: 11px;
+}
+
+.invite-auth-help summary,
+.public-invite-auth summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.public-invite-auth {
+  margin-top: 22px;
+  max-width: 620px;
+  padding: 14px;
+  border: 1px solid var(--ink);
+  background: var(--paper);
+}
+
+.public-invite-auth p {
+  margin: 6px 0 0;
+}
+
 .open-table-pool__heading > div:first-child {
   max-width: 720px;
 }
@@ -4389,6 +4665,80 @@ button:disabled {
 
   .open-table-grid {
     grid-template-columns: 1fr;
+  }
+
+  .lobby-presence-panel {
+    padding: 18px 14px;
+  }
+
+  .lobby-presence-heading,
+  .lobby-presence-directory-heading,
+  .incoming-lobby-invite {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .lobby-presence-heading .secondary-button,
+  .lobby-presence-opt-in .primary-button,
+  .incoming-invite-actions > *,
+  .lobby-presence-list .secondary-button {
+    width: 100%;
+  }
+
+  .lobby-presence-opt-in {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .incoming-invite-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .lobby-presence-directory-heading p {
+    max-width: none;
+    text-align: left;
+  }
+
+  .lobby-presence-list li {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .lobby-presence-safety-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .lobby-presence-safety-actions > button,
+  .lobby-presence-safety-actions > span {
+    width: 100%;
+    max-width: none;
+  }
+
+  .lobby-presence-block-confirmation {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .lobby-presence-block-confirmation,
+  .lobby-presence-block-confirmation > button,
+  .lobby-presence-block-confirmation > span {
+    width: 100%;
+    max-width: none;
+  }
+
+  .lobby-presence-peers ul {
+    grid-template-columns: 1fr;
+  }
+
+  .lobby-player-invite-panel .dialog-actions {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+
+  .lobby-player-invite-panel .dialog-actions > * {
+    width: 100%;
   }
 
   .public-listing-control {

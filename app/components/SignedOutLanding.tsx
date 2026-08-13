@@ -34,6 +34,7 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
     availability: PublicAvailability;
     rooms: PublicRoomCard[];
   } | null>(null);
+  const inviteJourney = isInviteSignInPath(signInPath);
 
   useEffect(() => {
     let cancelled = false;
@@ -99,6 +100,16 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
             </a>
             <a className="secondary-button" href="#how-to-play" onClick={(event) => focusSection(event, "how-to-play")}>Learn the rules</a>
           </div>
+          {inviteJourney ? (
+            <aside className="public-invite-auth" aria-label="Invite sign-in help">
+              <strong>Joining a friend?</strong>
+              <p>Sign in with ChatGPT shares only basic identity—not your conversations or files.</p>
+              <details>
+                <summary>Having trouble?</summary>
+                <p>Open this page in Safari or Chrome and retry with your personal ChatGPT account. In ChatGPT, use ••• → Open in browser. A managed workspace may require admin approval.</p>
+              </details>
+            </aside>
+          ) : null}
         </div>
 
         <div
@@ -234,4 +245,13 @@ export function SignedOutLanding({ signInPath }: { signInPath: string }) {
       </footer>
     </div>
   );
+}
+
+function isInviteSignInPath(signInPath: string): boolean {
+  try {
+    const url = new URL(signInPath, "https://open-shed.local");
+    return /(?:^|[?&])join=[A-Z0-9]{6}(?:&|$)/u.test(url.searchParams.get("return_to") ?? "");
+  } catch {
+    return false;
+  }
 }

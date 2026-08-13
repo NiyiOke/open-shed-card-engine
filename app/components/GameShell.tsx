@@ -97,6 +97,24 @@ import {
   type ViewerListing,
   waitingAgeLabel,
 } from "./public-discovery";
+import {
+  LOBBY_PRESENCE_POLL_MS,
+  isAmbiguousLobbyMutationFailure,
+  lobbyPresenceFailureMessage,
+  parseLobbyBlockResult,
+  parseLobbyInviteResponse,
+  parseLobbyInviteSent,
+  parseLobbyPresenceSnapshot,
+  pendingLobbyMutation,
+  type LobbyInvite,
+  type LobbyPresencePlayer,
+  type LobbyPresenceSnapshot,
+} from "./lobby-presence";
+import {
+  LobbyPresenceDirectory,
+  LobbyPresencePanel,
+  type LobbyInviteResponseAction,
+} from "./LobbyPresencePanels";
 
 type Session = {
   signedIn: boolean;
@@ -111,7 +129,7 @@ type SessionResponse = {
 
 type Lobbies = { mine: LobbySummary[] };
 type EventLine = { type: string; message: string };
-type RequestFailure = Error & { code?: string };
+type RequestFailure = Error & { code?: string; status?: number };
 type ConnectionState = "live" | "syncing" | "reconnecting" | "offline";
 type GuideTopic = "rules" | "actions";
 type AudioTransitionSnapshot = {
@@ -179,6 +197,7 @@ type ChatDialog = {
   displayName: string;
   message: ChatMessage | null;
 };
+type LobbyInviteDialog = { player: LobbyPresencePlayer; gameId: string };
 const COMMAND_STORAGE_KEY = "open-shed-inflight-command-v1";
 const CHAT_TAB_STORAGE_KEY = "open-shed-chat-tab-v1";
 const CHAT_ANNOUNCEMENTS_STORAGE_KEY = "open-shed-chat-announcements-v1";
@@ -282,6 +301,15 @@ export function GameShell({
   const [storedCommand, setStoredCommand] = useState<StoredCommand | null>(null);
   const [sidebarDetailsOpen, setSidebarDetailsOpen] = useState(false);
   const [publicRooms, setPublicRooms] = useState<PublicRoomPage | null>(null);
+  const [lobbyPresence, setLobbyPresence] = useState<LobbyPresenceSnapshot | null>(null);
+  const [lobbyPresenceAvailable, setLobbyPresenceAvailable] = useState<boolean | null>(null);
+  const [lobbyPresenceAlias, setLobbyPresenceAlias] = useState("");
+  const [lobbyPresenceBusy, setLobbyPresenceBusy] = useState(false);
+  const [lobbyPresenceError, setLobbyPresenceError] = useState<string | null>(null);
+  const [lobbyPresenceStatus, setLobbyPresenceStatus] = useState<string | null>(null);
+  const [lobbyPresenceFocusRequest, setLobbyPresenceFocusRequest] = useState(0);
+  const [lobbyInviteDialog, setLobbyInviteDialog] = useState<LobbyInviteDialog | null>(null);
+  const [lobbyInviteHostAlias, setLobbyInviteHostAlias] = useState("");
   const [publicDiscoveryEnabled, setPublicDiscoveryEnabled] = useState(false);
   const [linkedListingIntent, setLinkedListingIntent] = useState<string | null>(null);
   const [publicJoinIntent, setPublicJoinIntent] = useState<PublicJoinIntent | null>(null);
@@ -348,6 +376,15 @@ export function GameShell({
   const chatMessageIdsRef = useRef(new Set<string>());
   const chatSendMutationRef = useRef<PendingPublicMutation | null>(null);
   const chatReportMutationRef = useRef<PendingPublicMutation | null>(null);
+  const lobbyPresenceMutationRef = useRef<PendingPublicMutation | null>(null);
+  const lobbyInviteMutationRef = useRef<PendingPublicMutation | null>(null);
+  const lobbyInviteResponseMutationRef = useRef<PendingPublicMutation | null>(null);
+  const lobbyInviteResponsePendingRef = useRef<{
+    invite: LobbyInvite;
+    action: LobbyInviteResponseAction;
+  } | null>(null);
+  const lobbyPresenceLookingRef = useRef<boolean | null>(null);
+  const lobbyBlockMutationRef = useRef<PendingPublicMutation | null>(null);
   const chatTabPreferenceRef = useRef(false);
   const chatDialogRef = useRef<HTMLDivElement>(null);
   const chatDialogTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -398,6 +435,7 @@ export function GameShell({
       if (!response.ok) {
         const failure = new Error(body.error?.message ?? "Request failed.") as RequestFailure;
         failure.code = body.error?.code;
+        failure.status = response.status;
         throw failure;
       }
       return body;
@@ -471,6 +509,40 @@ export function GameShell({
     }
   }, [request]);
 
+  const loadLobbyPresence = useCallback(async () => {
+    try {
+      const response = await request<unknown>("/api/lobby-presence");
+      if (
+        response &&
+        typeof response === "object" &&
+        !Array.isArray(response) &&
+        Object.keys(response).length === 1 &&
+        (response as { enabled?: unknown }).enabled === false
+      ) {
+        setLobbyPresenceAvailable(false);
+        setLobbyPresence(null);
+        setLobbyPresenceError(null);
+        return;
+      }
+      const snapshot = parseLobbyPresenceSnapshot(response);
+      if (!snapshot) throw new SyntaxError("Invalid lobby presence response.");
+      setLobbyPresenceAvailable(true);
+      setLobbyPresence((current) => {
+        const pending = lobbyInviteResponsePendingRef.current;
+        if (!pending || snapshot.invites.some((invite) => invite.inviteId === pending.invite.inviteId)) {
+          return snapshot;
+        }
+        const retained = current?.invites.find(
+          (invite) => invite.inviteId === pending.invite.inviteId,
+        );
+        return retained ? { ...snapshot, invites: [retained, ...snapshot.invites] } : snapshot;
+      });
+      if (snapshot.self.alias) setLobbyPresenceAlias(snapshot.self.alias);
+    } catch {
+      // Preserve the last verified snapshot and retry transient failures.
+    }
+  }, [request]);
+
   useEffect(() => {
     let cancelled = false;
     void request<SessionResponse>("/api/session")
@@ -488,6 +560,7 @@ export function GameShell({
         if (next.signedIn) {
           void loadLobbies();
           void loadPublicRooms();
+          void loadLobbyPresence();
         }
       })
       .catch(() => {
@@ -496,7 +569,52 @@ export function GameShell({
     return () => {
       cancelled = true;
     };
-  }, [loadLobbies, loadPublicRooms, request]);
+  }, [loadLobbies, loadLobbyPresence, loadPublicRooms, request]);
+
+  useEffect(() => {
+    if (!session?.signedIn || lobbyPresenceAvailable === false) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const sync = async () => {
+      if (cancelled || document.hidden) return;
+      try {
+        if (!game && lobbyPresence?.self.lookingForGame) {
+          await request<unknown>("/api/lobby-presence/heartbeat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+        }
+        if (!cancelled) await loadLobbyPresence();
+      } catch {
+        // Polling is best-effort and the directory fails closed.
+      } finally {
+        if (!cancelled) timer = window.setTimeout(() => void sync(), LOBBY_PRESENCE_POLL_MS);
+      }
+    };
+    timer = window.setTimeout(() => void sync(), LOBBY_PRESENCE_POLL_MS);
+    const onVisible = () => {
+      if (!document.hidden) {
+        if (timer !== null) window.clearTimeout(timer);
+        timer = null;
+        void sync();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [game, loadLobbyPresence, lobbyPresence?.self.lookingForGame, lobbyPresenceAvailable, request, session?.signedIn]);
+
+  useEffect(() => {
+    const looking = lobbyPresence?.self.lookingForGame ?? null;
+    if (lobbyPresenceLookingRef.current === true && looking === false) {
+      setLobbyPresenceStatus("Your lobby visibility ended. Opt in again when you’re ready.");
+    }
+    lobbyPresenceLookingRef.current = looking;
+  }, [lobbyPresence?.self.lookingForGame]);
 
   useEffect(() => {
     const code = normalizeJoinCodeFromUrl(window.location.search);
@@ -1312,6 +1430,15 @@ export function GameShell({
         savedAction: storedCommand
           ? { gameId: storedCommand.gameId, type: storedCommand.command.type }
           : null,
+        lobbyPresence: lobbyPresence
+          ? {
+              lookingForGame: lobbyPresence.self.lookingForGame,
+              canBrowse: lobbyPresence.self.canBrowse,
+              playerCount: lobbyPresence.players.length,
+              inviteCount: lobbyPresence.invites.length,
+              sendDialog: lobbyInviteDialog ? "open" : "closed",
+            }
+          : null,
         issueReport: {
           modal: bugReportOpen ? "open" : "closed",
           category: bugReportOpen ? bugReportCategory : null,
@@ -1406,6 +1533,8 @@ export function GameShell({
     connectionState,
     game,
     liveVoiceSnapshot,
+    lobbyInviteDialog,
+    lobbyPresence,
     playedCardFxRevision,
     presence,
     reducedMotion,
@@ -1427,6 +1556,8 @@ export function GameShell({
     initialPresence: PresenceSnapshot | null = null,
     initialListing: ViewerListing | null = null,
   ) => {
+    lobbyInviteResponsePendingRef.current = null;
+    lobbyInviteResponseMutationRef.current = null;
     if (pollRequestRef.current?.gameId !== view.gameId) {
       pollRequestRef.current?.controller.abort();
       pollRequestRef.current = null;
@@ -1440,9 +1571,12 @@ export function GameShell({
     setConnectionState("live");
     setError(null);
     setJoinAlias("");
+    setLobbyPresenceStatus(null);
+    setLobbyPresenceError(null);
     setGameInUrl(view.gameId);
+    void loadLobbyPresence();
     window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
-  }, []);
+  }, [loadLobbyPresence]);
 
   const openLobbyBrowser = useCallback(() => {
     pollRequestRef.current?.controller.abort();
@@ -1462,7 +1596,8 @@ export function GameShell({
     window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
     void loadLobbies();
     void loadPublicRooms();
-  }, [loadLobbies, loadPublicRooms]);
+    void loadLobbyPresence();
+  }, [loadLobbies, loadLobbyPresence, loadPublicRooms]);
 
   const runBusy = useCallback(async (work: () => Promise<void>): Promise<boolean> => {
     if (busy) return false;
@@ -1496,8 +1631,210 @@ export function GameShell({
     });
   };
 
-  const joinLobby = async (code = joinCode) => {
-    const alias = normalizeRoomAlias(joinAlias);
+  const setLookingForGame = async (lookingForGame: boolean) => {
+    const alias = normalizeRoomAlias(lobbyPresenceAlias);
+    if (lookingForGame && !isValidRoomAlias(alias)) {
+      setLobbyPresenceError(ROOM_ALIAS_ERROR);
+      return;
+    }
+    if (lobbyPresenceBusy) return;
+    setLobbyPresenceBusy(true);
+    setLobbyPresenceError(null);
+    setLobbyPresenceStatus(null);
+    const payload = {
+      lookingForGame,
+      ...(lookingForGame ? { alias } : {}),
+    };
+    const fingerprint = JSON.stringify(payload);
+    const mutation = pendingLobbyMutation(lobbyPresenceMutationRef.current, fingerprint, commandId);
+    lobbyPresenceMutationRef.current = mutation;
+    try {
+      await request<unknown>("/api/lobby-presence", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          commandId: mutation.commandId,
+          ...payload,
+        }),
+      });
+      await loadLobbyPresence();
+      setLobbyPresenceFocusRequest((current) => current + 1);
+      if (!lookingForGame) setLobbyPresenceAlias("");
+      setLobbyPresenceStatus(
+        lookingForGame
+          ? "You’re visible to other opted-in players while this lobby stays open."
+          : "You’re hidden from the player lobby.",
+      );
+      lobbyPresenceMutationRef.current = null;
+    } catch (failure) {
+      const code = (failure as RequestFailure).code;
+      if (["LOBBY_PRESENCE_DISABLED", "FEATURE_DISABLED", "NOT_FOUND", "ROUTE_NOT_FOUND"].includes(code ?? "")) {
+        setLobbyPresence(null);
+        lobbyPresenceMutationRef.current = null;
+      } else {
+        setLobbyPresenceError(
+          failure instanceof Error && !code
+            ? failure.message
+            : lobbyPresenceFailureMessage(code),
+        );
+        if (!isAmbiguousLobbyMutationFailure(failure, code)) {
+          lobbyPresenceMutationRef.current = null;
+        }
+      }
+    } finally {
+      setLobbyPresenceBusy(false);
+    }
+  };
+
+  const openLobbyPlayerInvite = (player: LobbyPresencePlayer) => {
+    const current = gameRef.current;
+    if (!current || current.phase !== "lobby" || !current.isHost) return;
+    setLobbyPresenceError(null);
+    setLobbyInviteHostAlias("");
+    setLobbyInviteDialog({ player, gameId: current.gameId });
+  };
+
+  const closeLobbyPlayerInvite = useCallback(() => {
+    setLobbyInviteDialog(null);
+    window.requestAnimationFrame(() => utilityTriggerRef.current?.focus());
+  }, []);
+
+  const sendLobbyPlayerInvite = async () => {
+    const pending = lobbyInviteDialog;
+    if (!pending || lobbyPresenceBusy) return;
+    const senderAlias = normalizeRoomAlias(lobbyInviteHostAlias);
+    if (!isValidRoomAlias(senderAlias)) {
+      setLobbyPresenceError(ROOM_ALIAS_ERROR);
+      return;
+    }
+    setLobbyPresenceBusy(true);
+    setLobbyPresenceError(null);
+    const fingerprint = JSON.stringify({ gameId: pending.gameId, presenceId: pending.player.presenceId, senderAlias });
+    const mutation = pendingLobbyMutation(lobbyInviteMutationRef.current, fingerprint, commandId);
+    lobbyInviteMutationRef.current = mutation;
+    try {
+      const response = await request<unknown>(`/api/games/${encodeURIComponent(pending.gameId)}/lobby-invites`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commandId: mutation.commandId, presenceId: pending.player.presenceId, senderAlias }),
+      });
+      if (!parseLobbyInviteSent(response)) throw new SyntaxError("Invalid invitation response.");
+      setLobbyPresenceStatus(`Invitation sent to ${pending.player.alias}.`);
+      setLobbyInviteDialog(null);
+      setLobbyInviteHostAlias("");
+      await loadLobbyPresence();
+      setLobbyPresenceFocusRequest((current) => current + 1);
+      lobbyInviteMutationRef.current = null;
+    } catch (failure) {
+      const code = (failure as RequestFailure).code;
+      if (["LOBBY_PRESENCE_DISABLED", "FEATURE_DISABLED", "NOT_FOUND", "ROUTE_NOT_FOUND"].includes(code ?? "")) {
+        setLobbyPresence(null);
+        setLobbyInviteDialog(null);
+        lobbyInviteMutationRef.current = null;
+        return;
+      }
+      setLobbyPresenceError(lobbyPresenceFailureMessage(code));
+      if (!isAmbiguousLobbyMutationFailure(failure, code)) {
+        lobbyInviteMutationRef.current = null;
+      }
+    } finally {
+      setLobbyPresenceBusy(false);
+    }
+  };
+
+  const respondToLobbyInvite = async (invite: LobbyInvite, action: LobbyInviteResponseAction) => {
+    if (lobbyPresenceBusy) return;
+    setLobbyPresenceBusy(true);
+    setLobbyPresenceError(null);
+    const fingerprint = JSON.stringify({ inviteId: invite.inviteId, action });
+    const mutation = pendingLobbyMutation(lobbyInviteResponseMutationRef.current, fingerprint, commandId);
+    lobbyInviteResponseMutationRef.current = mutation;
+    lobbyInviteResponsePendingRef.current = { invite, action };
+    try {
+      const response = await request<unknown>(
+        `/api/lobby-invites/${encodeURIComponent(invite.inviteId)}/respond`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ commandId: mutation.commandId, action }),
+        },
+      );
+      const parsedResponse = parseLobbyInviteResponse(response, action);
+      if (!parsedResponse) throw new SyntaxError("Invalid invitation response.");
+      if (action !== "accept") {
+        lobbyInviteResponsePendingRef.current = null;
+        setLobbyPresenceStatus(
+          action === "decline_and_block"
+            ? `Invitation declined. ${invite.fromAlias} can no longer invite you.`
+            : `Invitation from ${invite.fromAlias} declined.`,
+        );
+        await loadLobbyPresence();
+        setLobbyPresenceFocusRequest((current) => current + 1);
+      } else {
+        const snapshot = parsedResponse.snapshot as GameSnapshotResponse | null;
+        if (!snapshot?.view) throw new Error("The invitation could not be verified.");
+        enterGame(
+          snapshot.view,
+          snapshot.events ?? [],
+          snapshot.eventCursor ?? snapshot.view.revision,
+          snapshot.presence ?? null,
+          parseViewerListing(snapshot.listing),
+        );
+      }
+      lobbyInviteResponseMutationRef.current = null;
+      lobbyInviteResponsePendingRef.current = null;
+    } catch (failure) {
+      const code = (failure as RequestFailure).code;
+      if (["LOBBY_PRESENCE_DISABLED", "FEATURE_DISABLED", "NOT_FOUND", "ROUTE_NOT_FOUND"].includes(code ?? "")) {
+        setLobbyPresence(null);
+        setLobbyPresenceAvailable(false);
+        lobbyInviteResponseMutationRef.current = null;
+        lobbyInviteResponsePendingRef.current = null;
+        return;
+      }
+      const ambiguous = isAmbiguousLobbyMutationFailure(failure, code);
+      setLobbyPresenceError(ambiguous
+        ? `${action === "accept" ? "Joining" : "Responding"} may have succeeded. Retry the same action to recover safely.`
+        : failure instanceof Error && !code ? failure.message : lobbyPresenceFailureMessage(code));
+      if (action === "accept" && ambiguous) void loadLobbies();
+      if (!ambiguous) {
+        lobbyInviteResponseMutationRef.current = null;
+        lobbyInviteResponsePendingRef.current = null;
+      }
+    } finally {
+      setLobbyPresenceBusy(false);
+    }
+  };
+
+  const blockLobbyPlayer = async (player: LobbyPresencePlayer) => {
+    if (lobbyPresenceBusy) return;
+    setLobbyPresenceBusy(true);
+    setLobbyPresenceError(null);
+    const fingerprint = JSON.stringify({ presenceId: player.presenceId });
+    const mutation = pendingLobbyMutation(lobbyBlockMutationRef.current, fingerprint, commandId);
+    lobbyBlockMutationRef.current = mutation;
+    try {
+      const response = await request<unknown>(`/api/lobby-presence/players/${encodeURIComponent(player.presenceId)}/block`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commandId: mutation.commandId }),
+      });
+      if (!parseLobbyBlockResult(response)) throw new SyntaxError("Invalid lobby safety response.");
+      setLobbyPresenceStatus(`${player.alias} is hidden and blocked.`);
+      lobbyBlockMutationRef.current = null;
+      await loadLobbyPresence();
+      setLobbyPresenceFocusRequest((current) => current + 1);
+    } catch (failure) {
+      const code = (failure as RequestFailure).code;
+      setLobbyPresenceError(lobbyPresenceFailureMessage(code));
+      if (!isAmbiguousLobbyMutationFailure(failure, code)) lobbyBlockMutationRef.current = null;
+    } finally {
+      setLobbyPresenceBusy(false);
+    }
+  };
+
+  async function joinLobby(code = joinCode, requestedAlias = joinAlias) {
+    const alias = normalizeRoomAlias(requestedAlias);
     if (!isValidRoomAlias(alias)) {
       setError(ROOM_ALIAS_ERROR);
       return false;
@@ -1517,7 +1854,7 @@ export function GameShell({
         parseViewerListing(response.listing),
       );
     });
-  };
+  }
 
   const openGame = async (gameId: string) => {
     await runBusy(async () => {
@@ -1951,23 +2288,24 @@ export function GameShell({
     }
     const inviteUrl = new URL(window.location.origin);
     inviteUrl.searchParams.set("join", current.joinCode);
+    const inviteClipboardText = `${inviteUrl.toString()}\n\nOpen this link in Safari or Chrome. If it opens inside ChatGPT, tap ••• → Open in browser.`;
     try {
       if (preferNativeShare && typeof navigator.share === "function") {
         await navigator.share({
           title: "Join my Open Shed table",
-          text: `Join table ${current.joinCode} in Open Shed.`,
+          text: `Join table ${current.joinCode} in Open Shed. Open this link in Safari or Chrome. If it opens inside ChatGPT, tap ••• → Open in browser.`,
           url: inviteUrl.toString(),
         });
         setShareFeedback("Invite shared.");
       } else {
-        await navigator.clipboard.writeText(inviteUrl.toString());
-        setShareFeedback("Invite link copied.");
+        await navigator.clipboard.writeText(inviteClipboardText);
+        setShareFeedback("Invite link and browser instructions copied.");
       }
     } catch (failure) {
       if ((failure as Error).name === "AbortError") return;
       try {
-        await navigator.clipboard.writeText(inviteUrl.toString());
-        setShareFeedback("Invite link copied instead.");
+        await navigator.clipboard.writeText(inviteClipboardText);
+        setShareFeedback("Invite link and browser instructions copied instead.");
       } catch {
         setShareFeedback("Couldn’t share automatically. Copy the table code instead.");
       }
@@ -2796,12 +3134,16 @@ export function GameShell({
     soundDialogOpen ||
     bugReportOpen ||
     inviteDialogOpen ||
+    Boolean(lobbyInviteDialog) ||
     Boolean(publicJoinIntent) ||
     Boolean(listingDialogAction) ||
     Boolean(guideTopic) ||
     Boolean(removeTargetId) ||
     Boolean(chatDialog) ||
     voiceSheetOpen;
+  const canInviteFromCurrentLobby = Boolean(
+    game?.phase === "lobby" && game.isHost && activePlayers.length === 1 && lobbyPresence?.self.canBrowse,
+  );
 
   useEffect(() => {
     if (!modalOpen) return;
@@ -2922,6 +3264,7 @@ export function GameShell({
   useEffect(() => {
     if (
       !inviteDialogOpen &&
+      !lobbyInviteDialog &&
       !publicJoinIntent &&
       !listingDialogAction &&
       !guideTopic &&
@@ -2953,6 +3296,7 @@ export function GameShell({
     });
     const closeUtility = () => {
       if (inviteDialogOpen) dismissInvite();
+      else if (lobbyInviteDialog) closeLobbyPlayerInvite();
       else if (publicJoinIntent) closePublicJoin();
       else if (listingDialogAction) closeListingDialog();
       else if (removeTargetId) closeInactiveRemoval();
@@ -2989,10 +3333,12 @@ export function GameShell({
   }, [
     closeGuide,
     closeInactiveRemoval,
+    closeLobbyPlayerInvite,
     closeListingDialog,
     closePublicJoin,
     guideTopic,
     inviteDialogOpen,
+    lobbyInviteDialog,
     listingDialogAction,
     publicJoinIntent,
     removeTargetId,
@@ -3296,6 +3642,15 @@ export function GameShell({
             setJoinCode={setJoinCode}
             lobbies={lobbies}
             publicRooms={publicRooms}
+            lobbyPresence={lobbyPresence}
+            lobbyPresenceAlias={lobbyPresenceAlias}
+            lobbyPresenceBusy={lobbyPresenceBusy}
+            lobbyPresenceError={lobbyPresenceError}
+            lobbyPresenceStatus={lobbyPresenceStatus}
+            lobbyPresenceFocusRequest={lobbyPresenceFocusRequest}
+            setLobbyPresenceAlias={setLobbyPresenceAlias}
+            setLookingForGame={(looking) => void setLookingForGame(looking)}
+            respondToInvite={(invite, action) => void respondToLobbyInvite(invite, action)}
             busy={busy}
             createLobby={() => void createLobby()}
             joinLobby={(code) => void joinLobby(code)}
@@ -3546,6 +3901,7 @@ export function GameShell({
             )}
 
             {game.phase === "lobby" ? (
+              <>
               <div className="lobby-actions">
                 <button
                   className="primary-button acid invite-button"
@@ -3572,6 +3928,21 @@ export function GameShell({
                 ) : null}
                 <span className="waiting-copy">{lobbyReadiness}</span>
               </div>
+              {canInviteFromCurrentLobby && lobbyPresence ? (
+                <LobbyPresenceDirectory
+                  players={lobbyPresence.players}
+                  busy={lobbyPresenceBusy}
+                  status={lobbyPresenceStatus}
+                  error={lobbyPresenceError}
+                  focusRequest={lobbyPresenceFocusRequest}
+                  invite={(player, trigger) => {
+                    utilityTriggerRef.current = trigger;
+                    openLobbyPlayerInvite(player);
+                  }}
+                  block={(player) => void blockLobbyPlayer(player)}
+                />
+              ) : null}
+              </>
             ) : null}
 
             {game.phase === "playing" ? (
@@ -4061,7 +4432,7 @@ export function GameShell({
         )}
       </div>
 
-      {inviteDialogOpen || publicJoinIntent || listingDialogAction || guideTopic || removeTarget ? (
+      {inviteDialogOpen || lobbyInviteDialog || publicJoinIntent || listingDialogAction || guideTopic || removeTarget ? (
         <div
           ref={utilityDialogRef}
           className="choice-overlay"
@@ -4071,6 +4442,8 @@ export function GameShell({
           aria-labelledby={
             inviteDialogOpen
               ? "invite-dialog-title"
+              : lobbyInviteDialog
+                ? "lobby-player-invite-title"
               : publicJoinIntent
                 ? "public-join-title"
                 : listingDialogAction
@@ -4088,6 +4461,15 @@ export function GameShell({
               <p className="dialog-copy">
                 Choose a room alias, then join the lobby. Your account name is never filled in.
               </p>
+              <p className="invite-auth-note">
+                Sign in with ChatGPT shares only basic identity with Open Shed—not your conversations or files.
+              </p>
+              <details className="invite-auth-help">
+                <summary>Having trouble?</summary>
+                <p>
+                  Retry in Safari or Chrome with your personal ChatGPT account. If this opened inside ChatGPT, use ••• → Open in browser. A managed workspace may require admin approval.
+                </p>
+              </details>
               <label className="input-label dialog-input" htmlFor="invite-player-name">
                 <span>Room alias</span>
                 <input
@@ -4108,6 +4490,39 @@ export function GameShell({
                 <button className="secondary-button" disabled={busy} onClick={dismissInvite}>Use another code</button>
                 <button className="primary-button acid" disabled={busy || !joinAlias.trim()} onClick={() => void confirmInvite()}>
                   {busy ? "Joining…" : "Join this table"}
+                </button>
+              </div>
+            </div>
+          ) : lobbyInviteDialog ? (
+            <div className="choice-panel lobby-player-invite-panel">
+              <span className="eyebrow">Invite an opted-in player</span>
+              <h2 id="lobby-player-invite-title">Invite {lobbyInviteDialog.player.alias}?</h2>
+              <p className="dialog-copy">
+                If they accept, this private table becomes public-safe: quick phrases only, with no free text or live voice.
+              </p>
+              <label className="input-label dialog-input" htmlFor="lobby-invite-host-alias">
+                <span>Your public invitation alias</span>
+                <input
+                  id="lobby-invite-host-alias"
+                  value={lobbyInviteHostAlias}
+                  maxLength={ROOM_ALIAS_MAX_LENGTH}
+                  autoComplete="off"
+                  placeholder="Choose a new alias"
+                  aria-describedby="lobby-invite-host-alias-note"
+                  onChange={(event) => {
+                    setLobbyInviteHostAlias(event.target.value);
+                    setLobbyPresenceError(null);
+                  }}
+                />
+              </label>
+              <p id="lobby-invite-host-alias-note" className="dialog-privacy-note">
+                Starts blank and never uses your account or table name. Avoid your real name.
+              </p>
+              {lobbyPresenceError ? <p className="field-error invite-error" role="alert">{lobbyPresenceError}</p> : null}
+              <div className="dialog-actions">
+                <button className="secondary-button" disabled={lobbyPresenceBusy} onClick={closeLobbyPlayerInvite}>Cancel</button>
+                <button className="primary-button acid" disabled={lobbyPresenceBusy || !lobbyInviteHostAlias.trim()} onClick={() => void sendLobbyPlayerInvite()}>
+                  {lobbyPresenceBusy ? "Sending…" : "Confirm & send invite"}
                 </button>
               </div>
             </div>
@@ -4947,6 +5362,15 @@ function LobbyBrowser({
   setJoinCode,
   lobbies,
   publicRooms,
+  lobbyPresence,
+  lobbyPresenceAlias,
+  lobbyPresenceBusy,
+  lobbyPresenceError,
+  lobbyPresenceStatus,
+  lobbyPresenceFocusRequest,
+  setLobbyPresenceAlias,
+  setLookingForGame,
+  respondToInvite,
   busy,
   createLobby,
   joinLobby,
@@ -4964,6 +5388,15 @@ function LobbyBrowser({
   setJoinCode: (value: string) => void;
   lobbies: Lobbies;
   publicRooms: PublicRoomPage | null;
+  lobbyPresence: LobbyPresenceSnapshot | null;
+  lobbyPresenceAlias: string;
+  lobbyPresenceBusy: boolean;
+  lobbyPresenceError: string | null;
+  lobbyPresenceStatus: string | null;
+  lobbyPresenceFocusRequest: number;
+  setLobbyPresenceAlias: (value: string) => void;
+  setLookingForGame: (looking: boolean) => void;
+  respondToInvite: (invite: LobbyInvite, action: LobbyInviteResponseAction) => void;
   busy: boolean;
   createLobby: () => void;
   joinLobby: (code?: string) => void;
@@ -5078,6 +5511,20 @@ function LobbyBrowser({
             </div>
           )}
         </section>
+      ) : null}
+
+      {lobbyPresence ? (
+        <LobbyPresencePanel
+          snapshot={lobbyPresence}
+          alias={lobbyPresenceAlias}
+          busy={lobbyPresenceBusy}
+          error={lobbyPresenceError}
+          status={lobbyPresenceStatus}
+          focusRequest={lobbyPresenceFocusRequest}
+          setAlias={setLobbyPresenceAlias}
+          setLooking={setLookingForGame}
+          respondToInvite={respondToInvite}
+        />
       ) : null}
 
       <div className="rooms-section">

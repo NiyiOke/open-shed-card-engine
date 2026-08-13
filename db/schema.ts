@@ -133,6 +133,86 @@ export const profileBlocks = sqliteTable(
   ],
 );
 
+/**
+ * A profile appears in the global lobby only after an explicit opt-in. The
+ * opaque presence locator is scoped to that opt-in session and rotates after
+ * opt-out/expiry; profile/auth identifiers never cross the API boundary.
+ */
+export const lobbyPresence = sqliteTable(
+  "lobby_presence",
+  {
+    profileId: text("profile_id").primaryKey(),
+    presenceId: text("presence_id").notNull(),
+    alias: text("alias").notNull(),
+    lastSeenAt: integer("last_seen_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_lobby_presence_locator").on(table.presenceId),
+    index("idx_lobby_presence_expiry").on(table.expiresAt),
+    index("idx_lobby_presence_activity").on(table.lastSeenAt),
+  ],
+);
+
+export const lobbyPresenceReceipts = sqliteTable(
+  "lobby_presence_receipts",
+  {
+    actorProfileId: text("actor_profile_id").notNull(),
+    commandId: text("command_id").notNull(),
+    requestHash: text("request_hash").notNull(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.actorProfileId, table.commandId] }),
+    index("idx_lobby_presence_receipts_expiry").on(table.expiresAt),
+  ],
+);
+
+export const lobbyInvitations = sqliteTable(
+  "lobby_invitations",
+  {
+    id: text("id").primaryKey(),
+    senderProfileId: text("sender_profile_id").notNull(),
+    recipientProfileId: text("recipient_profile_id").notNull(),
+    recipientPresenceId: text("recipient_presence_id").notNull(),
+    gameId: text("game_id").notNull(),
+    senderAlias: text("sender_alias").notNull(),
+    commandId: text("command_id").notNull(),
+    requestHash: text("request_hash").notNull(),
+    pendingKey: text("pending_key"),
+    state: text("state").notNull(),
+    responseCommandId: text("response_command_id"),
+    responseAction: text("response_action"),
+    responseRequestHash: text("response_request_hash"),
+    acceptedAlias: text("accepted_alias"),
+    acceptedRevision: integer("accepted_revision"),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    respondedAt: integer("responded_at"),
+  },
+  (table) => [
+    uniqueIndex("idx_lobby_invitations_sender_command").on(
+      table.senderProfileId,
+      table.commandId,
+    ),
+    uniqueIndex("idx_lobby_invitations_recipient_response_command").on(
+      table.recipientProfileId,
+      table.responseCommandId,
+    ),
+    uniqueIndex("idx_lobby_invitations_pending_key").on(table.pendingKey),
+    index("idx_lobby_invitations_recipient_feed").on(
+      table.recipientProfileId,
+      table.state,
+      table.expiresAt,
+    ),
+    index("idx_lobby_invitations_game").on(table.gameId, table.state),
+    index("idx_lobby_invitations_expiry").on(table.expiresAt),
+  ],
+);
+
 export const gameMessages = sqliteTable(
   "game_messages",
   {

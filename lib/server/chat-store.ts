@@ -68,6 +68,7 @@ type MemberGameRow = {
   expires_at: number;
   profile_id: string | null;
   membership_status: string | null;
+  joined_at: number | null;
 };
 
 type CurrentMemberContext = {
@@ -76,6 +77,7 @@ type CurrentMemberContext = {
   state: GameState;
   player: PlayerState;
   communicationScope: string;
+  joinedAt: number;
 };
 
 type TargetMember = {
@@ -171,7 +173,7 @@ export async function listTableMessages(
   const liveVoiceAvailable =
     privateCommunicationAvailable && getLiveVoiceProviderConfig() !== null;
   const cursorRow = cursor
-    ? await requireCursor(database, gameId, cursor)
+    ? await requireCursor(database, gameId, cursor, viewer.joinedAt)
     : null;
 
   const query = cursorRow
@@ -203,6 +205,7 @@ export async function listTableMessages(
           AND sender.profile_id = message.sender_profile_id
           AND sender.status <> 'left'
          WHERE message.game_id = ? AND message.expires_at > ?
+           AND message.created_at > ?
            AND (? = 1 OR message.kind <> 'text')
            AND (
              message.created_at > ?
@@ -217,6 +220,7 @@ export async function listTableMessages(
           viewer.profileId,
           gameId,
           now,
+          viewer.joinedAt,
           freeTextAvailable ? 1 : 0,
           cursorRow.created_at,
           cursorRow.created_at,
@@ -251,6 +255,7 @@ export async function listTableMessages(
           AND sender.profile_id = message.sender_profile_id
           AND sender.status <> 'left'
          WHERE message.game_id = ? AND message.expires_at > ?
+           AND message.created_at > ?
            AND (? = 1 OR message.kind <> 'text')
          ORDER BY message.created_at, message.id
          LIMIT ?`,
@@ -260,6 +265,7 @@ export async function listTableMessages(
         viewer.profileId,
         gameId,
         now,
+        viewer.joinedAt,
         freeTextAvailable ? 1 : 0,
         COMMUNICATION_LIMITS.messageScanLimit,
       );
@@ -842,6 +848,7 @@ async function recordMessageReceipts(
             AND sender_member.status <> 'left'
            WHERE message.id = ? AND message.game_id = ?
              AND message.expires_at > ?
+             AND message.created_at > recipient_member.joined_at
              AND game.room_status = 'open' AND game.expires_at > ?
              AND message.sender_profile_id <> recipient.id
              AND (? = 1 OR message.kind <> 'text')
@@ -1104,7 +1111,8 @@ async function requireCurrentMember(
     .prepare(
       `SELECT game.id, game.state_json, game.room_status,
               game.communication_scope, game.expires_at,
-              profile.id AS profile_id, member.status AS membership_status
+              profile.id AS profile_id, member.status AS membership_status,
+              member.joined_at
        FROM games game
        LEFT JOIN profiles profile ON profile.auth_subject = ?
        LEFT JOIN game_members member
@@ -1149,6 +1157,7 @@ async function requireCurrentMember(
     state,
     player,
     communicationScope: row.communication_scope,
+    joinedAt: Number(row.joined_at),
   };
 }
 
@@ -1330,13 +1339,14 @@ async function requireCursor(
   database: D1Database,
   gameId: string,
   cursor: string,
+  joinedAt: number,
 ): Promise<CursorRow> {
   const row = await database
     .prepare(
       `SELECT id, created_at FROM game_messages
-       WHERE game_id = ? AND id = ? LIMIT 1`,
+       WHERE game_id = ? AND id = ? AND created_at > ? LIMIT 1`,
     )
-    .bind(gameId, cursor)
+    .bind(gameId, cursor, joinedAt)
     .first<CursorRow>();
   requireRule(
     row,

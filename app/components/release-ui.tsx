@@ -10,9 +10,9 @@ import {
 export const NEXT_RELEASE_LABEL = "V1.7" as const;
 
 export const RELEASE_NOTES = Object.freeze([
-  "One canonical rulebook now powers both the public rules page and the in-game guide, including every action card and the complete 168-card inventory.",
-  "Round wins now names the rematch metric clearly, keeping it separate from the optional official points-to-1,000 format.",
-  "Rules navigation, mobile reflow, focus handling, runtime stability, and delivery performance received a dedicated quality pass.",
+  "Invite links now explain how to recover when ChatGPT authorization is denied inside a mobile in-app browser.",
+  "Players can opt in with a separate public alias while looking for a game; waiting hosts can invite them without exposing account names or table codes.",
+  "Lobby invitations are short-lived, rate-limited, block-aware, and accept into the table atomically with public-safe quick phrases only.",
 ] as const);
 
 export const NEXT_RELEASE_PREVIEW =

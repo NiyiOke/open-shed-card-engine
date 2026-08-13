@@ -112,6 +112,63 @@ async function initialize(database: D1Database): Promise<void> {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_profile_blocks_blocked
       ON profile_blocks(blocked_profile_id)`,
+    `CREATE TABLE IF NOT EXISTS lobby_presence (
+      profile_id TEXT PRIMARY KEY NOT NULL,
+      presence_id TEXT NOT NULL,
+      alias TEXT NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_lobby_presence_locator
+      ON lobby_presence(presence_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_lobby_presence_expiry
+      ON lobby_presence(expires_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_lobby_presence_activity
+      ON lobby_presence(last_seen_at)`,
+    `CREATE TABLE IF NOT EXISTS lobby_presence_receipts (
+      actor_profile_id TEXT NOT NULL,
+      command_id TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      PRIMARY KEY (actor_profile_id, command_id)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_lobby_presence_receipts_expiry
+      ON lobby_presence_receipts(expires_at)`,
+    `CREATE TABLE IF NOT EXISTS lobby_invitations (
+      id TEXT PRIMARY KEY NOT NULL,
+      sender_profile_id TEXT NOT NULL,
+      recipient_profile_id TEXT NOT NULL,
+      recipient_presence_id TEXT NOT NULL,
+      game_id TEXT NOT NULL,
+      sender_alias TEXT NOT NULL,
+      command_id TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      pending_key TEXT,
+      state TEXT NOT NULL,
+      response_command_id TEXT,
+      response_action TEXT,
+      response_request_hash TEXT,
+      accepted_alias TEXT,
+      accepted_revision INTEGER,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      responded_at INTEGER
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_lobby_invitations_sender_command
+      ON lobby_invitations(sender_profile_id, command_id)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_lobby_invitations_recipient_response_command
+      ON lobby_invitations(recipient_profile_id, response_command_id)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_lobby_invitations_pending_key
+      ON lobby_invitations(pending_key)`,
+    `CREATE INDEX IF NOT EXISTS idx_lobby_invitations_recipient_feed
+      ON lobby_invitations(recipient_profile_id, state, expires_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_lobby_invitations_game
+      ON lobby_invitations(game_id, state)`,
+    `CREATE INDEX IF NOT EXISTS idx_lobby_invitations_expiry
+      ON lobby_invitations(expires_at)`,
     `CREATE TABLE IF NOT EXISTS game_messages (
       id TEXT PRIMARY KEY NOT NULL,
       game_id TEXT NOT NULL,

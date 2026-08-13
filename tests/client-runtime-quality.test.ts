@@ -89,7 +89,7 @@ test("heavy voice code stays behind one dynamic client import", () => {
 
   // Source ceilings are early warnings; the post-build CI gate measures the
   // real emitted chunks.
-  assert.ok(statSync(GAME_SHELL_PATH).size <= 230_000);
+  assert.ok(statSync(GAME_SHELL_PATH).size <= 232_000);
   assert.ok(statSync(LIVE_VOICE_PATH).size <= 38_000);
   assert.ok(statSync(GAME_STORE_PATH).size <= 175_000);
 });

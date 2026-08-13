@@ -20,9 +20,9 @@ test("application release identity is canonical and matches package metadata", (
     readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"),
   ) as { version?: unknown; packages?: Record<string, { version?: unknown }> };
 
-  assert.equal(APP_VERSION, "1.6.1");
-  assert.equal(APP_VERSION_LABEL, "V1.6.1");
-  assert.equal(APP_RELEASE_LABEL, "Open Shed V1.6.1");
+  assert.equal(APP_VERSION, "1.6.2");
+  assert.equal(APP_VERSION_LABEL, "V1.6.2");
+  assert.equal(APP_RELEASE_LABEL, "Open Shed V1.6.2");
   assert.equal(packageMetadata.version, APP_VERSION);
   assert.equal(lockMetadata.version, APP_VERSION);
   assert.equal(lockMetadata.packages?.[""]?.version, APP_VERSION);

@@ -108,7 +108,7 @@ test("feed scans are bounded, stable, current-member-only, and advance past hidd
 test("cursors and target player IDs are scoped back to the active room", () => {
   assert.match(
     STORE_SOURCE,
-    /FROM game_messages[\s\S]*WHERE game_id = \? AND id = \? LIMIT 1/u,
+    /FROM game_messages[\s\S]*WHERE game_id = \? AND id = \? AND created_at > \? LIMIT 1/u,
   );
   assert.match(
     STORE_SOURCE,
@@ -117,6 +117,21 @@ test("cursors and target player IDs are scoped back to the active room", () => {
   assert.match(
     STORE_SOURCE,
     /viewer_member\.game_id = game\.id[\s\S]*viewer_member\.status <> 'left'[\s\S]*game\.id = message\.game_id/u,
+  );
+});
+
+test("message feeds and cursors cannot cross the viewer join boundary", () => {
+  assert.match(
+    STORE_SOURCE,
+    /message\.created_at > \?/u,
+  );
+  assert.match(
+    STORE_SOURCE,
+    /message\.created_at > recipient_member\.joined_at/u,
+  );
+  assert.match(
+    STORE_SOURCE,
+    /requireCursor\(database, gameId, cursor, viewer\.joinedAt\)/u,
   );
 });
 

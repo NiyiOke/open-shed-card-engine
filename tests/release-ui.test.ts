@@ -26,13 +26,13 @@ const CSS_SOURCE = readFileSync(
 );
 
 test("release UI uses the canonical app version and names the next release", () => {
-  assert.equal(APP_VERSION_LABEL, "V1.6.1");
-  assert.equal(APP_RELEASE_LABEL, "Open Shed V1.6.1");
+  assert.equal(APP_VERSION_LABEL, "V1.6.2");
+  assert.equal(APP_RELEASE_LABEL, "Open Shed V1.6.2");
   assert.equal(NEXT_RELEASE_LABEL, "V1.7");
   assert.match(NEXT_RELEASE_PREVIEW, /points-to-1,000/i);
-  assert.ok(RELEASE_NOTES.some((note) => /canonical rulebook/i.test(note)));
-  assert.ok(RELEASE_NOTES.some((note) => /round wins/i.test(note)));
-  assert.ok(RELEASE_NOTES.some((note) => /accessibility|focus|mobile/i.test(note)));
+  assert.ok(RELEASE_NOTES.some((note) => /authorization/i.test(note)));
+  assert.ok(RELEASE_NOTES.some((note) => /public alias/i.test(note)));
+  assert.ok(RELEASE_NOTES.some((note) => /atomic|atomically/i.test(note)));
 });
 
 test("table revisions are diagnostic counters, never app-version labels", () => {

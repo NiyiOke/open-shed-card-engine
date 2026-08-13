@@ -71,6 +71,13 @@
       "when": 1786523087165,
       "tag": "0009_lovely_miek",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1786642344290,
+      "tag": "0010_fluffy_lady_deathstrike",
+      "breakpoints": true
     }
   ]
 }
