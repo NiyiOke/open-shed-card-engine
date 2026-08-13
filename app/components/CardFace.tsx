@@ -156,8 +156,12 @@ function CardArtwork({
       className="card-face"
       data-active-color={activeWildColor ?? undefined}
       data-color={color}
+      data-label-density={label.length > 10 ? "long" : undefined}
       data-playable={playable || undefined}
       data-selected={selected || undefined}
+      data-value-density={
+        centerMark && centerMark.length >= 3 ? "long" : undefined
+      }
       data-variant={variant}
       aria-hidden="true"
     >

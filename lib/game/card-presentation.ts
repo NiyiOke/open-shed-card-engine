@@ -72,7 +72,7 @@ const ACTION_PRESENTATION = {
     cornerMark: "+4",
     icon: "reverse",
     label: "Reverse draw 4",
-    supportMark: "+4",
+    supportMark: null,
   },
   wild_draw_six: {
     centerMark: "+6",

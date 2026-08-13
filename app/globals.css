@@ -2934,6 +2934,11 @@ button:disabled {
   -webkit-text-stroke: 1px #1b1b1a;
 }
 
+.card-face[data-value-density="long"] .card-face__value {
+  font-size: clamp(22px, 34cqw, 52px);
+  letter-spacing: -0.12em;
+}
+
 .card-face__icon {
   width: 62%;
   height: 62%;
@@ -2971,6 +2976,13 @@ button:disabled {
   line-height: 1.02;
   text-align: left;
   text-transform: uppercase;
+}
+
+.card-face[data-variant="compact"][data-label-density="long"] .card-face__label {
+  right: 8%;
+  font-size: clamp(7px, 10cqw, 9px);
+  letter-spacing: -0.04em;
+  line-height: 0.95;
 }
 
 .card-face__play-cue {
@@ -3664,10 +3676,10 @@ button:disabled {
 
 .rules-guide-card {
   min-width: 0;
-  padding: 14px;
+  padding: 16px;
   display: grid;
   grid-template-columns: 70px minmax(0, 1fr);
-  gap: 14px;
+  gap: 16px;
   align-items: start;
   border-bottom: 1px solid var(--line);
 }
@@ -3677,6 +3689,7 @@ button:disabled {
 }
 
 .rules-guide-card-face {
+  align-self: center;
   width: 70px;
   height: 128px;
 }
