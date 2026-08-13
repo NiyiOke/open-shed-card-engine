@@ -103,6 +103,13 @@ test("the guide has valid heading structure and a semantic deck inventory", () =
   }
 });
 
+test("action-card columns size independently instead of stretching the shorter group", () => {
+  assert.match(
+    CSS_SOURCE,
+    /\.rules-guide-card-groups\s*\{[^}]*\balign-items:\s*start\s*;?[^}]*\}/u,
+  );
+});
+
 test("the guide provides an early close control and a complete modal focus lifecycle", () => {
   const titleIndex = GAME_SHELL_SOURCE.indexOf('id="game-guide-title"');
   const closeIndex = GAME_SHELL_SOURCE.indexOf('aria-label="Close rules guide"');

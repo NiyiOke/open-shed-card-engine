@@ -1,48 +1,36 @@
-# Option 1 card redesign — design QA
+# Action-card rules layout — design QA
 
 ## Evidence
 
-- Source visual truth: `docs/design/option-1-card-reference.webp`.
-- Browser-rendered desktop implementation: `docs/design/option-1-card-implementation-desktop.jpg`.
-- Browser-rendered mobile implementation: `docs/design/option-1-card-implementation-mobile.jpg`.
-- Full-view side-by-side comparison: `docs/design/option-1-card-comparison-full.jpg`.
-- Focused hand-card comparison: `docs/design/option-1-card-comparison-focused.jpg`.
-- Source pixels: 1492 × 1054.
-- Desktop capture: 1492 × 1200 pixels from a 1492 × 1200 CSS viewport at device scale 1. The comparison preserves the shared 1492-pixel width; the implementation is taller because it retains the functional draw stack and the full live-game page.
-- Mobile capture: 320 × 900 pixels from a 320 × 900 CSS viewport at device scale 1.
-- State: the source concept shows an opponent turn with Yellow 4; the live capture shows the next turn with Yellow 3 after a real remote command. The hand keeps the same visual archetypes. Dynamic player/card copy was excluded from fidelity judgments where the states differ.
+- Source visual truth: `/var/folders/l9/m1ccvftn5w3bfjslr_p1l6rm0000gn/T/TemporaryItems/NSIRD_screencaptureui_PKkVVU/Screenshot 2026-08-13 at 19.32.04.png`.
+- Source pixels and target CSS viewport: 1771 × 881 at device scale 1.
+- Intended state: signed-out `#action-cards` rules section with both Action-card disclosures open.
+- Browser-rendered post-fix implementation screenshot: unavailable. The selected Codex in-app browser rejected the local preview URL under its local-URL policy after the preview server was started, so a compliant fresh capture and same-viewport visual comparison could not be completed.
 
 ## Findings
 
-- No actionable P0, P1, or P2 findings remain.
-- Fonts and typography: the implementation preserves the concept's heavy sans numerals, compact mono corner identifiers, and bold uppercase rule labels. Long action names wrap to two short lines without clipping.
-- Spacing and layout rhythm: at the 1492-pixel comparison width, hand cards reach the same approximately 150-pixel width and 1:1.83 proportion as the source. The table discard keeps the shorter pile-card proportion. The added draw stack is an intentional gameplay affordance rather than design drift.
-- Colors and visual tokens: the charcoal chassis, warm keyline, subdued red/yellow/green/blue faces, and acid interaction ring map closely to the selected direction. Text and icons retain strong contrast on every color.
-- Image quality and asset fidelity: the generated charcoal pressed-paper texture is a real optimized raster asset; Phosphor supplies crisp vector action icons. No copied UNO artwork, inline custom SVG, emoji, Unicode action glyph, or branded card asset is used.
-- Copy and content: implementation labels come from the rules model and correct semantic errors in the generated concept, including the red 8 and green 9 labels.
-- Accessibility and behavior: hand cards remain native buttons with full accessible names, playable/not-playable status, visible non-color `PLAY` cues, elevated focus stacking, and a lime focus ring. The choice dialog autofocuses, fits at 320 pixels, closes with Escape, and restores focus.
-- Responsiveness: the page has no root overflow at 320 pixels; the hand alone scrolls horizontally, and both the first and final cards remain reachable. Mobile cards retain the large identifier, icon, label, and minimum touch area.
-- Console: a fresh preview tab produced only Vite/React development messages and no errors.
+- [P1, fixed in source] The four-card Wild Action panel was stretched to the height of the six-card Color Action panel, producing a large empty bordered block below Color Roulette. The shared two-column grid used CSS Grid's default cross-axis stretching. `.rules-guide-card-groups` now uses `align-items: start`, so each disclosure sizes to its own content while preserving equal column widths.
+- Fonts and typography: unchanged by the fix.
+- Spacing and layout rhythm: the only intended change is removal of the false empty height from the shorter Wild panel; card rows, column gap, borders, and the following section remain unchanged.
+- Colors and visual tokens: unchanged.
+- Image quality and asset fidelity: the existing semantic `CardFace` assets are unchanged.
+- Copy and content: unchanged; all ten Action-card types remain rendered from the canonical rules registry.
+- Accessibility and interaction: native `<details>/<summary>` behavior, focus styles, type counts, and the ≤720px one-column reflow are unchanged.
 
 ## Comparison history
 
-1. Initial comparison found a P2 density issue: the original 34-pixel negative overlap covered wild-spectrum markers and parts of longer labels.
-2. The hand was changed to responsive 128–150-pixel cards with a 10-pixel desktop overlap, preserving labels and the selected concept's wider fan.
-3. Post-fix evidence in `docs/design/option-1-card-comparison-focused.jpg` shows the markers, central icons, labels, and lime selected state clearly at the same normalized card height.
-
-## Open questions
-
-- None blocking. The implementation keeps sharper angular panel joins than the slightly rounded AI concept so the geometry is repeatable across every dynamic card; this is acceptable P3 identity polish.
+1. The supplied 1771 × 881 screenshot exposed the P1 grid-stretch defect.
+2. Source inspection confirmed six Color cards and four Wild cards share one grid row with default `align-items: stretch`.
+3. The scoped `align-items: start` correction and a block-bounded regression contract were added. Focused rules tests, the full unit suite, TypeScript, lint, production build, diff-check, and client performance budgets pass.
+4. A post-fix same-viewport browser capture remains blocked by the selected browser's local-preview URL policy. No visual pass is claimed from source/tests alone.
 
 ## Implementation checklist
 
-- [x] Reusable card presentation model covers every card kind.
-- [x] Hand and table discard use the same DOM card face.
-- [x] Desktop, mobile, focus, playable, dialog, and live remote-turn states verified.
-- [x] Unit tests, typecheck, lint, production build, and production dependency audit pass.
+- [x] Scope the fix to Action-card groups; leave scoring grids unchanged.
+- [x] Preserve mobile one-column behavior and native disclosure semantics.
+- [x] Add a regression contract that cannot match declarations outside the target CSS block.
+- [x] Run focused and full automated release gates.
+- [ ] Capture and compare the corrected 1771 × 881 public rules page in the selected browser.
+- [ ] Recheck 1280px, 320px, and effective 200% zoom geometry before deployment.
 
-## Follow-up polish
-
-- P3: if a future art pass calls for softer panel seams, replace the shared normalized polygon with a reusable masked asset while preserving the current dynamic color and icon layers.
-
-final result: passed
+final result: blocked
