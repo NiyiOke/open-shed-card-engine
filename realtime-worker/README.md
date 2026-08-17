@@ -68,7 +68,7 @@ Claims contain exactly:
 - `subject` exists only in the serialized ready-socket attachment for the hibernation-safe quota. It is never logged, returned, or broadcast.
 - The shared secret must be 32–256 UTF-8 bytes without control characters and must never reach browser code.
 
-The ticket is necessarily present transiently in the request's `Sec-WebSocket-Protocol` header so the upgrade can be authenticated before a room exists. TLS protects it in transit and its 30-second one-use lifetime limits exposure. Worker observability, logs, and traces are explicitly disabled in `wrangler.jsonc`. Do not log request headers, enable request logging, configure `Sec-WebSocket-Protocol` as a custom Logpush field, or include headers in error reporting. A deployment review must inspect `wrangler tail`/Logpush configuration with a canary ticket before enabling production traffic. The 101 response must echo only the base protocol, and the browser must verify `socket.protocol` equals it.
+The ticket is necessarily present transiently in the request's `Sec-WebSocket-Protocol` header so the upgrade can be authenticated before a room exists. TLS protects it in transit and its 30-second one-use lifetime limits exposure. Worker observability, invocation logs, persistence, and traces are explicitly disabled in `wrangler.jsonc`. Do not log request headers, configure `Sec-WebSocket-Protocol` as a custom Logpush field, or include headers in error reporting. Cloudflare's privileged Real-time Logs / `wrangler tail` surface can include this header because its name does not match Cloudflare's heuristic secret-redaction list. The Worker durably consumes the one-use ticket nonce before returning a successful upgrade, so an accepted ticket is already spent. Treat Workers Tail Read and Scripts Write as credential-adjacent privileges. Never run any production Real-time Logs or live-tail session while realtime user traffic is enabled, regardless of nominal redaction; never pipe one to a file; and count terminal scrollback or diagnostic artifacts as retention. The 101 response must echo only the base protocol, and the browser must verify `socket.protocol` equals it.
 
 ## Exact post-commit notification
 
@@ -128,7 +128,7 @@ Infrastructure still required:
 - A final Worker hostname or custom domain for Sites `OPEN_SHED_REALTIME_URL`.
 - One independent random `OPEN_SHED_REALTIME_SHARED_SECRET`, configured identically in Sites and the Worker.
 - The exact production Sites origin in `ALLOWED_ORIGINS` (the current Sites origin is preconfigured).
-- Explicit review that Worker observability remains off and no account-level/custom HTTP logs capture `Sec-WebSocket-Protocol`.
+- Explicit review that Worker observability, invocation logging, persistence, Tail Workers, Logpush, and custom HTTP header logging remain off. Privileged live-tail access is separately restricted and never retained.
 
 Recommended rollout:
 
@@ -136,7 +136,7 @@ Recommended rollout:
 2. Authenticate Wrangler, run `wrangler deploy --dry-run --env production`, and inspect the `v1` SQLite Durable Object migration and disabled observability settings.
 3. Deploy the production Worker before installing its shared secret. Although the production switch is explicit, the missing secret keeps its transport fail-closed.
 4. Generate one independent random secret, install it with `wrangler secret put OPEN_SHED_REALTIME_SHARED_SECRET --env production`, and configure the identical value plus the Worker URL in Sites while leaving the Sites `OPEN_SHED_REALTIME_ENABLED` switch off. Never put the secret in source or `wrangler.jsonc`.
-5. Deploy the Sites release with realtime still off, then inspect a direct canary upgrade and Cloudflare logging configuration to prove the auth protocol token is absent from logs.
+5. Deploy the Sites release with realtime still off and verify its ticket route reports `enabled: false`. Wait at least 65 seconds for every previously minted ticket, clock-skew allowance, authorization lease, and socket to expire before attaching any privileged diagnostic stream. Inspect a synthetic canary upgrade and prove that no persistent Workers Logs, Tail Worker, Logpush job, OTEL destination, or custom header field retains the auth protocol token. Stop the diagnostic session, discard its output, and confirm account-wide that no live-tail client remains.
 6. Enable the Sites switch for the staged rollout while monitoring rejection rates, 1011/1013 closes, reconnects, and authoritative refetch latency.
 7. Retain polling permanently as the rollback and missed-hint recovery path; disabling the Sites switch requires no Worker or database rollback.
 

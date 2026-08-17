@@ -33,5 +33,7 @@ Important invariants:
   room-bound ticket before a Durable Object is selected, and post-commit hints are
   independently timestamped, nonce-bound, body-bound, and replay-protected;
 - the WebSocket bearer appears transiently only in the encrypted protocol-offer
-  header, so realtime Worker observability, request logs, and traces remain disabled
-  and account/custom logs must never retain `Sec-WebSocket-Protocol`.
+  header, so realtime Worker observability, invocation-log persistence, exports,
+  and traces remain disabled and no persistent account/custom log may retain
+  `Sec-WebSocket-Protocol`; privileged Cloudflare live-tail access is treated as
+  credential-adjacent, prohibited during user traffic, and never retained.

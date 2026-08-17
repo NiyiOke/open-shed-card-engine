@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { isAllowedOrigin, readConfig } from "../src/config";
 
@@ -8,6 +10,29 @@ test("realtime is disabled unless explicitly enabled", () => {
   assert.equal(readConfig({ OPEN_SHED_REALTIME_ENABLED: "false" }).enabled, false);
   assert.equal(readConfig({ OPEN_SHED_REALTIME_ENABLED: "TRUE" }).enabled, false);
   assert.equal(readConfig({ OPEN_SHED_REALTIME_ENABLED: "true" }).enabled, true);
+});
+
+test("persistent and invocation logging stay explicitly disabled in every environment", () => {
+  const wrangler = JSON.parse(
+    readFileSync(
+      fileURLToPath(new URL("../wrangler.jsonc", import.meta.url)),
+      "utf8",
+    ),
+  ) as {
+    observability?: { logs?: Record<string, unknown> };
+    env?: { production?: { observability?: { logs?: Record<string, unknown> } } };
+  };
+
+  for (const logs of [
+    wrangler.observability?.logs,
+    wrangler.env?.production?.observability?.logs,
+  ]) {
+    assert.deepEqual(logs, {
+      enabled: false,
+      invocation_logs: false,
+      persist: false,
+    });
+  }
 });
 
 test("origin allowlist is exact and fails closed", () => {
