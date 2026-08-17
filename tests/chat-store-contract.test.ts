@@ -223,8 +223,11 @@ test("game purge removes ephemeral chat but never couples report evidence to gam
 
 test("request-path retention cleanup is best-effort and retries after failure", () => {
   const start = STORE_SOURCE.indexOf("async function maybeCleanupCommunication");
-  const slice = STORE_SOURCE.slice(start);
-  assert.match(slice, /cleanupExpiredCommunicationRows\(database, now\)/u);
-  assert.match(slice, /\.catch\(\(\) => \{[\s\S]*lastCleanupAt = 0/u);
-  assert.doesNotMatch(slice, /\.catch\(\(error\)[\s\S]*throw error/u);
+  const end = STORE_SOURCE.indexOf("async function hashText", start);
+  const slice = STORE_SOURCE.slice(start, end);
+  assert.match(
+    slice,
+    /try \{[\s\S]*await communicationCleanupGate\.run\(now, \(\) =>[\s\S]*cleanupExpiredCommunicationRows\(database, now\)[\s\S]*\} catch \{/u,
+  );
+  assert.doesNotMatch(slice, /throw/u);
 });

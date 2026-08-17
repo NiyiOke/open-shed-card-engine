@@ -69,6 +69,7 @@ import {
 } from "./live-voice-cleanup";
 import { getV15FeaturePolicy } from "./v15-feature-policy";
 import { gameCommandActivityFields } from "./game-command-response";
+import { createRequestMaintenanceGate } from "./request-maintenance";
 
 type ProfileRow = {
   id: string;
@@ -294,10 +295,13 @@ const OPEN_ROOM_LIFECYCLE: RoomLifecycleUpdate = Object.freeze({
   abandonedSince: null,
 });
 
-let lastPurgeAt = 0;
-let purgePromise: Promise<void> | null = null;
-let lastRoomMaintenanceAt = 0;
-let roomMaintenancePromise: Promise<void> | null = null;
+// D1 promises belong to the request that created them. Only cadence timestamps
+// may be shared across Worker requests; an aborted request must not leave later
+// requests awaiting its canceled I/O.
+const purgeGate = createRequestMaintenanceGate(PURGE_INTERVAL_MS);
+const roomMaintenanceGate = createRequestMaintenanceGate(
+  ROOM_MAINTENANCE_INTERVAL_MS,
+);
 
 export async function getPublicAvailability(): Promise<PublicAvailability> {
   if (!getV15FeaturePolicy().discoveryEnabled) {
@@ -5032,18 +5036,9 @@ async function maybeMaintainRoomLifecycles(
   database: D1Database,
   now: number,
 ): Promise<void> {
-  if (roomMaintenancePromise) return roomMaintenancePromise;
-  if (now - lastRoomMaintenanceAt < ROOM_MAINTENANCE_INTERVAL_MS) return;
-  lastRoomMaintenanceAt = now;
-  roomMaintenancePromise = maintainRoomLifecycleRows(database, now)
-    .catch((error) => {
-      lastRoomMaintenanceAt = 0;
-      throw error;
-    })
-    .finally(() => {
-      roomMaintenancePromise = null;
-    });
-  return roomMaintenancePromise;
+  await roomMaintenanceGate.run(now, () =>
+    maintainRoomLifecycleRows(database, now),
+  );
 }
 
 async function maintainRoomLifecycleRows(
@@ -5406,18 +5401,7 @@ async function maybePurgeExpiredGames(
   database: D1Database,
   now: number,
 ): Promise<void> {
-  if (purgePromise) return purgePromise;
-  if (now - lastPurgeAt < PURGE_INTERVAL_MS) return;
-  lastPurgeAt = now;
-  purgePromise = purgeExpiredRows(database, now)
-    .catch((error) => {
-      lastPurgeAt = 0;
-      throw error;
-    })
-    .finally(() => {
-      purgePromise = null;
-    });
-  return purgePromise;
+  await purgeGate.run(now, () => purgeExpiredRows(database, now));
 }
 
 async function purgeExpiredRows(

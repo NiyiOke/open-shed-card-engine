@@ -20,6 +20,7 @@ import {
   type ReportReasonId,
 } from "./communication-policy";
 import { getV15FeaturePolicy } from "./v15-feature-policy";
+import { createRequestMaintenanceGate } from "./request-maintenance";
 
 type TableMessageBase = Readonly<{
   id: string;
@@ -159,8 +160,11 @@ const MESSAGE_OPERATION = "chat_message_send";
 const REPORT_OPERATION = "chat_message_report";
 const COMMUNICATION_CLEANUP_INTERVAL_MS = 5 * 60_000;
 
-let cleanupPromise: Promise<void> | null = null;
-let lastCleanupAt = 0;
+// Never cache request-bound D1 cleanup promises at module scope. A canceled
+// request can otherwise strand every later request handled by the isolate.
+const communicationCleanupGate = createRequestMaintenanceGate(
+  COMMUNICATION_CLEANUP_INTERVAL_MS,
+);
 
 export async function listTableMessages(
   user: AuthenticatedUser,
@@ -1594,20 +1598,15 @@ async function maybeCleanupCommunication(
   database: D1Database,
   now: number,
 ): Promise<void> {
-  if (cleanupPromise) return cleanupPromise;
-  if (now - lastCleanupAt < COMMUNICATION_CLEANUP_INTERVAL_MS) return;
-  lastCleanupAt = now;
-  cleanupPromise = cleanupExpiredCommunicationRows(database, now)
-    .catch(() => {
-      lastCleanupAt = 0;
-      // Retention maintenance is best-effort on the request path. A transient
-      // D1 cleanup failure must not take down an otherwise valid chat read,
-      // send, report, mute, or block operation; the next request retries it.
-    })
-    .finally(() => {
-      cleanupPromise = null;
-    });
-  return cleanupPromise;
+  try {
+    await communicationCleanupGate.run(now, () =>
+      cleanupExpiredCommunicationRows(database, now),
+    );
+  } catch {
+    // Retention maintenance is best-effort on the request path. A transient
+    // D1 cleanup failure must not take down an otherwise valid chat read,
+    // send, report, mute, or block operation; the next request retries it.
+  }
 }
 
 async function hashText(value: string): Promise<string> {
