@@ -242,6 +242,26 @@ export const gameMessages = sqliteTable(
   ],
 );
 
+/**
+ * Durable, opaque positions for the chat feed. Message rows expire after one
+ * day, but their cursor positions remain for the lifetime of the game so a
+ * reconnect can continue safely without depending on wall-clock timestamps or
+ * the lexical order of random message IDs.
+ */
+export const gameMessageCursors = sqliteTable(
+  "game_message_cursors",
+  {
+    sequence: integer("sequence").primaryKey({ autoIncrement: true }),
+    cursorId: text("cursor_id").notNull(),
+    gameId: text("game_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_game_message_cursors_id").on(table.cursorId),
+    index("idx_game_message_cursors_feed").on(table.gameId, table.sequence),
+  ],
+);
+
 export const gameMessageReports = sqliteTable(
   "game_message_reports",
   {

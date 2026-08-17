@@ -62,11 +62,15 @@ test("polling and render loops remain bounded and clean up browser resources", (
   assert.doesNotMatch(GAME_SHELL, /setInterval\(/u);
   assert.match(
     GAME_SHELL,
-    /if \(existing\?\.gameId === gameId\) return existing\.promise/u,
+    /if \(existing\?\.gameId === gameId\) \{[\s\S]*?if \(!trailing\) return existing\.promise;[\s\S]*?existing\.promise\.then\(\(\) => refreshGame\(gameId\)\)/u,
   );
   assert.match(GAME_SHELL, /pollFailureCountRef\.current \+ 1, 5/u);
   assert.match(GAME_SHELL, /Math\.min\(15_000, 1_500 \* 2 \*\* pollFailureCountRef\.current\)/u);
-  assert.match(GAME_SHELL, /document\.hidden \? Math\.max\(10_000, visibleDelay\)/u);
+  assert.match(
+    GAME_SHELL,
+    /document\.hidden[\s\S]*Math\.max\(realtimeState === "live" \? 30_000 : 10_000, visibleDelay\)/u,
+  );
+  assert.match(GAME_SHELL, /realtimeState === "live"[\s\S]*\? 25_000/u);
   assert.match(GAME_SHELL, /controller\?\.abort\(\)/u);
   assert.equal(
     occurrences(GAME_SHELL, 'window.addEventListener("focus", refreshNow)'),

@@ -26,3 +26,12 @@ Important invariants:
   payloads or public logs;
 - game commands are durably idempotent, related snapshot/event writes are atomic,
   cross-origin mutations are rejected, and authenticated mutation quotas bound abuse.
+- WebSockets are notification-only: the companion receives opaque room/subject values,
+  emits no game or chat content, accepts no mutation, and every hint causes a fresh
+  viewer-authorized Sites read; HTTP polling remains the recovery path;
+- realtime upgrades require an exact production origin plus a short-lived, one-use,
+  room-bound ticket before a Durable Object is selected, and post-commit hints are
+  independently timestamped, nonce-bound, body-bound, and replay-protected;
+- the WebSocket bearer appears transiently only in the encrypted protocol-offer
+  header, so realtime Worker observability, request logs, and traces remain disabled
+  and account/custom logs must never retain `Sec-WebSocket-Protocol`.

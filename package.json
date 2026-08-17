@@ -1,6 +1,6 @@
 {
   "name": "open-shed-card-engine",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -18,6 +18,8 @@
     "test:v16-continuity": "node scripts/v16-continuity-acceptance.mjs",
     "test:v161-rules": "node scripts/v161-rules-clarity-acceptance.mjs",
     "test:v162-lobby": "node scripts/v162-lobby-presence-acceptance.mjs",
+    "test:realtime": "node --import tsx scripts/realtime-worker-acceptance.mjs",
+    "test:realtime-sites": "node --import tsx scripts/realtime-sites-integration-acceptance.mjs",
     "test:performance": "node --import tsx scripts/check-client-performance.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",

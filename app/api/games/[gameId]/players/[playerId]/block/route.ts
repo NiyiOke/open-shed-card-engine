@@ -44,7 +44,8 @@ async function mutateBlock(
       "INVALID_SAFETY_ACTION",
       "Block requests do not accept additional fields.",
     );
-    return jsonResponse(await setProfileBlock(user, gameId, playerId, blocked));
+    const result = await setProfileBlock(user, gameId, playerId, blocked);
+    return jsonResponse(result);
   } catch (error) {
     return routeErrorResponse(error);
   }

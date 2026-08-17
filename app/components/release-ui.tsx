@@ -10,9 +10,9 @@ import {
 export const NEXT_RELEASE_LABEL = "V1.7" as const;
 
 export const RELEASE_NOTES = Object.freeze([
-  "Invite links now explain how to recover when ChatGPT authorization is denied inside a mobile in-app browser.",
-  "Players can opt in with a separate public alias while looking for a game; waiting hosts can invite them without exposing account names or table codes.",
-  "Lobby invitations are short-lived, rate-limited, block-aware, and accept into the table atomically with public-safe quick phrases only.",
+  "WebSocket signals now wake connected tables for faster turns and chat while every private view still comes from the authoritative Sites API.",
+  "Stable chat cursors recover same-moment messages, expired history, and reconnects without skipping or duplicating the visible feed.",
+  "Automatic polling remains active as a safety net, and lost command responses no longer skip intervening Activity updates.",
 ] as const);
 
 export const NEXT_RELEASE_PREVIEW =

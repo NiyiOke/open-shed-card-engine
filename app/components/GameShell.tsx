@@ -36,6 +36,7 @@ import {
   seriesWinLabel,
   winnerReasonLabel,
 } from "./continuity-ui";
+import { parseCommandActivityDelivery, reconcileCommandActivity, type ActivityEventLine } from "./game-activity-sync";
 import {
   createGameAudioController,
   type AudioCapabilities,
@@ -115,6 +116,7 @@ import {
   LobbyPresencePanel,
   type LobbyInviteResponseAction,
 } from "./LobbyPresencePanels";
+import { useRealtimeUpdates } from "./use-realtime-updates";
 
 type Session = {
   signedIn: boolean;
@@ -128,7 +130,7 @@ type SessionResponse = {
 };
 
 type Lobbies = { mine: LobbySummary[] };
-type EventLine = { type: string; message: string };
+type EventLine = ActivityEventLine;
 type RequestFailure = Error & { code?: string; status?: number };
 type ConnectionState = "live" | "syncing" | "reconnecting" | "offline";
 type GuideTopic = "rules" | "actions";
@@ -691,12 +693,17 @@ export function GameShell({
     };
   }, []);
 
-  const refreshGame = useCallback((requestedGameId?: string): Promise<boolean> => {
+  const refreshGame = useCallback(function refreshGame(
+    requestedGameId?: string, trailing = false,
+  ): Promise<boolean> {
     const gameId = requestedGameId ?? gameRef.current?.gameId;
     if (!gameId) return Promise.resolve(false);
 
     const existing = pollRequestRef.current;
-    if (existing?.gameId === gameId) return existing.promise;
+    if (existing?.gameId === gameId) {
+      if (!trailing) return existing.promise;
+      return existing.promise.then(() => refreshGame(gameId));
+    }
     existing?.controller.abort();
 
     const controller = new AbortController();
@@ -785,6 +792,11 @@ export function GameShell({
         !blockedChatPlayers[message.senderPlayerId],
     );
   }, [blockedChatPlayers, chatMessages, game, mutedChatPlayers]);
+
+  const realtimeState = useRealtimeUpdates(activeGameId, request, refreshGame,
+    () => gameRef.current?.gameId ?? null,
+    () => setChatRefreshTick((current) => current + 1),
+  );
   const chatDraftGraphemes = useMemo(
     () => countChatGraphemes(chatDraft),
     [chatDraft],
@@ -889,7 +901,6 @@ export function GameShell({
     };
     const previous = audioTransitionRef.current;
 
-    // Entering or re-opening a table hydrates the baseline without replaying old cues.
     if (
       !previous ||
       previous.gameId !== current.gameId ||
@@ -1118,7 +1129,9 @@ export function GameShell({
       if (timeout !== null) window.clearTimeout(timeout);
       timeout = window.setTimeout(
         poll,
-        documentVisible && navigator.onLine ? 2_500 : 12_000,
+        realtimeState === "live"
+          ? documentVisible && navigator.onLine ? 30_000 : 45_000
+          : documentVisible && navigator.onLine ? 2_500 : 12_000,
       );
     };
     const hideDisabledChat = () => {
@@ -1263,6 +1276,7 @@ export function GameShell({
     chatRefreshTick,
     documentVisible,
     mutedChatPlayers,
+    realtimeState,
     request,
   ]);
 
@@ -1284,12 +1298,16 @@ export function GameShell({
     const schedule = () => {
       if (cancelled) return;
       if (timeout !== null) window.clearTimeout(timeout);
-      const visibleDelay = activeGamePhase === "complete"
-        ? 5_000
-        : Math.min(15_000, 1_500 * 2 ** pollFailureCountRef.current);
+      const visibleDelay = realtimeState === "live"
+        ? 25_000
+        : activeGamePhase === "complete"
+          ? 5_000
+          : Math.min(15_000, 1_500 * 2 ** pollFailureCountRef.current);
       timeout = window.setTimeout(() => {
         void refreshGame(activeGameId).finally(schedule);
-      }, document.hidden ? Math.max(10_000, visibleDelay) : visibleDelay);
+      }, document.hidden
+        ? Math.max(realtimeState === "live" ? 30_000 : 10_000, visibleDelay)
+        : visibleDelay);
     };
     const refreshNow = () => {
       if (timeout !== null) window.clearTimeout(timeout);
@@ -1311,7 +1329,7 @@ export function GameShell({
       window.removeEventListener("online", refreshNow);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [activeGameId, activeGamePhase, refreshGame]);
+  }, [activeGameId, activeGamePhase, realtimeState, refreshGame]);
 
   useEffect(() => {
     if (!activeGameId) return;
@@ -1404,6 +1422,7 @@ export function GameShell({
         release: APP_RELEASE_IDENTITY,
         mode: game?.phase ?? (session?.signedIn ? "lobby-browser" : "signed-out"),
         connection: connectionState,
+        realtime: realtimeState,
         effects: {
           reducedMotion,
           playedCardPulse: Boolean(
@@ -1538,6 +1557,7 @@ export function GameShell({
     playedCardFxRevision,
     presence,
     reducedMotion,
+    realtimeState,
     session,
     sidebarTab,
     soundCapabilities,
@@ -1880,6 +1900,7 @@ export function GameShell({
         const response = await request<{
           view?: GameView;
           events?: EventLine[];
+          eventCursor: number | null;
           replayed: boolean;
           listing?: ViewerListing | null;
         }>(`/api/games/${encodeURIComponent(commandGame.gameId)}/commands`, {
@@ -1891,15 +1912,21 @@ export function GameShell({
             command: record.command,
           }),
         });
-        const responseRevision = response.view?.revision ?? null;
+        const activityDelivery = parseCommandActivityDelivery(response);
+        if (!activityDelivery) {
+          throw new Error("Invalid activity response. Refresh and try again.");
+        }
         if (Object.prototype.hasOwnProperty.call(response, "listing")) {
           setListing(parseViewerListing(response.listing));
         }
         const cursorBeforeResponse = eventCursorRef.current;
-        const responseAlreadyObserved =
-          responseRevision !== null &&
-          cursorBeforeResponse?.gameId === commandGame.gameId &&
-          cursorBeforeResponse.revision >= responseRevision;
+        const activityUpdate = reconcileCommandActivity(
+          cursorBeforeResponse?.gameId === commandGame.gameId
+            ? cursorBeforeResponse.revision
+            : null,
+          record.expectedRevision,
+          activityDelivery,
+        );
         const currentGame = gameRef.current;
         if (
           record.command.type !== "leave_game" &&
@@ -1910,22 +1937,21 @@ export function GameShell({
             gameRef.current = response.view;
             setGame(response.view);
           }
-          eventCursorRef.current = {
-            gameId: response.view.gameId,
-            revision: Math.max(
-              cursorBeforeResponse?.gameId === response.view.gameId
-                ? cursorBeforeResponse.revision
-                : 0,
-              response.view.revision,
-            ),
-          };
+          if (activityUpdate.eventCursor !== null) {
+            eventCursorRef.current = {
+              gameId: response.view.gameId,
+              revision: activityUpdate.eventCursor,
+            };
+          }
         }
         if (
-          response.events?.length &&
-          gameRef.current?.gameId === commandGame.gameId &&
-          !responseAlreadyObserved
+          activityUpdate.eventsToAppend.length &&
+          gameRef.current?.gameId === commandGame.gameId
         ) {
-          setEvents((current) => [...current, ...response.events!].slice(-12));
+          setEvents((current) => [
+            ...current,
+            ...activityUpdate.eventsToAppend,
+          ].slice(-12));
         }
         setPendingCard(null);
         setChosenColor(null);

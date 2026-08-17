@@ -1,0 +1,64 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "open-shed-realtime",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-17",
+  "workers_dev": true,
+  "vars": {
+    "ENVIRONMENT": "development",
+    "ALLOWED_ORIGINS": "[\"http://localhost:3000\",\"http://127.0.0.1:3000\"]",
+    "MAX_CONNECTIONS_PER_ROOM": "64",
+    "MAX_READY_CONNECTIONS_PER_SUBJECT": "3",
+    "MAX_NOTIFICATIONS_PER_SECOND": "20",
+    "MAX_BUFFERED_BYTES": "65536",
+    "HEARTBEAT_MS": "25000"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REALTIME_ROOMS",
+        "class_name": "RealtimeRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RealtimeRoom"]
+    }
+  ],
+  "observability": {
+    "enabled": false,
+    "logs": { "enabled": false },
+    "traces": { "enabled": false }
+  },
+  "env": {
+    "production": {
+      "name": "open-shed-realtime-production",
+      "workers_dev": true,
+      "vars": {
+        "ENVIRONMENT": "production",
+        "OPEN_SHED_REALTIME_ENABLED": "true",
+        "ALLOWED_ORIGINS": "[\"https://open-shed-card-game.neo-dabuda.chatgpt.site\"]",
+        "MAX_CONNECTIONS_PER_ROOM": "64",
+        "MAX_READY_CONNECTIONS_PER_SUBJECT": "3",
+        "MAX_NOTIFICATIONS_PER_SECOND": "20",
+        "MAX_BUFFERED_BYTES": "65536",
+        "HEARTBEAT_MS": "25000"
+      },
+      "observability": {
+        "enabled": false,
+        "logs": { "enabled": false },
+        "traces": { "enabled": false }
+      },
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "REALTIME_ROOMS",
+            "class_name": "RealtimeRoom"
+          }
+        ]
+      }
+    }
+  }
+}

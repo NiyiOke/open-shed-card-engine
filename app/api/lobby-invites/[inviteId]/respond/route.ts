@@ -11,6 +11,7 @@ import {
   requireCommandId,
   routeErrorResponse,
 } from "../../../../../lib/server/responses";
+import { notifyRealtimeChange } from "../../../../../lib/server/realtime-notify";
 
 type RouteContext = { params: Promise<{ inviteId: string }> };
 
@@ -38,14 +39,15 @@ export async function POST(request: Request, context: RouteContext) {
       );
     }
     const { inviteId } = await context.params;
-    return jsonResponse(
-      await respondToLobbyInvitation(user, inviteId, {
-        commandId,
-        action: body.action,
-      }),
-    );
+    const result = await respondToLobbyInvitation(user, inviteId, {
+      commandId,
+      action: body.action,
+    });
+    if ("snapshot" in result && !result.invite.replayed) {
+      await notifyRealtimeChange(result.snapshot.view.gameId, ["game", "chat"]);
+    }
+    return jsonResponse(result);
   } catch (error) {
     return routeErrorResponse(error);
   }
 }
-

@@ -44,7 +44,8 @@ async function mutateMute(
       "INVALID_SAFETY_ACTION",
       "Mute requests do not accept additional fields.",
     );
-    return jsonResponse(await setTableMute(user, gameId, playerId, muted));
+    const result = await setTableMute(user, gameId, playerId, muted);
+    return jsonResponse(result);
   } catch (error) {
     return routeErrorResponse(error);
   }

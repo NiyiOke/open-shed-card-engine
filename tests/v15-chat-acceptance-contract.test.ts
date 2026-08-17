@@ -165,6 +165,7 @@ test("chat mutations are confined to communication, receipt, quota, and safety t
     [...mutatedTables].sort(),
     [
       "command_receipts",
+      "game_message_cursors",
       "game_message_receipts",
       "game_message_reports",
       "game_messages",
@@ -220,6 +221,7 @@ test("report evidence survives ordinary game purge until its own 90-day boundary
   );
   assert.match(ordinaryPurge, /DELETE FROM game_message_reports[\s\S]*expires_at <= \?/u);
   assert.match(ordinaryPurge, /DELETE FROM game_messages/u);
+  assert.match(ordinaryPurge, /DELETE FROM game_message_cursors/u);
   assert.match(ordinaryPurge, /DELETE FROM game_message_receipts/u);
   assert.match(ordinaryPurge, /DELETE FROM games WHERE id IN/u);
   const gameDelete = ordinaryPurge.slice(
@@ -228,6 +230,7 @@ test("report evidence survives ordinary game purge until its own 90-day boundary
   );
   assert.doesNotMatch(gameDelete, /game_message_reports/u);
   assert.match(gameDelete, /NOT EXISTS \([\s\S]*FROM game_message_receipts/u);
+  assert.match(gameDelete, /NOT EXISTS \([\s\S]*FROM game_message_cursors/u);
   assert.match(
     RUNTIME_SOURCE,
     /CREATE TABLE IF NOT EXISTS game_message_reports[\s\S]*evidence_sender_display_name[\s\S]*evidence_body_text[\s\S]*expires_at INTEGER NOT NULL/u,

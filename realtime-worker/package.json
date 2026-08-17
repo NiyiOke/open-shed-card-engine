@@ -1,0 +1,21 @@
+{
+  "name": "open-shed-realtime-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run dry-run",
+    "dry-run": "wrangler deploy --dry-run --config wrangler.jsonc --env=\"\" --outdir ../dist/realtime-worker-dry-run && wrangler deploy --dry-run --config wrangler.jsonc --env production --outdir ../dist/realtime-worker-dry-run-production",
+    "dev": "wrangler dev",
+    "deploy:production": "wrangler deploy --env production"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260817.1",
+    "@types/node": "22.19.19",
+    "tsx": "4.20.5",
+    "typescript": "5.9.3",
+    "wrangler": "4.123.0"
+  }
+}

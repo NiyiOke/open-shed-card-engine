@@ -7,6 +7,22 @@ const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   "00000000-0000-4000-8000-000000000000";
 
 const { d1, r2 } = hostingConfig;
+const acceptanceEnvironment = process.env.NODE_ENV !== "production" &&
+  process.env.OPEN_SHED_ACCEPTANCE_ENVIRONMENT === "true"
+  ? Object.fromEntries(
+      [
+        "OPEN_SHED_V15_COMMUNICATION_ENABLED",
+        "OPEN_SHED_V15_FREE_TEXT_ENABLED",
+        "OPEN_SHED_ACCEPTANCE_ENVIRONMENT",
+        "OPEN_SHED_REALTIME_ENABLED",
+        "OPEN_SHED_REALTIME_URL",
+        "OPEN_SHED_REALTIME_SHARED_SECRET",
+      ].flatMap((name) => {
+        const value = process.env[name];
+        return value === undefined ? [] : [[name, value]];
+      }),
+    )
+  : {};
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
@@ -14,6 +30,7 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 const localBindingConfig = {
   main: "./worker/index.ts",
   compatibility_flags: ["nodejs_compat"],
+  vars: acceptanceEnvironment,
   d1_databases: d1
     ? [
         {
@@ -42,6 +59,7 @@ export default defineConfig(async () => {
 
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import("@cloudflare/vite-plugin");
+  const acceptancePersistencePath = process.env.OPEN_SHED_ACCEPTANCE_PERSIST_PATH;
 
   return {
     server: isCodexSeatbeltSandbox
@@ -53,6 +71,9 @@ export default defineConfig(async () => {
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
         config: localBindingConfig,
+        persistState: acceptancePersistencePath
+          ? { path: acceptancePersistencePath }
+          : true,
       }),
     ],
   };

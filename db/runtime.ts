@@ -188,6 +188,16 @@ async function initialize(database: D1Database): Promise<void> {
       ON game_messages(expires_at)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_game_messages_sender_command
       ON game_messages(sender_profile_id, command_id)`,
+    `CREATE TABLE IF NOT EXISTS game_message_cursors (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+      cursor_id TEXT NOT NULL,
+      game_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_game_message_cursors_id
+      ON game_message_cursors(cursor_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_game_message_cursors_feed
+      ON game_message_cursors(game_id, sequence)`,
     `CREATE TABLE IF NOT EXISTS game_message_reports (
       id TEXT PRIMARY KEY NOT NULL,
       game_id TEXT NOT NULL,
@@ -477,6 +487,18 @@ async function initialize(database: D1Database): Promise<void> {
     "evidence_body_text",
     "ALTER TABLE game_message_reports ADD COLUMN evidence_body_text TEXT",
   );
+  // Preserve every legacy opaque message ID as a stable feed position. New
+  // positions are allocated by SQLite AUTOINCREMENT when messages are sent.
+  await database
+    .prepare(
+      `INSERT OR IGNORE INTO game_message_cursors (
+         cursor_id, game_id, created_at
+       )
+       SELECT id, game_id, created_at
+       FROM game_messages
+       ORDER BY created_at, id`,
+    )
+    .run();
   await database
     .prepare(
       `CREATE INDEX IF NOT EXISTS idx_games_room_status_abandoned
