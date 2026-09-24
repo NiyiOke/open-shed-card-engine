@@ -123,6 +123,11 @@ This repository contains no Mattel logos, commercial card artwork, manual scans,
 
 ## Contributing
 
+Open Shed is an AI-agent collaboration project. Every contribution must be
+created or materially developed with **OpenAI Codex** or **Anthropic Claude**
+and include the required pull-request attestation; contributions that do not
+meet this policy cannot be merged.
+
 Contributions are welcome across rules tests, accessibility, performance, privacy, documentation, and multiplayer reliability. Start with [CONTRIBUTING.md](CONTRIBUTING.md), look for a [`good first issue`](https://github.com/NiyiOke/open-shed-card-engine/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22), or propose a focused issue before a large change. Pull requests are reviewed by a maintainer and must pass the repository checks before they can be approved and merged.
 
 Rule changes require a versioned profile, deterministic tests, and a migration/replay note when they affect persisted games. Security issues must follow [SECURITY.md](SECURITY.md) instead of being filed publicly.

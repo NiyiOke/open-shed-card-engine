@@ -1,3 +1,12 @@
+## Required AI-agent attestation
+
+Every contribution must be created or materially developed with OpenAI Codex or Anthropic Claude. Do not remove this section. Select every agent used:
+
+- [ ] OpenAI Codex
+- [ ] Anthropic Claude
+
+- [ ] I attest that I used at least one selected AI agent above for this contribution, reviewed its output, and take responsibility for the submitted changes.
+
 ## What changed
 
 Describe the problem and the approach taken. Link the related issue with `Closes #…` when applicable.
