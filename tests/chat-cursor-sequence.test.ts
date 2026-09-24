@@ -12,103 +12,118 @@ const MIGRATION = readFileSync(
 );
 
 test("migration backfills deterministic positions for legacy same-ms messages", () => {
-  using database = legacyDatabase();
-  const createdAt = 1_786_970_000_000;
-  const laterId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-  const earlierId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-  insertMessage(database, laterId, "game-a", createdAt);
-  insertMessage(database, earlierId, "game-a", createdAt);
+  withDatabase(legacyDatabase(), (database) => {
+    const createdAt = 1_786_970_000_000;
+    const laterId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const earlierId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    insertMessage(database, laterId, "game-a", createdAt);
+    insertMessage(database, earlierId, "game-a", createdAt);
 
-  applyMigration(database);
+    applyMigration(database);
 
-  assert.deepEqual(readFeed(database, "game-a"), [earlierId, laterId]);
-  assert.deepEqual(
-    (database
-      .prepare(
-        `SELECT cursor_id AS cursorId, sequence
-         FROM game_message_cursors ORDER BY sequence`,
-      )
-      .all() as { cursorId: string; sequence: number }[]).map((row) => ({
-        cursorId: row.cursorId,
-        sequence: row.sequence,
-      })),
-    [
-      { cursorId: earlierId, sequence: 1 },
-      { cursorId: laterId, sequence: 2 },
-    ],
-  );
+    assert.deepEqual(readFeed(database, "game-a"), [earlierId, laterId]);
+    assert.deepEqual(
+      (database
+        .prepare(
+          `SELECT cursor_id AS cursorId, sequence
+           FROM game_message_cursors ORDER BY sequence`,
+        )
+        .all() as { cursorId: string; sequence: number }[]).map((row) => ({
+          cursorId: row.cursorId,
+          sequence: row.sequence,
+        })),
+      [
+        { cursorId: earlierId, sequence: 1 },
+        { cursorId: laterId, sequence: 2 },
+      ],
+    );
+  });
 });
 
 test("same-millisecond commits follow D1 allocation order rather than random ID order", () => {
-  using database = migratedDatabase();
-  const createdAt = 1_786_970_001_000;
-  const firstCommitted = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-  const secondCommitted = "11111111111111111111111111111111";
+  withDatabase(migratedDatabase(), (database) => {
+    const createdAt = 1_786_970_001_000;
+    const firstCommitted = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const secondCommitted = "11111111111111111111111111111111";
 
-  commitMessage(database, firstCommitted, "game-a", createdAt);
-  commitMessage(database, secondCommitted, "game-a", createdAt);
+    commitMessage(database, firstCommitted, "game-a", createdAt);
+    commitMessage(database, secondCommitted, "game-a", createdAt);
 
-  assert.ok(secondCommitted < firstCommitted, "fixture must oppose lexical order");
-  assert.deepEqual(readFeed(database, "game-a"), [firstCommitted, secondCommitted]);
+    assert.ok(secondCommitted < firstCommitted, "fixture must oppose lexical order");
+    assert.deepEqual(readFeed(database, "game-a"), [firstCommitted, secondCommitted]);
+  });
 });
 
 test("a cursor remains usable after its one-day message row is removed", () => {
-  using database = migratedDatabase();
-  const expiredId = "22222222222222222222222222222222";
-  const nextId = "33333333333333333333333333333333";
-  commitMessage(database, expiredId, "game-a", 1_786_970_002_000);
-  const expiredPosition = database
-    .prepare(
-      `SELECT sequence FROM game_message_cursors
-       WHERE game_id = ? AND cursor_id = ?`,
-    )
-    .get("game-a", expiredId) as { sequence: number };
+  withDatabase(migratedDatabase(), (database) => {
+    const expiredId = "22222222222222222222222222222222";
+    const nextId = "33333333333333333333333333333333";
+    commitMessage(database, expiredId, "game-a", 1_786_970_002_000);
+    const expiredPosition = database
+      .prepare(
+        `SELECT sequence FROM game_message_cursors
+         WHERE game_id = ? AND cursor_id = ?`,
+      )
+      .get("game-a", expiredId) as { sequence: number };
 
-  database.prepare("DELETE FROM game_messages WHERE id = ?").run(expiredId);
-  commitMessage(database, nextId, "game-a", 1_786_970_003_000);
+    database.prepare("DELETE FROM game_messages WHERE id = ?").run(expiredId);
+    commitMessage(database, nextId, "game-a", 1_786_970_003_000);
 
-  assert.deepEqual(
-    (database
+    assert.deepEqual(
+      (database
+        .prepare(
+          `SELECT message.id
+           FROM game_messages message
+           JOIN game_message_cursors position
+             ON position.cursor_id = message.id
+            AND position.game_id = message.game_id
+           WHERE message.game_id = ? AND position.sequence > ?
+           ORDER BY position.sequence`,
+        )
+        .all("game-a", expiredPosition.sequence) as { id: string }[]).map(
+          ({ id }) => ({ id }),
+        ),
+      [{ id: nextId }],
+    );
+  });
+});
+
+test("initial and rebased reads return the latest bounded window chronologically", () => {
+  withDatabase(migratedDatabase(), (database) => {
+    const ids = Array.from({ length: 60 }, (_, index) => opaqueId(index + 1));
+    for (const [index, id] of ids.entries()) {
+      commitMessage(database, id, "game-a", 1_786_970_100_000 + index);
+    }
+
+    const descendingWindow = database
       .prepare(
         `SELECT message.id
          FROM game_messages message
          JOIN game_message_cursors position
            ON position.cursor_id = message.id
           AND position.game_id = message.game_id
-         WHERE message.game_id = ? AND position.sequence > ?
-         ORDER BY position.sequence`,
+         WHERE message.game_id = ?
+         ORDER BY position.sequence DESC
+         LIMIT ?`,
       )
-      .all("game-a", expiredPosition.sequence) as { id: string }[]).map(
-        ({ id }) => ({ id }),
-      ),
-    [{ id: nextId }],
-  );
+      .all("game-a", 48) as { id: string }[];
+    const chronologicalWindow = descendingWindow.reverse().map(({ id }) => id);
+
+    assert.deepEqual(chronologicalWindow, ids.slice(-48));
+    assert.equal(chronologicalWindow.at(-1), ids.at(-1));
+  });
 });
 
-test("initial and rebased reads return the latest bounded window chronologically", () => {
-  using database = migratedDatabase();
-  const ids = Array.from({ length: 60 }, (_, index) => opaqueId(index + 1));
-  for (const [index, id] of ids.entries()) {
-    commitMessage(database, id, "game-a", 1_786_970_100_000 + index);
+function withDatabase<T>(
+  database: DatabaseSync,
+  run: (database: DatabaseSync) => T,
+): T {
+  try {
+    return run(database);
+  } finally {
+    database.close();
   }
-
-  const descendingWindow = database
-    .prepare(
-      `SELECT message.id
-       FROM game_messages message
-       JOIN game_message_cursors position
-         ON position.cursor_id = message.id
-        AND position.game_id = message.game_id
-       WHERE message.game_id = ?
-       ORDER BY position.sequence DESC
-       LIMIT ?`,
-    )
-    .all("game-a", 48) as { id: string }[];
-  const chronologicalWindow = descendingWindow.reverse().map(({ id }) => id);
-
-  assert.deepEqual(chronologicalWindow, ids.slice(-48));
-  assert.equal(chronologicalWindow.at(-1), ids.at(-1));
-});
+}
 
 function legacyDatabase(): DatabaseSync {
   const database = new DatabaseSync(":memory:");

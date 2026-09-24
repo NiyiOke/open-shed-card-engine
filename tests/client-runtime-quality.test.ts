@@ -93,7 +93,9 @@ test("heavy voice code stays behind one dynamic client import", () => {
 
   // Source ceilings are early warnings; the post-build CI gate measures the
   // real emitted chunks.
-  assert.ok(statSync(GAME_SHELL_PATH).size <= 232_000);
+  // The explicit lobby lazy boundary adds a small amount of source orchestration
+  // while reducing the emitted initial chunk; the build budget below remains strict.
+  assert.ok(statSync(GAME_SHELL_PATH).size <= 233_000);
   assert.ok(statSync(LIVE_VOICE_PATH).size <= 38_000);
   assert.ok(statSync(GAME_STORE_PATH).size <= 175_000);
 });
@@ -113,6 +115,7 @@ test("client asset manifest parser is JSON-only", () => {
     'export default {"appBootstrapPreinitModules":[],"lazyChunks":[],"dynamicPreloads":{}};',
   );
   assert.deepEqual(manifest.appBootstrapPreinitModules, []);
+  assert.equal(manifest.browserEntry, null);
   assert.throws(
     () => parseVinextClientAssetManifest("export default globalThis.manifest;"),
     /CLIENT_ASSET_MANIFEST_FORMAT/u,
@@ -120,6 +123,53 @@ test("client asset manifest parser is JSON-only", () => {
   assert.throws(
     () => parseVinextClientAssetManifest('export default {"dynamicPreloads":{}};'),
     /CLIENT_ASSET_MANIFEST_SHAPE/u,
+  );
+});
+
+test("client asset manifest parser accepts Vinext's separate browser entry manifest", () => {
+  const assetManifest = JSON.stringify({
+    appBootstrapPreinitModules: ["/_next/runtime.js"],
+    lazyChunks: ["_next/game.js", "_next/livekit.js"],
+    dynamicPreloads: {
+      "app/components/GameShell.tsx": ["_next/game.js"],
+      "node_modules/livekit-client/dist/livekit-client.esm.mjs": ["_next/livekit.js"],
+    },
+  });
+  for (const entryManifest of [
+    { appBrowserEntry: "_next/index.js" },
+    { pagesClientEntry: "_next/index.js" },
+  ]) {
+    const manifest = parseVinextClientAssetManifest(
+      `export default ${assetManifest};`,
+      JSON.stringify(entryManifest),
+    );
+    const report = auditClientPerformance(
+      manifest,
+      {
+        "_next/runtime.js": 100,
+        "_next/index.js": 200,
+        "_next/game.js": 300,
+        "_next/livekit.js": 400,
+      },
+      {
+        initialJavaScriptBytes: 1_000,
+        largestInitialChunkBytes: 1_000,
+        liveKitChunkBytes: 1_000,
+        totalJavaScriptBytes: 2_000,
+        totalCssBytes: 1_000,
+      },
+    );
+    assert.equal(manifest.browserEntry, "_next/index.js");
+    assert.equal(report.initialJavaScriptBytes, 600);
+    assert.deepEqual(report.errors, []);
+  }
+
+  assert.throws(
+    () => parseVinextClientAssetManifest(
+      `export default ${assetManifest};`,
+      '{"appBrowserEntry":null}',
+    ),
+    /CLIENT_ENTRY_MANIFEST_SHAPE/u,
   );
 });
 

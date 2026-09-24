@@ -1,6 +1,8 @@
 "use client";
 
 import {
+  lazy,
+  Suspense,
   type FormEvent,
   useCallback,
   useEffect,
@@ -111,12 +113,15 @@ import {
   type LobbyPresencePlayer,
   type LobbyPresenceSnapshot,
 } from "./lobby-presence";
-import {
-  LobbyPresenceDirectory,
-  LobbyPresencePanel,
-  type LobbyInviteResponseAction,
-} from "./LobbyPresencePanels";
+import type { LobbyInviteResponseAction } from "./LobbyPresencePanels";
 import { useRealtimeUpdates } from "./use-realtime-updates";
+
+const LobbyPresenceDirectory = lazy(() => import("./LobbyPresencePanels").then(
+  ({ LobbyPresenceDirectory: Component }) => ({ default: Component }),
+));
+const LobbyPresencePanel = lazy(() => import("./LobbyPresencePanels").then(
+  ({ LobbyPresencePanel: Component }) => ({ default: Component }),
+));
 
 type Session = {
   signedIn: boolean;
@@ -3955,18 +3960,20 @@ export function GameShell({
                 <span className="waiting-copy">{lobbyReadiness}</span>
               </div>
               {canInviteFromCurrentLobby && lobbyPresence ? (
-                <LobbyPresenceDirectory
-                  players={lobbyPresence.players}
-                  busy={lobbyPresenceBusy}
-                  status={lobbyPresenceStatus}
-                  error={lobbyPresenceError}
-                  focusRequest={lobbyPresenceFocusRequest}
-                  invite={(player, trigger) => {
-                    utilityTriggerRef.current = trigger;
-                    openLobbyPlayerInvite(player);
-                  }}
-                  block={(player) => void blockLobbyPlayer(player)}
-                />
+                <Suspense fallback={<p className="lobby-presence-feedback" role="status">Loading player lobby…</p>}>
+                  <LobbyPresenceDirectory
+                    players={lobbyPresence.players}
+                    busy={lobbyPresenceBusy}
+                    status={lobbyPresenceStatus}
+                    error={lobbyPresenceError}
+                    focusRequest={lobbyPresenceFocusRequest}
+                    invite={(player, trigger) => {
+                      utilityTriggerRef.current = trigger;
+                      openLobbyPlayerInvite(player);
+                    }}
+                    block={(player) => void blockLobbyPlayer(player)}
+                  />
+                </Suspense>
               ) : null}
               </>
             ) : null}
@@ -5540,17 +5547,19 @@ function LobbyBrowser({
       ) : null}
 
       {lobbyPresence ? (
-        <LobbyPresencePanel
-          snapshot={lobbyPresence}
-          alias={lobbyPresenceAlias}
-          busy={lobbyPresenceBusy}
-          error={lobbyPresenceError}
-          status={lobbyPresenceStatus}
-          focusRequest={lobbyPresenceFocusRequest}
-          setAlias={setLobbyPresenceAlias}
-          setLooking={setLookingForGame}
-          respondToInvite={respondToInvite}
-        />
+        <Suspense fallback={<p className="lobby-presence-feedback" role="status">Loading player lobby…</p>}>
+          <LobbyPresencePanel
+            snapshot={lobbyPresence}
+            alias={lobbyPresenceAlias}
+            busy={lobbyPresenceBusy}
+            error={lobbyPresenceError}
+            status={lobbyPresenceStatus}
+            focusRequest={lobbyPresenceFocusRequest}
+            setAlias={setLobbyPresenceAlias}
+            setLooking={setLookingForGame}
+            respondToInvite={respondToInvite}
+          />
+        </Suspense>
       ) : null}
 
       <div className="rooms-section">

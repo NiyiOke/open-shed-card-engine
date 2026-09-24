@@ -2,6 +2,15 @@
   "name": "open-shed-card-engine",
   "version": "1.6.3",
   "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NiyiOke/open-shed-card-engine.git"
+  },
+  "homepage": "https://open-shed-card-game.neo-dabuda.chatgpt.site",
+  "bugs": {
+    "url": "https://github.com/NiyiOke/open-shed-card-engine/issues"
+  },
   "engines": {
     "node": ">=22.13.0"
   },
@@ -34,8 +43,8 @@
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.37.1",
-    "@cloudflare/workers-types": "4.20260515.1",
+    "@cloudflare/vite-plugin": "1.58.0",
+    "@cloudflare/workers-types": "5.20260924.1",
     "@eslint/js": "9.39.4",
     "@next/eslint-plugin-next": "16.2.6",
     "@tailwindcss/postcss": "4.2.1",
@@ -43,8 +52,8 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "6.0.2",
-    "@vitejs/plugin-rsc": "0.5.26",
-    "drizzle-kit": "0.31.10",
+    "@vitejs/plugin-rsc": "0.5.35",
+    "drizzle-kit": "0.31.11",
     "eslint": "9.39.4",
     "eslint-plugin-jsx-a11y": "6.10.2",
     "eslint-plugin-react": "7.37.5",
@@ -56,9 +65,9 @@
     "tsx": "4.20.5",
     "typescript": "5.9.3",
     "typescript-eslint": "8.59.3",
-    "vinext": "1.0.0-beta.2",
-    "vite": "8.0.13",
-    "wrangler": "4.92.0"
+    "vinext": "1.0.0-beta.6",
+    "vite": "8.3.0",
+    "wrangler": "4.137.0"
   },
   "type": "module"
 }

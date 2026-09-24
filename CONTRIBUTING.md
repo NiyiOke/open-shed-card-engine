@@ -2,22 +2,47 @@
 
 Thanks for helping Open Shed grow from a reliable rules engine into a broader multiplayer platform.
 
+## Contribution workflow
+
+1. Fork the repository and branch from the latest `main`.
+2. Open or reference an issue before substantial work on rules, persistent data,
+   identity, chat, media, moderation, or transport.
+3. Keep the change focused and avoid mixing unrelated refactors into the same pull request.
+4. Open a pull request using the repository template and respond to review feedback.
+
+Pull requests are merged only after required checks pass and a maintainer approves
+them; maintainers may request changes or decline work that conflicts with the
+project's rules, privacy, accessibility, security, or scope. Contributors cannot
+deploy the hosted game or publish releases.
+
 ## Before opening a pull request
 
-1. Open or reference an issue for rule changes, persistent data changes, identity, chat, media, moderation, or transport changes.
-2. Keep commercial logos, card artwork, rulebook scans, and copied trade dress out of the repository.
-3. Branch from `main` and keep the change focused.
-4. Run:
+1. Keep commercial logos, card artwork, rulebook scans, copied trade dress, secrets,
+   and private player data out of the repository.
+2. Run:
 
    ```bash
-   npm install
+   npm ci
    npm run test:unit
    npm run typecheck
    npm run lint
    npm run build
+   npm run test:performance
    ```
 
-5. Explain what changed, why, the impact on players or contributors, and how it was verified.
+3. For realtime Worker changes, also run:
+
+   ```bash
+   npm ci --prefix realtime-worker
+   npm run check --prefix realtime-worker
+   ```
+
+4. Explain what changed, why, the impact on players or contributors, and how it was verified.
+
+Use invented test data in issues and pull requests. Never publish a live table URL,
+code or identifier; a player name, hand, or chat message; account data; authentication
+material; or a production log containing any of those. Report security problems using
+the private process in [SECURITY.md](SECURITY.md).
 
 ## Engine changes
 
@@ -40,4 +65,10 @@ Support keyboard and touch, 320px-wide mobile layouts, reduced motion, visible f
 
 ## Conduct
 
-Be respectful, specific, and curious. Harassment, discrimination, deliberate privacy violations, and hostile use of contributor or player data are not accepted. Maintainers may remove content or participation that puts people or the project at risk.
+Be respectful, specific, and curious. Harassment, discrimination, deliberate privacy violations, and hostile use of contributor or player data are not accepted. Maintainers may remove content or participation that puts people or the project at risk. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the full policy.
+
+## Contribution license
+
+By submitting a contribution, you confirm that you have the right to submit it and
+agree that it is licensed under the repository's Apache License 2.0, as described in
+section 5 of that license.

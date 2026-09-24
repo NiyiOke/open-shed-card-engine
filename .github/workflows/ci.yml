@@ -11,16 +11,21 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            realtime-worker/package-lock.json
       - run: npm ci
       - run: npm run test:unit
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build
       - run: npm run test:performance
+      - run: npm ci --prefix realtime-worker
+      - run: npm run check --prefix realtime-worker

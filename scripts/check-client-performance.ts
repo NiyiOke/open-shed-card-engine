@@ -8,8 +8,14 @@ import {
 const projectRoot = process.cwd();
 const clientRoot = resolve(projectRoot, "dist/client");
 const manifestPath = resolve(projectRoot, "dist/server/vinext-client-assets.js");
+const clientEntryManifestPath = resolve(
+  clientRoot,
+  "vinext-client-entry-manifest.json",
+);
+const clientEntryManifestSource = await readOptionalFile(clientEntryManifestPath);
 const manifest = parseVinextClientAssetManifest(
   await readFile(manifestPath, "utf8"),
+  clientEntryManifestSource,
 );
 const assetBytes: Record<string, number> = {};
 
@@ -34,6 +40,19 @@ process.stdout.write(
 if (report.errors.length) {
   for (const error of report.errors) process.stderr.write(`- ${error}\n`);
   process.exitCode = 1;
+}
+
+async function readOptionalFile(path: string): Promise<string | undefined> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error) {
+    if (isErrorWithCode(error) && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function isErrorWithCode(error: unknown): error is Error & { code: string } {
+  return error instanceof Error && "code" in error && typeof error.code === "string";
 }
 
 async function walk(directory: string): Promise<string[]> {

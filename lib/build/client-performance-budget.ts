@@ -1,5 +1,6 @@
 export type VinextClientAssetManifest = Readonly<{
   appBootstrapPreinitModules: ReadonlyArray<string>;
+  browserEntry: string | null;
   dynamicPreloads: Readonly<Record<string, ReadonlyArray<string>>>;
   lazyChunks: ReadonlyArray<string>;
 }>;
@@ -41,6 +42,7 @@ const LIVEKIT_ENTRY = "node_modules/livekit-client/dist/livekit-client.esm.mjs";
 
 export function parseVinextClientAssetManifest(
   source: string,
+  clientEntrySource?: string,
 ): VinextClientAssetManifest {
   const match = /^\s*export default (\{[\s\S]*\});?\s*$/u.exec(source);
   if (!match) throw new Error("CLIENT_ASSET_MANIFEST_FORMAT");
@@ -64,6 +66,9 @@ export function parseVinextClientAssetManifest(
   }
   return Object.freeze({
     appBootstrapPreinitModules: Object.freeze([...bootstrap]),
+    browserEntry: clientEntrySource === undefined
+      ? null
+      : parseVinextClientEntryManifest(clientEntrySource),
     dynamicPreloads: Object.freeze(dynamicPreloads),
     lazyChunks: Object.freeze([...lazyChunks]),
   });
@@ -77,7 +82,7 @@ export function auditClientPerformance(
   const errors: string[] = [];
   const initialAssets = uniqueAssets([
     ...manifest.appBootstrapPreinitModules,
-    ...readEntryAssets(manifest, BROWSER_ENTRY, errors),
+    ...readBrowserEntryAssets(manifest, errors),
     ...readEntryAssets(manifest, GAME_SHELL_ENTRY, errors),
   ]).filter(isJavaScriptAsset);
   const liveKitAssets = uniqueAssets(
@@ -161,6 +166,17 @@ function readEntryAssets(
   return assets;
 }
 
+function readBrowserEntryAssets(
+  manifest: VinextClientAssetManifest,
+  errors: string[],
+): ReadonlyArray<string> {
+  const legacyPreloads = manifest.dynamicPreloads[BROWSER_ENTRY];
+  if (legacyPreloads) return legacyPreloads;
+  if (manifest.browserEntry) return [manifest.browserEntry];
+  errors.push(`Client preload entry is missing: ${BROWSER_ENTRY}.`);
+  return [];
+}
+
 function uniqueAssets(values: ReadonlyArray<string>): string[] {
   return [...new Set(values.map(normalizeAssetPath))];
 }
@@ -188,6 +204,23 @@ function readStringArray(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string")
     ? value
     : null;
+}
+
+function parseVinextClientEntryManifest(source: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(source);
+  } catch {
+    throw new Error("CLIENT_ENTRY_MANIFEST_JSON");
+  }
+  if (!isRecord(value)) throw new Error("CLIENT_ENTRY_MANIFEST_SHAPE");
+  const entry = typeof value.pagesClientEntry === "string"
+    ? value.pagesClientEntry
+    : value.appBrowserEntry;
+  if (typeof entry !== "string" || !entry.trim()) {
+    throw new Error("CLIENT_ENTRY_MANIFEST_SHAPE");
+  }
+  return entry;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
