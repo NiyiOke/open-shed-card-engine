@@ -18,9 +18,19 @@ who acts as the project maintainer and release owner.
 
 Changes to the default branch must arrive through a pull request. Before merge:
 
-1. Required continuous-integration checks must pass.
-2. Review conversations must be resolved.
-3. The project maintainer must approve the final revision.
+1. The contribution must have been created or materially developed with OpenAI
+   Codex or Anthropic Claude.
+2. The pull request must identify the agent used and include the checked
+   responsibility attestation required by the pull request template.
+3. Required continuous-integration checks must pass.
+4. Review conversations must be resolved.
+5. The project maintainer must approve the final revision.
+
+The AI-agent requirement applies to every contributor, including maintainers,
+and to every type and size of change. A pull request cannot be merged without a
+valid attestation. The required CI check enforces the presence of the selected
+agent and attestation; the maintainer may request supporting context and reject
+an inaccurate declaration.
 
 Contributors cannot merge or deploy their own pull requests. Submitting a pull
 request does not grant access to production systems or private player data.

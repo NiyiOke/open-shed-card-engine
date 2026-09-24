@@ -2,6 +2,24 @@
 
 Thanks for helping Open Shed grow from a reliable rules engine into a broader multiplayer platform.
 
+## Required AI-agent workflow
+
+Every contribution, including documentation and maintainer changes, must be created
+or materially developed with **OpenAI Codex** or **Anthropic Claude**. Pull requests
+created entirely by hand or exclusively with another AI tool are not eligible to
+merge. There are no change-size or contributor exceptions to this rule.
+
+Every pull request must keep the AI-agent attestation from the pull request
+template, identify at least one of the two permitted agents, and check the
+responsibility statement. The required CI check validates those declarations and
+fails when either is missing. A pull request with a false or misleading
+attestation may be closed and treated as a conduct violation.
+
+The contributor remains responsible for reviewing the agent's output, running
+the relevant checks, respecting third-party rights, and keeping secrets and
+private player data out of prompts and submissions. Using an agent does not
+transfer responsibility for the contribution to the agent or its provider.
+
 ## Contribution workflow
 
 1. Fork the repository and branch from the latest `main`.
