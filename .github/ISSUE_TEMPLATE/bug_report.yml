@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a reproducible problem in Open Shed
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Open Shed. Search existing issues before filing a new one.
+
+        **Keep game data private.** Do not post live table codes or join links, player identities, private hands, chat content, authentication data, secrets, or unredacted logs. For a security or privacy vulnerability, use the private reporting link below instead of this public form.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior.
+      placeholder: A concise description of what went wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: Describe the behavior you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Use a fresh or expired test table and replace identifying values with safe placeholders.
+      placeholder: |
+        1. Open …
+        2. Select …
+        3. Observe …
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Tell us the browser, operating system, device type, and app version if known.
+      placeholder: Safari 19 on iPhone; Open Shed V1.6.3
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence
+      description: Add screenshots or short log excerpts only after removing private game and account data.
+      placeholder: Drag a redacted image here or paste a minimal, sanitized error message.
+
+  - type: textarea
+    id: accessibility
+    attributes:
+      label: Accessibility impact
+      description: Note keyboard, screen-reader, motion, contrast, zoom, touch, or other accessibility impact, or write "None known".
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed live table codes and join links, player identities, private hands, chat content, authentication data, secrets, and sensitive logs from this report.
+          required: true
+        - label: This is not a security or privacy vulnerability that should be reported privately.
+          required: true
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to submit a pull request for this issue.
+          required: false

@@ -172,13 +172,14 @@ test("migration 0009 backfills the proven win event before a later completed-tab
     const migrations = readdirSync(migrationDirectory)
       .filter((name) => /^000\d_.*\.sql$/u.test(name))
       .sort();
-    assert.equal(migrations.at(-1), "0009_lovely_miek.sql");
+    const continuityIndex = migrations.indexOf("0009_lovely_miek.sql");
+    assert.ok(continuityIndex >= 0);
     const beforeContinuity = migrations
-      .slice(0, -1)
+      .slice(0, continuityIndex)
       .map((name) => readFileSync(join(migrationDirectory, name), "utf8"))
       .join("\n");
     const continuity = readFileSync(
-      join(migrationDirectory, migrations.at(-1)!),
+      join(migrationDirectory, migrations[continuityIndex]),
       "utf8",
     );
     const winRevision = 40;
@@ -312,12 +313,14 @@ test("migration omits an unproven completed snapshot instead of inventing a roun
     const migrations = readdirSync(migrationDirectory)
       .filter((name) => /^000\d_.*\.sql$/u.test(name))
       .sort();
+    const continuityIndex = migrations.indexOf("0009_lovely_miek.sql");
+    assert.ok(continuityIndex >= 0);
     const beforeContinuity = migrations
-      .slice(0, -1)
+      .slice(0, continuityIndex)
       .map((name) => readFileSync(join(migrationDirectory, name), "utf8"))
       .join("\n");
     const continuity = readFileSync(
-      join(migrationDirectory, migrations.at(-1)!),
+      join(migrationDirectory, migrations[continuityIndex]),
       "utf8",
     );
     const state = JSON.stringify({

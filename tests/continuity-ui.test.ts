@@ -58,7 +58,7 @@ test("viewer refreshes accept equal revisions without allowing gameplay regressi
   );
 });
 
-test("series scores rank wins first and keep tied seats deterministic", () => {
+test("round-win standings rank wins first and keep tied seats deterministic", () => {
   const ranked = rankSeriesScores(
     [
       { playerId: "seat-three", displayName: "C", wins: 1 },

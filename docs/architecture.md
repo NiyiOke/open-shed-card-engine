@@ -2,7 +2,7 @@
 
 ## Product boundary
 
-Open Shed is a turn-based multiplayer foundation. The first release optimizes for correctness, privacy, portability, and recoverability. It does not attempt sub-second action broadcasting, turn timers, chat, media calls, or rich commercial card art.
+Open Shed is a turn-based multiplayer foundation optimized for correctness, privacy, portability, and recoverability. It supports moderated table communication and optional realtime refresh signals without moving rules, private projections, or durable writes into the transport layer. Turn timers, stored media, and rich commercial card art remain outside the current boundary.
 
 ## Authoritative command path
 
@@ -43,17 +43,19 @@ Local runtime initialization is idempotent and mirrors the generated Drizzle mig
 
 ## Synchronization baseline
 
-The browser adaptively polls every 1.5 seconds while a visible round is active, uses a low-rate five-second poll on complete tables so rematches propagate, and backs off while hidden. It refreshes on focus, reconnect, and visibility changes, aborts stale-room requests, and keeps the active game in a durable URL. A single in-flight mutation envelope is stored in the browser session and retried with the same command ID after a lost response. Mutation responses contain the new projection, avoiding a redundant immediate read. Stale commands receive a conflict and trigger resynchronization.
+The browser always retains authoritative HTTP synchronization. Without realtime it adaptively polls every 1.5 seconds while a visible round is active, uses a low-rate five-second poll on complete tables, and backs off while hidden. It refreshes on focus, reconnect, and visibility changes, aborts stale-room requests, and keeps the active game in a durable URL. A single in-flight mutation envelope is stored in the browser session and retried with the same command ID after a lost response. Mutation responses contain the new projection; stale commands receive a conflict and trigger resynchronization.
+
+When explicitly enabled, a separate hibernating Durable Object companion sends only content-free `game`/`chat` invalidation hints over WebSockets. Every hint triggers the same authenticated Sites read used by polling; the socket never carries a `GameView`, event, message, cursor, name, identifier, or mutation. A `ready` connection becomes live only after its authoritative catch-up succeeds. Duplicate hints are coalesced, an invalidation during an in-flight read queues a trailing refresh, and low-rate 25–30 second polling remains active to recover a missed hint. A failed handshake, closed Worker, offline transition, or kill switch immediately restores the original polling cadence.
 
 Presence uses a separate heartbeat path and server clock: players progress from live to reconnecting to disconnected, while host removal is unavailable until the server revalidates a two-minute inactive grace period. Completed tables continue low-rate heartbeats so a waiting player can observe a rematch without being falsely classified as removable.
 
-Short polling is intentional because the Sites binding contract currently exposes D1 and R2, not Durable Objects. Stateless Worker memory is never used as room authority.
+Sites and D1 remain authoritative because the Sites binding contract exposes D1/R2 but not Durable Objects. The realtime coordinator is therefore a separately deployed companion with an opaque room namespace; stateless Worker memory and the companion's Durable Object state are never game authority.
 
 ## Growth path
 
 The stable seams are the command union, rules profile, `GameState`, event bundle, viewer projection, and repository boundary.
 
-- Real-time updates: move per-game coordination to Durable Objects and broadcast the same public events over hibernatable WebSockets.
+- Real-time updates: retain notification-only hibernating Durable Objects, viewer-specific Sites refetches, bounded one-use tickets, and permanent HTTP recovery; never widen sockets into a second rules or chat authority.
 - Communication: keep curated/public chat, private text, reports, and voice authorization in separate moderated boundaries; never mix them into authoritative rules state.
 - Sound: map public event kinds to optional client audio cues.
 - Live voice: the provider-neutral LiveKit adapter supplies managed WebRTC signaling/TURN, explicit consent, listen-only join, microphone-only grants, and lifecycle revocation; keep it independently disabled until provider credentials and operational safety gates are configured.
@@ -63,8 +65,8 @@ The stable seams are the command union, rules profile, `GameState`, event bundle
 
 ## Known baseline limits
 
-- Polling increases read volume with audience size.
-- D1 serializes writes at its primary; globally distributed competitive play will eventually benefit from one Durable Object per room.
+- Safety polling and invalidation-triggered refetches still increase read volume with audience size.
+- D1 serializes authoritative writes at its primary; the current room Durable Object accelerates notification only and does not change write locality.
 - No scheduler binding means expiry cleanup is bounded and lazy during normal requests.
 - Hosted identity currently means a user able to complete ChatGPT sign-in; generic email/social identity is abstracted but not implemented.
 - Trusted identity headers are a Sites ingress contract; self-hosters must replace that adapter with verified sessions or tokens.

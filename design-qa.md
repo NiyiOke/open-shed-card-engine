@@ -1,48 +1,49 @@
-# Option 1 card redesign — design QA
+# Action-card readability annotations — design QA
 
 ## Evidence
 
-- Source visual truth: `docs/design/option-1-card-reference.webp`.
-- Browser-rendered desktop implementation: `docs/design/option-1-card-implementation-desktop.jpg`.
-- Browser-rendered mobile implementation: `docs/design/option-1-card-implementation-mobile.jpg`.
-- Full-view side-by-side comparison: `docs/design/option-1-card-comparison-full.jpg`.
-- Focused hand-card comparison: `docs/design/option-1-card-comparison-focused.jpg`.
-- Source pixels: 1492 × 1054.
-- Desktop capture: 1492 × 1200 pixels from a 1492 × 1200 CSS viewport at device scale 1. The comparison preserves the shared 1492-pixel width; the implementation is taller because it retains the functional draw stack and the full live-game page.
-- Mobile capture: 320 × 900 pixels from a 320 × 900 CSS viewport at device scale 1.
-- State: the source concept shows an opponent turn with Yellow 4; the live capture shows the next turn with Yellow 3 after a real remote command. The hand keeps the same visual archetypes. Dynamic player/card copy was excluded from fidelity judgments where the states differ.
+- Source visual truth: annotated production page captured before the fix at `/tmp/open-shed-card-readability-before.png`; full production source capture at `/tmp/open-shed-card-readability-before-full.png`.
+- Browser-rendered implementation: `/tmp/open-shed-card-readability-after.png` at the same Action-card anchor and viewport.
+- Full-view comparison input: `/tmp/open-shed-card-readability-comparison.png`.
+- Focused Wild-card comparison input: `/tmp/open-shed-card-readability-comparison-wild.png`.
+- Focused long-label comparison input: `/tmp/open-shed-card-readability-comparison-labels.png`.
+- Responsive implementation captures: `/tmp/open-shed-card-readability-desktop-1280.png`, `/tmp/open-shed-card-readability-mobile-320.png`, `/tmp/open-shed-card-readability-mobile-details.png`, and `/tmp/open-shed-card-readability-mobile-wild.png`.
+- Source and primary implementation pixels: 801 × 998 at device scale 1; CSS viewport 801 × 998.
+- State: signed-out `#action-cards` rules section with both native Action-card disclosures open.
 
 ## Findings
 
 - No actionable P0, P1, or P2 findings remain.
-- Fonts and typography: the implementation preserves the concept's heavy sans numerals, compact mono corner identifiers, and bold uppercase rule labels. Long action names wrap to two short lines without clipping.
-- Spacing and layout rhythm: at the 1492-pixel comparison width, hand cards reach the same approximately 150-pixel width and 1:1.83 proportion as the source. The table discard keeps the shorter pile-card proportion. The added draw stack is an intentional gameplay affordance rather than design drift.
-- Colors and visual tokens: the charcoal chassis, warm keyline, subdued red/yellow/green/blue faces, and acid interaction ring map closely to the selected direction. Text and icons retain strong contrast on every color.
-- Image quality and asset fidelity: the generated charcoal pressed-paper texture is a real optimized raster asset; Phosphor supplies crisp vector action icons. No copied UNO artwork, inline custom SVG, emoji, Unicode action glyph, or branded card asset is used.
-- Copy and content: implementation labels come from the rules model and correct semantic errors in the generated concept, including the red 8 and green 9 labels.
-- Accessibility and behavior: hand cards remain native buttons with full accessible names, playable/not-playable status, visible non-color `PLAY` cues, elevated focus stacking, and a lime focus ring. The choice dialog autofocuses, fits at 320 pixels, closes with Escape, and restores focus.
-- Responsiveness: the page has no root overflow at 320 pixels; the hand alone scrolls horizontally, and both the first and final cards remain reachable. Mobile cards retain the large identifier, icon, label, and minimum touch area.
-- Console: a fresh preview tab produced only Vite/React development messages and no errors.
+- [P1, fixed] Wild Draw 10 used the same minimum center-value size as two-character values, so `+10` reached the compact face edge and appeared cut off. Three-character center values now use a length-aware scale while `+2`, `+4`, and `+6` retain their original emphasis.
+- [P1, fixed] Wild Reverse Draw 4 rendered a redundant boxed `+4` beside its Reverse icon in addition to the two corner marks. The duplicate support mark is removed; the card still shows the Reverse icon, both `+4` corner values, its title, and the same accessible card identity.
+- [P1, fixed] Discard All, Skip Everyone, and Color Roulette inherited a short-label width that clipped or crowded their compact bottom labels. Only compact faces with long labels now receive the full bottom width and a bounded, two-line-capable optical size.
+- [P2, fixed] Taller Draw 4 and Wild Reverse Draw 4 explanations left the thumbnail pinned to the top of a much taller row. Card artwork now centers beside tall explanatory copy, and tablet/desktop rows use a 16px card-to-copy gutter and 16px inset.
+- Fonts and typography: display/body typography is unchanged. Card-only value and label sizing is content-aware, remains high contrast, and stays within the card chassis at both 70 × 128 and 62 × 113 pixels.
+- Spacing and layout rhythm: panel widths, section order, borders, 16px group gap, and independent group heights remain unchanged. Card-row spacing is intentionally relaxed from 14px to 16px at tablet/desktop sizes; mobile keeps its existing 12px gutter.
+- Colors and visual tokens: unchanged.
+- Image quality and asset fidelity: the existing shared `CardFace` presentation is preserved; no source asset, icon family, texture, shadow, or card silhouette was replaced. Phosphor action icons remain sharp and optically centered.
+- Copy and content: rules copy and all ten card types are unchanged. The only removed visual content was the redundant inner `+4`; accessible names and rule titles are unchanged.
+- Accessibility and interactions: guide artwork remains `aria-hidden="true"` beside visible semantic card headings/copy. Native 52px disclosure summaries still open/close, retain focus, and show a 3px focus outline. Reduced-motion behavior is unaffected.
+- Responsiveness: at 1280px the groups remain equal 608px columns with independent heights; at 801px both columns fit with a measured 16px art/copy gutter and no x-overflow; at 320px the groups reflow to one 292px column, 62 × 113 thumbnails remain inside the viewport, all long labels and `+10` remain inside the face, summaries remain 52px, and `scrollWidth === innerWidth === 320`. The existing 200%-zoom contract remains green, and the same effective 320px reflow was visually inspected.
+- Console/runtime: the local in-app browser emitted no warnings or errors. The required game client captured the signed-out state with no error artifact.
 
 ## Comparison history
 
-1. Initial comparison found a P2 density issue: the original 34-pixel negative overlap covered wild-spectrum markers and parts of longer labels.
-2. The hand was changed to responsive 128–150-pixel cards with a 10-pixel desktop overlap, preserving labels and the selected concept's wider fan.
-3. Post-fix evidence in `docs/design/option-1-card-comparison-focused.jpg` shows the markers, central icons, labels, and lime selected state clearly at the same normalized card height.
-
-## Open questions
-
-- None blocking. The implementation keeps sharper angular panel joins than the slightly rounded AI concept so the geometry is repeatable across every dynamic card; this is acceptable P3 identity polish.
+1. The user’s seven browser annotations identified a clipped `+10`, a duplicate inner `+4`, three crowded long labels, and weak spacing in two tall rule rows.
+2. The 801 × 998 production capture reproduced the compact-card defects. Source inspection tied them to one duplicate `supportMark`, a fixed 34px minimum value size inside a 68%-wide center, a short-label right inset, and top-aligned art in variable-height rows.
+3. The first implementation pass removed the duplicate support mark, introduced content-density hooks, widened long compact labels, and centered the artwork. Focused source tests and TypeScript/lint checks passed.
+4. The initial rendered pass showed the defects resolved. A final scoped spacing refinement increased tablet/desktop card-row inset and gutter from 14px to 16px without changing the two-column information architecture.
+5. The revised 801px full and focused comparison inputs show `+10` with clear side room, Reverse +4 with one visual penalty indicator system, readable complete long labels, and balanced art/copy rows. Desktop and mobile captures show no new clipping or overflow.
 
 ## Implementation checklist
 
-- [x] Reusable card presentation model covers every card kind.
-- [x] Hand and table discard use the same DOM card face.
-- [x] Desktop, mobile, focus, playable, dialog, and live remote-turn states verified.
-- [x] Unit tests, typecheck, lint, production build, and production dependency audit pass.
-
-## Follow-up polish
-
-- P3: if a future art pass calls for softer panel seams, replace the shared normalized polygon with a reusable masked asset while preserving the current dynamic color and icon layers.
+- [x] Remove only the redundant Wild Reverse Draw 4 support badge.
+- [x] Scale long center values without reducing ordinary number/action values.
+- [x] Keep long compact labels fully readable without changing gameplay-card labels.
+- [x] Balance card artwork beside tall copy and preserve mobile reflow.
+- [x] Add regression coverage for presentation data, density hooks, and guide spacing.
+- [x] Compare before/after at the exact annotated viewport and inspect focused card regions.
+- [x] Verify 1280px and 320px layouts, disclosure focus, ARIA-hidden artwork, no horizontal overflow, and no browser errors.
+- [x] Run the required game client and automated release gates.
 
 final result: passed

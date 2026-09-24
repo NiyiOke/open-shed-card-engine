@@ -4,6 +4,7 @@ import {
   liveVoiceRevocationProtectionUntil,
   revokeLiveVoiceParticipant,
 } from "./live-voice-provider";
+import { createRequestMaintenanceGate } from "./request-maintenance";
 
 export type LiveVoiceCleanupTarget =
   | Readonly<{ kind: "room"; gameId: string }>
@@ -31,8 +32,12 @@ const CLEANUP_RECONCILE_INTERVAL_MS = 15_000;
 const CLEANUP_RECONCILE_LIMIT = 8;
 const CLEANUP_PROVIDER_DEADLINE_MS = 1_500;
 
-let reconcilePromise: Promise<LiveVoiceCleanupResult> | null = null;
-let lastReconcileAt = 0;
+// Share only the cadence timestamp across requests. Provider/D1 promises stay
+// owned by the request that started them so cancellation cannot poison an
+// isolate-wide in-flight cache.
+const cleanupReconcileGate = createRequestMaintenanceGate(
+  CLEANUP_RECONCILE_INTERVAL_MS,
+);
 
 /**
  * Enqueues media cleanup inside the same D1 batch as a durable command.
@@ -357,20 +362,14 @@ export async function maybeReconcileLiveVoiceCleanupJobs(
   database: D1Database,
   now: number,
 ): Promise<LiveVoiceCleanupResult> {
-  if (reconcilePromise) return reconcilePromise;
-  if (now - lastReconcileAt < CLEANUP_RECONCILE_INTERVAL_MS) {
+  try {
+    const run = await cleanupReconcileGate.run(now, () =>
+      reconcileLiveVoiceCleanupJobs(database, { now }),
+    );
+    return run.started ? run.value : emptyCleanupResult();
+  } catch {
     return emptyCleanupResult();
   }
-  lastReconcileAt = now;
-  reconcilePromise = reconcileLiveVoiceCleanupJobs(database, { now })
-    .catch(() => {
-      lastReconcileAt = 0;
-      return emptyCleanupResult();
-    })
-    .finally(() => {
-      reconcilePromise = null;
-    });
-  return reconcilePromise;
 }
 
 /** Route-safe helper: cleanup failures never rewrite a successful mutation. */

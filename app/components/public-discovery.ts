@@ -174,6 +174,7 @@ export function isValidRoomAlias(value: string): boolean {
   return (
     length >= 2 &&
     length <= ROOM_ALIAS_MAX_LENGTH &&
+    !hasUnsafePublicText(alias) &&
     /^[\p{L}\p{N}][\p{L}\p{N} _'-]*[\p{L}\p{N}]$/u.test(alias)
   );
 }
@@ -263,3 +264,4 @@ function isSafeCount(value: unknown): value is number {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
+import { hasUnsafePublicText } from "../../lib/public-text-policy";

@@ -10,6 +10,7 @@ import {
   requireCommandId,
   routeErrorResponse,
 } from "../../../../lib/server/responses";
+import { notifyRealtimeChange } from "../../../../lib/server/realtime-notify";
 
 export async function POST(request: Request) {
   try {
@@ -27,8 +28,12 @@ export async function POST(request: Request) {
         400,
       );
     }
-    const view = await joinGame(user, body.nickname, body.joinCode, commandId);
+    const joined = await joinGame(user, body.nickname, body.joinCode, commandId);
+    const view = joined.view;
     const listing = await getViewerListingForGame(user, view.gameId);
+    if (!joined.replayed) {
+      await notifyRealtimeChange(view.gameId, ["game", "chat"]);
+    }
     return jsonResponse({ view, ...(listing ? { listing } : {}) });
   } catch (error) {
     return routeErrorResponse(error);

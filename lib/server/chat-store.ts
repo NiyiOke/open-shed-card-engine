@@ -20,6 +20,7 @@ import {
   type ReportReasonId,
 } from "./communication-policy";
 import { getV15FeaturePolicy } from "./v15-feature-policy";
+import { createRequestMaintenanceGate } from "./request-maintenance";
 
 type TableMessageBase = Readonly<{
   id: string;
@@ -50,6 +51,12 @@ export type TableMessagePage = Readonly<{
   }>;
 }>;
 
+export type ListTableMessagesResult = Readonly<{
+  page: TableMessagePage;
+  /** True when the supplied opaque position no longer belongs to this feed. */
+  cursorRebased: boolean;
+}>;
+
 export type SendTableMessageResult = Readonly<{
   message: TableMessage;
   replayed: boolean;
@@ -68,6 +75,7 @@ type MemberGameRow = {
   expires_at: number;
   profile_id: string | null;
   membership_status: string | null;
+  joined_at: number | null;
 };
 
 type CurrentMemberContext = {
@@ -76,6 +84,7 @@ type CurrentMemberContext = {
   state: GameState;
   player: PlayerState;
   communicationScope: string;
+  joinedAt: number;
 };
 
 type TargetMember = {
@@ -98,13 +107,13 @@ type MessageRow = {
 };
 
 type ScannedMessageRow = MessageRow & {
+  cursor_sequence: number;
   viewer_muted: number;
   pair_blocked: number;
 };
 
 type CursorRow = {
-  id: string;
-  created_at: number;
+  sequence: number;
 };
 
 type ProfileRow = {
@@ -151,14 +160,17 @@ const MESSAGE_OPERATION = "chat_message_send";
 const REPORT_OPERATION = "chat_message_report";
 const COMMUNICATION_CLEANUP_INTERVAL_MS = 5 * 60_000;
 
-let cleanupPromise: Promise<void> | null = null;
-let lastCleanupAt = 0;
+// Never cache request-bound D1 cleanup promises at module scope. A canceled
+// request can otherwise strand every later request handled by the isolate.
+const communicationCleanupGate = createRequestMaintenanceGate(
+  COMMUNICATION_CLEANUP_INTERVAL_MS,
+);
 
 export async function listTableMessages(
   user: AuthenticatedUser,
   gameId: string,
   cursor: string | null,
-): Promise<TableMessagePage> {
+): Promise<ListTableMessagesResult> {
   assertCommunicationEnabled();
   const database = await ensureDatabaseSchema();
   const now = Date.now();
@@ -171,8 +183,9 @@ export async function listTableMessages(
   const liveVoiceAvailable =
     privateCommunicationAvailable && getLiveVoiceProviderConfig() !== null;
   const cursorRow = cursor
-    ? await requireCursor(database, gameId, cursor)
+    ? await findCursor(database, gameId, cursor, viewer.joinedAt)
     : null;
+  const cursorRebased = cursor !== null && cursorRow === null;
 
   const query = cursorRow
     ? database.prepare(
@@ -181,6 +194,7 @@ export async function listTableMessages(
                 message.kind, message.content_id, message.body_text,
                 message.command_id,
                 message.created_at, message.expires_at,
+                position.sequence AS cursor_sequence,
                 EXISTS (
                   SELECT 1 FROM game_mutes mute
                   WHERE mute.game_id = message.game_id
@@ -198,17 +212,18 @@ export async function listTableMessages(
                   )
                 ) AS pair_blocked
          FROM game_messages message
+         JOIN game_message_cursors position
+           ON position.cursor_id = message.id
+          AND position.game_id = message.game_id
          JOIN game_members sender
            ON sender.game_id = message.game_id
           AND sender.profile_id = message.sender_profile_id
           AND sender.status <> 'left'
          WHERE message.game_id = ? AND message.expires_at > ?
+           AND message.created_at > ?
            AND (? = 1 OR message.kind <> 'text')
-           AND (
-             message.created_at > ?
-             OR (message.created_at = ? AND message.id > ?)
-           )
-         ORDER BY message.created_at, message.id
+           AND position.sequence > ?
+         ORDER BY position.sequence
          LIMIT ?`,
       )
         .bind(
@@ -217,10 +232,9 @@ export async function listTableMessages(
           viewer.profileId,
           gameId,
           now,
+          viewer.joinedAt,
           freeTextAvailable ? 1 : 0,
-          cursorRow.created_at,
-          cursorRow.created_at,
-          cursorRow.id,
+          cursorRow.sequence,
           COMMUNICATION_LIMITS.messageScanLimit,
         )
     : database.prepare(
@@ -229,6 +243,7 @@ export async function listTableMessages(
                 message.kind, message.content_id, message.body_text,
                 message.command_id,
                 message.created_at, message.expires_at,
+                position.sequence AS cursor_sequence,
                 EXISTS (
                   SELECT 1 FROM game_mutes mute
                   WHERE mute.game_id = message.game_id
@@ -246,13 +261,17 @@ export async function listTableMessages(
                   )
                 ) AS pair_blocked
          FROM game_messages message
+         JOIN game_message_cursors position
+           ON position.cursor_id = message.id
+          AND position.game_id = message.game_id
          JOIN game_members sender
            ON sender.game_id = message.game_id
           AND sender.profile_id = message.sender_profile_id
           AND sender.status <> 'left'
          WHERE message.game_id = ? AND message.expires_at > ?
+           AND message.created_at > ?
            AND (? = 1 OR message.kind <> 'text')
-         ORDER BY message.created_at, message.id
+         ORDER BY position.sequence DESC
          LIMIT ?`,
       ).bind(
         viewer.profileId,
@@ -260,13 +279,19 @@ export async function listTableMessages(
         viewer.profileId,
         gameId,
         now,
+        viewer.joinedAt,
         freeTextAvailable ? 1 : 0,
         COMMUNICATION_LIMITS.messageScanLimit,
       );
 
   const scanned = await query.all<ScannedMessageRow>();
+  // Initial loads and explicit cursor rebases scan backward for the newest
+  // bounded window, then restore commit order for the UI and receipt writer.
+  const scannedRows = cursorRow
+    ? scanned.results
+    : [...scanned.results].reverse();
   const safety = await readViewerSafetyState(database, viewer);
-  const visibleRows = scanned.results.filter(
+  const visibleRows = scannedRows.filter(
     (message) =>
       Number(message.viewer_muted) === 0 &&
       Number(message.pair_blocked) === 0,
@@ -281,14 +306,17 @@ export async function listTableMessages(
     freeTextAvailable,
   );
   return {
-    messages,
-    nextCursor: scanned.results.at(-1)?.id ?? cursor,
-    serverTime: now,
-    viewer: {
-      ...safety,
-      capabilities: {
-        freeText: freeTextAvailable,
-        liveVoice: liveVoiceAvailable,
+    cursorRebased,
+    page: {
+      messages,
+      nextCursor: scannedRows.at(-1)?.id ?? (cursorRow ? cursor : null),
+      serverTime: now,
+      viewer: {
+        ...safety,
+        capabilities: {
+          freeText: freeTextAvailable,
+          liveVoice: liveVoiceAvailable,
+        },
       },
     },
   };
@@ -404,6 +432,28 @@ export async function sendTableMessage(
         ),
       database
         .prepare(
+          `INSERT INTO game_message_cursors (
+             cursor_id, game_id, created_at
+           )
+           SELECT ?, ?, ?
+           WHERE EXISTS (
+             SELECT 1 FROM command_receipts
+             WHERE actor_profile_id = ? AND command_id = ?
+               AND game_id = ? AND operation = ? AND request_hash = ?
+           )`,
+        )
+        .bind(
+          messageId,
+          gameId,
+          now,
+          actor.profileId,
+          commandId,
+          gameId,
+          MESSAGE_OPERATION,
+          requestHash,
+        ),
+      database
+        .prepare(
           `INSERT INTO game_messages (
             id, game_id, sender_profile_id, sender_player_id,
             sender_display_name, kind, content_id, command_id,
@@ -414,6 +464,9 @@ export async function sendTableMessage(
             SELECT 1 FROM command_receipts
             WHERE actor_profile_id = ? AND command_id = ?
               AND game_id = ? AND operation = ? AND request_hash = ?
+          ) AND EXISTS (
+            SELECT 1 FROM game_message_cursors position
+            WHERE position.cursor_id = ? AND position.game_id = ?
           )`,
         )
         .bind(
@@ -433,6 +486,8 @@ export async function sendTableMessage(
           gameId,
           MESSAGE_OPERATION,
           requestHash,
+          messageId,
+          gameId,
         ),
     ]);
     if ((batch.at(-1)?.meta.changes ?? 0) === 1) {
@@ -724,6 +779,17 @@ export async function cleanupExpiredCommunicationRows(
   await database.batch([
     database
       .prepare(
+        `DELETE FROM game_message_cursors WHERE rowid IN (
+          SELECT position.rowid
+          FROM game_message_cursors position
+          LEFT JOIN games game ON game.id = position.game_id
+          WHERE game.id IS NULL OR game.expires_at <= ?
+          ORDER BY position.sequence LIMIT ?
+        )`,
+      )
+      .bind(now, COMMUNICATION_LIMITS.cleanupBatchSize),
+    database
+      .prepare(
         `DELETE FROM game_message_reports WHERE rowid IN (
           SELECT rowid FROM game_message_reports
           WHERE expires_at <= ?
@@ -842,6 +908,7 @@ async function recordMessageReceipts(
             AND sender_member.status <> 'left'
            WHERE message.id = ? AND message.game_id = ?
              AND message.expires_at > ?
+             AND message.created_at > recipient_member.joined_at
              AND game.room_status = 'open' AND game.expires_at > ?
              AND message.sender_profile_id <> recipient.id
              AND (? = 1 OR message.kind <> 'text')
@@ -1104,7 +1171,8 @@ async function requireCurrentMember(
     .prepare(
       `SELECT game.id, game.state_json, game.room_status,
               game.communication_scope, game.expires_at,
-              profile.id AS profile_id, member.status AS membership_status
+              profile.id AS profile_id, member.status AS membership_status,
+              member.joined_at
        FROM games game
        LEFT JOIN profiles profile ON profile.auth_subject = ?
        LEFT JOIN game_members member
@@ -1149,6 +1217,7 @@ async function requireCurrentMember(
     state,
     player,
     communicationScope: row.communication_scope,
+    joinedAt: Number(row.joined_at),
   };
 }
 
@@ -1326,25 +1395,19 @@ async function readViewerSafetyState(
   };
 }
 
-async function requireCursor(
+async function findCursor(
   database: D1Database,
   gameId: string,
   cursor: string,
-): Promise<CursorRow> {
-  const row = await database
+  joinedAt: number,
+): Promise<CursorRow | null> {
+  return database
     .prepare(
-      `SELECT id, created_at FROM game_messages
-       WHERE game_id = ? AND id = ? LIMIT 1`,
+      `SELECT sequence FROM game_message_cursors
+       WHERE game_id = ? AND cursor_id = ? AND created_at > ? LIMIT 1`,
     )
-    .bind(gameId, cursor)
+    .bind(gameId, cursor, joinedAt)
     .first<CursorRow>();
-  requireRule(
-    row,
-    "INVALID_MESSAGE_CURSOR",
-    "The message cursor is not valid for this table.",
-    400,
-  );
-  return row;
 }
 
 async function replayMessage(
@@ -1535,20 +1598,15 @@ async function maybeCleanupCommunication(
   database: D1Database,
   now: number,
 ): Promise<void> {
-  if (cleanupPromise) return cleanupPromise;
-  if (now - lastCleanupAt < COMMUNICATION_CLEANUP_INTERVAL_MS) return;
-  lastCleanupAt = now;
-  cleanupPromise = cleanupExpiredCommunicationRows(database, now)
-    .catch(() => {
-      lastCleanupAt = 0;
-      // Retention maintenance is best-effort on the request path. A transient
-      // D1 cleanup failure must not take down an otherwise valid chat read,
-      // send, report, mute, or block operation; the next request retries it.
-    })
-    .finally(() => {
-      cleanupPromise = null;
-    });
-  return cleanupPromise;
+  try {
+    await communicationCleanupGate.run(now, () =>
+      cleanupExpiredCommunicationRows(database, now),
+    );
+  } catch {
+    // Retention maintenance is best-effort on the request path. A transient
+    // D1 cleanup failure must not take down an otherwise valid chat read,
+    // send, report, mute, or block operation; the next request retries it.
+  }
 }
 
 async function hashText(value: string): Promise<string> {

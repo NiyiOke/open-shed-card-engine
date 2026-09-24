@@ -12,6 +12,7 @@ import {
   routeErrorResponse,
 } from "../../../../../lib/server/responses";
 import { reconcileLiveVoiceCleanupForGame } from "../../../../../lib/server/live-voice-cleanup";
+import { notifyRealtimeChange } from "../../../../../lib/server/realtime-notify";
 
 type RouteContext = { params: Promise<{ gameId: string }> };
 
@@ -48,6 +49,12 @@ export async function POST(request: Request, context: RouteContext) {
     const listing = result.view
       ? await getViewerListingForGame(user, gameId)
       : undefined;
+    if (!result.replayed) {
+      await notifyRealtimeChange(
+        gameId,
+        command.type === "leave_game" ? ["game", "chat"] : ["game"],
+      );
+    }
     return jsonResponse({ ...result, ...(listing ? { listing } : {}) });
   } catch (error) {
     return routeErrorResponse(error);

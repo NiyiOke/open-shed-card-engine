@@ -1,5 +1,6 @@
 import { GAME_PROTOCOL_VERSION, RULES_VERSION } from "../game/types";
 import { PUBLIC_HOST_SUPPRESSION_AFTER_MS } from "./room-lifecycle-policy";
+import { hasUnsafeContactOrControlText } from "./communication-policy";
 
 export { PUBLIC_HOST_SUPPRESSION_AFTER_MS } from "./room-lifecycle-policy";
 
@@ -89,6 +90,7 @@ export function normalizePublicAlias(value: unknown): string | null {
     return null;
   }
   if (
+    hasUnsafeContactOrControlText(alias) ||
     !/^[\p{L}\p{N}](?:[\p{L}\p{N} _'-]*[\p{L}\p{N}])?$/u.test(alias)
   ) {
     return null;

@@ -10,6 +10,7 @@ import {
   requireCommandId,
   routeErrorResponse,
 } from "../../../../../../lib/server/responses";
+import { notifyRealtimeChange } from "../../../../../../lib/server/realtime-notify";
 
 type RouteContext = { params: Promise<{ listingId: string }> };
 
@@ -27,9 +28,11 @@ export async function POST(request: Request, context: RouteContext) {
         400,
       );
     }
-    return jsonResponse(
-      await joinPublicRoom(user, listingId, body.alias, commandId),
-    );
+    const result = await joinPublicRoom(user, listingId, body.alias, commandId);
+    if (!result.replayed) {
+      await notifyRealtimeChange(result.snapshot.view.gameId, ["game", "chat"]);
+    }
+    return jsonResponse(result.snapshot);
   } catch (error) {
     return routeErrorResponse(error);
   }

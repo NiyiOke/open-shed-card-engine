@@ -77,6 +77,15 @@ test("GET uses only one syntactically opaque cursor", () => {
   assert.match(MESSAGE_ROUTE, /requireOpaqueCommunicationId/u);
 });
 
+test("GET exposes cursor rebases in a response header without widening the DTO", () => {
+  assert.match(MESSAGE_ROUTE, /jsonResponse\(result\.page\)/u);
+  assert.match(
+    MESSAGE_ROUTE,
+    /result\.cursorRebased[\s\S]*X-Open-Shed-Chat-Cursor[\s\S]*rebased/u,
+  );
+  assert.doesNotMatch(MESSAGE_ROUTE, /jsonResponse\(result\)/u);
+});
+
 function source(relativeUrl: string): string {
   return readFileSync(
     fileURLToPath(new URL(relativeUrl, import.meta.url)),

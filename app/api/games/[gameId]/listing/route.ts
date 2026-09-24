@@ -15,6 +15,7 @@ import {
   routeErrorResponse,
 } from "../../../../../lib/server/responses";
 import { reconcileLiveVoiceCleanupForGame } from "../../../../../lib/server/live-voice-cleanup";
+import { notifyRealtimeChange } from "../../../../../lib/server/realtime-notify";
 
 type RouteContext = { params: Promise<{ gameId: string }> };
 
@@ -93,7 +94,10 @@ export async function POST(request: Request, context: RouteContext) {
     }
     const result = await mutateGameListing(user, gameId, input);
     if (action === "publish") await reconcileLiveVoiceCleanupForGame(gameId);
-    return jsonResponse(result);
+    if (!result.replayed) {
+      await notifyRealtimeChange(gameId, ["game", "chat"]);
+    }
+    return jsonResponse({ listing: result.listing, view: result.view });
   } catch (error) {
     return routeErrorResponse(error);
   }

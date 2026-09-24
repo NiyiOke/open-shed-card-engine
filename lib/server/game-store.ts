@@ -68,6 +68,8 @@ import {
   reconcileLiveVoiceCleanupJobs,
 } from "./live-voice-cleanup";
 import { getV15FeaturePolicy } from "./v15-feature-policy";
+import { gameCommandActivityFields } from "./game-command-response";
+import { createRequestMaintenanceGate } from "./request-maintenance";
 
 type ProfileRow = {
   id: string;
@@ -209,6 +211,7 @@ export type ListingMutationInput =
 export type ListingMutationResult = Readonly<{
   listing: ViewerListing;
   view: GameView;
+  replayed: boolean;
 }>;
 
 export type GameSnapshot = Readonly<{
@@ -217,6 +220,28 @@ export type GameSnapshot = Readonly<{
   eventCursor: number;
   presence: PresenceSnapshot;
   listing?: ViewerListing;
+}>;
+
+export type ManualJoinResult = Readonly<{
+  view: GameView;
+  replayed: boolean;
+}>;
+
+export type PublicJoinResult = Readonly<{
+  snapshot: GameSnapshot;
+  replayed: boolean;
+}>;
+
+export type GameCommandResult = Readonly<{
+  view: GameView | null;
+  events: GameEvent[];
+  /**
+   * The last event-feed revision actually delivered in `events`.
+   * Replays deliberately return null because their latest projection does not
+   * include the activity that happened at or after the accepted command.
+   */
+  eventCursor: number | null;
+  replayed: boolean;
 }>;
 
 type PublicJoinExecutionContext = Readonly<{
@@ -270,10 +295,13 @@ const OPEN_ROOM_LIFECYCLE: RoomLifecycleUpdate = Object.freeze({
   abandonedSince: null,
 });
 
-let lastPurgeAt = 0;
-let purgePromise: Promise<void> | null = null;
-let lastRoomMaintenanceAt = 0;
-let roomMaintenancePromise: Promise<void> | null = null;
+// D1 promises belong to the request that created them. Only cadence timestamps
+// may be shared across Worker requests; an aborted request must not leave later
+// requests awaiting its canceled I/O.
+const purgeGate = createRequestMaintenanceGate(PURGE_INTERVAL_MS);
+const roomMaintenanceGate = createRequestMaintenanceGate(
+  ROOM_MAINTENANCE_INTERVAL_MS,
+);
 
 export async function getPublicAvailability(): Promise<PublicAvailability> {
   if (!getV15FeaturePolicy().discoveryEnabled) {
@@ -674,6 +702,7 @@ export async function mutateGameListing(
         user.userId,
         now,
       ),
+      replayed: false,
     };
   }
 
@@ -907,6 +936,7 @@ export async function mutateGameListing(
       user.userId,
       now,
     ),
+    replayed: false,
   };
 }
 
@@ -1014,6 +1044,35 @@ export async function createGame(
             ) VALUES (?, ?, ?, ?, ?, 0, ?)`,
           )
           .bind(profile.id, commandId, gameId, operation, requestHash, now),
+        database
+          .prepare(
+            `UPDATE lobby_invitations
+             SET state = 'expired', pending_key = NULL, responded_at = ?
+             WHERE recipient_profile_id = ? AND state = 'pending'
+               AND EXISTS (
+                 SELECT 1 FROM command_receipts receipt
+                 WHERE receipt.actor_profile_id = ? AND receipt.command_id = ?
+                   AND receipt.game_id = ? AND receipt.request_hash = ?
+               )`,
+          )
+          .bind(
+            now,
+            profile.id,
+            profile.id,
+            commandId,
+            gameId,
+            requestHash,
+          ),
+        database
+          .prepare(
+            `DELETE FROM lobby_presence
+             WHERE profile_id = ? AND EXISTS (
+               SELECT 1 FROM command_receipts receipt
+               WHERE receipt.actor_profile_id = ? AND receipt.command_id = ?
+                 AND receipt.game_id = ? AND receipt.request_hash = ?
+             )`,
+          )
+          .bind(profile.id, profile.id, commandId, gameId, requestHash),
       ]);
       return projectStoredGameForUser(database, state, user.userId, now);
     } catch (error) {
@@ -1049,7 +1108,7 @@ export async function joinGame(
   nickname: string,
   joinCodeInput: string,
   commandId: string,
-): Promise<GameView> {
+): Promise<ManualJoinResult> {
   const joinCode = normalizeJoinCode(joinCodeInput);
   const alias = normalizePublicAlias(nickname);
   requireRule(
@@ -1070,7 +1129,7 @@ export async function joinGame(
     ? await findCommandReceipt(database, initialProfile.id, commandId)
     : null;
   if (existingReceipt) {
-    return viewFromReceipt(
+    return manualJoinResult(await viewFromReceipt(
       database,
       existingReceipt,
       user,
@@ -1078,7 +1137,7 @@ export async function joinGame(
       requestHash,
       undefined,
       joinCode,
-    );
+    ), true);
   }
 
   let quotaCharged = false;
@@ -1097,7 +1156,7 @@ export async function joinGame(
       ? await findCommandReceipt(database, storedProfile.id, commandId)
       : null;
     if (acceptedReceipt) {
-      return viewFromReceipt(
+      return manualJoinResult(await viewFromReceipt(
         database,
         acceptedReceipt,
         user,
@@ -1105,7 +1164,7 @@ export async function joinGame(
         requestHash,
         undefined,
         joinCode,
-      );
+      ), true);
     }
     const row = await database
       .prepare(
@@ -1129,7 +1188,10 @@ export async function joinGame(
         entry.actorUserId === user.userId && entry.commandId === commandId,
     );
     if (alreadyActive && !recoversAcceptedJoin) {
-      return projectStoredGameForUser(database, current, user.userId, now);
+      return manualJoinResult(
+        await projectStoredGameForUser(database, current, user.userId, now),
+        true,
+      );
     }
     if (!quotaCharged) {
       await enforceMutationQuota(database, now, [
@@ -1199,11 +1261,26 @@ export async function joinGame(
             commandId,
             requestHash,
           ),
+          guardedLobbyPresenceExpireStatement(
+            database,
+            profile.id,
+            now,
+            commandId,
+            requestHash,
+            row.id,
+          ),
+          guardedLobbyPresenceDeleteStatement(
+            database,
+            profile.id,
+            commandId,
+            requestHash,
+            row.id,
+          ),
         ]);
       } catch (error) {
         const receipt = await findCommandReceipt(database, profile.id, commandId);
         if (!receipt) throw error;
-        return viewFromReceipt(
+        return manualJoinResult(await viewFromReceipt(
           database,
           receipt,
           user,
@@ -1211,11 +1288,11 @@ export async function joinGame(
           requestHash,
           row.id,
           joinCode,
-        );
+        ), true);
       }
       const receipt = await findCommandReceipt(database, profile.id, commandId);
       if (!receipt) continue;
-      return viewFromReceipt(
+      return manualJoinResult(await viewFromReceipt(
         database,
         receipt,
         user,
@@ -1223,7 +1300,7 @@ export async function joinGame(
         requestHash,
         row.id,
         joinCode,
-      );
+      ), true);
     }
 
     const nextJson = JSON.stringify(result.state);
@@ -1307,6 +1384,21 @@ export async function joinGame(
           commandId,
           requestHash,
         ),
+        guardedLobbyPresenceExpireStatement(
+          database,
+          profile.id,
+          now,
+          commandId,
+          requestHash,
+          row.id,
+        ),
+        guardedLobbyPresenceDeleteStatement(
+          database,
+          profile.id,
+          commandId,
+          requestHash,
+          row.id,
+        ),
         guardedGameUpdateStatement(
           database,
           row,
@@ -1323,7 +1415,7 @@ export async function joinGame(
       if ((batch.at(-1)?.meta.changes ?? 0) !== 1) {
         const receipt = await findCommandReceipt(database, profile.id, commandId);
         if (receipt) {
-          return viewFromReceipt(
+          return manualJoinResult(await viewFromReceipt(
             database,
             receipt,
             user,
@@ -1331,14 +1423,14 @@ export async function joinGame(
             requestHash,
             row.id,
             joinCode,
-          );
+          ), true);
         }
         continue;
       }
     } catch (error) {
       const receipt = await findCommandReceipt(database, profile.id, commandId);
       if (receipt) {
-        return viewFromReceipt(
+        return manualJoinResult(await viewFromReceipt(
           database,
           receipt,
           user,
@@ -1346,11 +1438,14 @@ export async function joinGame(
           requestHash,
           row.id,
           joinCode,
-        );
+        ), true);
       }
       throw error;
     }
-    return projectStoredGameForUser(database, result.state, user.userId, now);
+    return manualJoinResult(
+      await projectStoredGameForUser(database, result.state, user.userId, now),
+      false,
+    );
   }
 
   throw new GameRuleError(
@@ -1360,12 +1455,16 @@ export async function joinGame(
   );
 }
 
+function manualJoinResult(view: GameView, replayed: boolean): ManualJoinResult {
+  return Object.freeze({ view, replayed });
+}
+
 export async function joinPublicRoom(
   user: AuthenticatedUser,
   listingIdInput: string,
   aliasInput: string,
   commandId: string,
-): Promise<GameSnapshot> {
+): Promise<PublicJoinResult> {
   return joinSelectedPublicRoom(
     user,
     listingIdInput,
@@ -1378,7 +1477,7 @@ export async function quickJoinPublicRoom(
   user: AuthenticatedUser,
   aliasInput: string,
   commandId: string,
-): Promise<GameSnapshot> {
+): Promise<PublicJoinResult> {
   requireRule(
     getV15FeaturePolicy().discoveryEnabled,
     "DISCOVERY_DISABLED",
@@ -1483,7 +1582,7 @@ async function joinSelectedPublicRoom(
   aliasInput: string,
   commandId: string,
   execution?: PublicJoinExecutionContext,
-): Promise<GameSnapshot> {
+): Promise<PublicJoinResult> {
   requireRule(
     getV15FeaturePolicy().discoveryEnabled,
     "DISCOVERY_DISABLED",
@@ -1705,6 +1804,21 @@ async function joinSelectedPublicRoom(
           commandId,
           requestHash,
         ),
+        guardedLobbyPresenceExpireStatement(
+          database,
+          actorProfileId,
+          now,
+          commandId,
+          requestHash,
+          target.id,
+        ),
+        guardedLobbyPresenceDeleteStatement(
+          database,
+          actorProfileId,
+          commandId,
+          requestHash,
+          target.id,
+        ),
         guardedGameUpdateStatement(
           database,
           target,
@@ -1721,7 +1835,7 @@ async function joinSelectedPublicRoom(
         ),
       ]);
       if ((batch.at(-1)?.meta.changes ?? 0) === 1) {
-        return getGame(user, target.id);
+        return publicJoinResult(await getGame(user, target.id), false);
       }
     } catch (error) {
       const accepted = await findCommandReceipt(
@@ -1926,7 +2040,7 @@ export async function executeGameCommand(
   expectedRevision: number,
   commandId: string,
   command: GameCommand,
-): Promise<{ view: GameView | null; events: GameEvent[]; replayed: boolean }> {
+): Promise<GameCommandResult> {
   const database = await ensureDatabaseSchema();
   const now = Date.now();
   await maintainRooms(database, now);
@@ -1946,8 +2060,8 @@ export async function executeGameCommand(
     commandId,
   );
   if (durableReceipt) {
-    return {
-      view: await commandViewFromReceipt(
+    return replayedGameCommandResult(
+      await commandViewFromReceipt(
         database,
         durableReceipt,
         user,
@@ -1956,9 +2070,7 @@ export async function executeGameCommand(
         gameId,
         command.type === "leave_game",
       ),
-      events: [],
-      replayed: true,
-    };
+    );
   }
   await enforceMutationQuota(database, now, [
     {
@@ -2016,8 +2128,8 @@ export async function executeGameCommand(
       "The accepted command could not be recovered safely.",
       500,
     );
-    return {
-      view: await commandViewFromReceipt(
+    return replayedGameCommandResult(
+      await commandViewFromReceipt(
         database,
         recoveredReceipt,
         user,
@@ -2026,9 +2138,7 @@ export async function executeGameCommand(
         gameId,
         command.type === "leave_game",
       ),
-      events: [],
-      replayed: true,
-    };
+    );
   }
 
   requireRule(
@@ -2333,8 +2443,8 @@ export async function executeGameCommand(
     if ((batch.at(-1)?.meta.changes ?? 0) !== 1) {
       const receipt = await findCommandReceipt(database, profile.id, commandId);
       if (receipt) {
-        return {
-          view: await commandViewFromReceipt(
+        return replayedGameCommandResult(
+          await commandViewFromReceipt(
             database,
             receipt,
             user,
@@ -2343,9 +2453,7 @@ export async function executeGameCommand(
             gameId,
             command.type === "leave_game",
           ),
-          events: [],
-          replayed: true,
-        };
+        );
       }
       // Surface the terminal lifecycle result when this command lost a race
       // with automatic closure; otherwise preserve the normal version-conflict
@@ -2385,8 +2493,8 @@ export async function executeGameCommand(
   } catch (error) {
     const receipt = await findCommandReceipt(database, profile.id, commandId);
     if (receipt) {
-      return {
-        view: await commandViewFromReceipt(
+      return replayedGameCommandResult(
+        await commandViewFromReceipt(
           database,
           receipt,
           user,
@@ -2395,17 +2503,25 @@ export async function executeGameCommand(
           gameId,
           command.type === "leave_game",
         ),
-        events: [],
-        replayed: true,
-      };
+      );
     }
     throw error;
   }
 
   return {
     view: await commandViewForUser(database, result.state, user.userId),
-    events: persistedEvents,
-    replayed: result.replayed,
+    ...gameCommandActivityFields(
+      result.replayed,
+      result.state.revision,
+      persistedEvents,
+    ),
+  };
+}
+
+function replayedGameCommandResult(view: GameView | null): GameCommandResult {
+  return {
+    view,
+    ...gameCommandActivityFields(true, 0, []),
   };
 }
 
@@ -3068,7 +3184,7 @@ async function publicJoinSnapshotFromReceipt(
   user: AuthenticatedUser,
   operation: string,
   requestHash: string,
-): Promise<GameSnapshot> {
+): Promise<PublicJoinResult> {
   assertReceiptMatches(receipt, operation, requestHash);
   const profile = await findProfileForUser(database, user.userId);
   requireRule(
@@ -3077,7 +3193,7 @@ async function publicJoinSnapshotFromReceipt(
     "That commandId was already used for a different request.",
     409,
   );
-  return getGame(user, receipt.game_id);
+  return publicJoinResult(await getGame(user, receipt.game_id), true);
 }
 
 async function recoverPublicJoinReceipt(
@@ -3086,7 +3202,7 @@ async function recoverPublicJoinReceipt(
   commandId: string,
   operation: string,
   requestHash: string,
-): Promise<GameSnapshot | null> {
+): Promise<PublicJoinResult | null> {
   const profile = await findProfileForUser(database, user.userId);
   if (!profile) return null;
   const receipt = await findCommandReceipt(database, profile.id, commandId);
@@ -3099,6 +3215,13 @@ async function recoverPublicJoinReceipt(
         requestHash,
       )
     : null;
+}
+
+function publicJoinResult(
+  snapshot: GameSnapshot,
+  replayed: boolean,
+): PublicJoinResult {
+  return Object.freeze({ snapshot, replayed });
 }
 
 function isRetryableMutationConflict(error: unknown): boolean {
@@ -3239,6 +3362,7 @@ async function listingResultFromReceipt(
       user.userId,
       now,
     ),
+    replayed: true,
   };
 }
 
@@ -4318,6 +4442,54 @@ function guardedPresenceDeleteStatement(
     );
 }
 
+function guardedLobbyPresenceExpireStatement(
+  database: D1Database,
+  profileId: string,
+  now: number,
+  commandId: string,
+  requestHash: string,
+  gameId: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `UPDATE lobby_invitations
+       SET state = 'expired', pending_key = NULL, responded_at = ?
+       WHERE recipient_profile_id = ? AND state = 'pending'
+         AND EXISTS (
+           SELECT 1 FROM command_receipts receipt
+           WHERE receipt.actor_profile_id = ? AND receipt.command_id = ?
+             AND receipt.game_id = ? AND receipt.request_hash = ?
+         )`,
+    )
+    .bind(
+      now,
+      profileId,
+      profileId,
+      commandId,
+      gameId,
+      requestHash,
+    );
+}
+
+function guardedLobbyPresenceDeleteStatement(
+  database: D1Database,
+  profileId: string,
+  commandId: string,
+  requestHash: string,
+  gameId: string,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `DELETE FROM lobby_presence
+       WHERE profile_id = ? AND EXISTS (
+         SELECT 1 FROM command_receipts receipt
+         WHERE receipt.actor_profile_id = ? AND receipt.command_id = ?
+           AND receipt.game_id = ? AND receipt.request_hash = ?
+       )`,
+    )
+    .bind(profileId, profileId, commandId, gameId, requestHash);
+}
+
 function staleSeatCleanupStatement(
   database: D1Database,
   gameId: string,
@@ -4864,18 +5036,9 @@ async function maybeMaintainRoomLifecycles(
   database: D1Database,
   now: number,
 ): Promise<void> {
-  if (roomMaintenancePromise) return roomMaintenancePromise;
-  if (now - lastRoomMaintenanceAt < ROOM_MAINTENANCE_INTERVAL_MS) return;
-  lastRoomMaintenanceAt = now;
-  roomMaintenancePromise = maintainRoomLifecycleRows(database, now)
-    .catch((error) => {
-      lastRoomMaintenanceAt = 0;
-      throw error;
-    })
-    .finally(() => {
-      roomMaintenancePromise = null;
-    });
-  return roomMaintenancePromise;
+  await roomMaintenanceGate.run(now, () =>
+    maintainRoomLifecycleRows(database, now),
+  );
 }
 
 async function maintainRoomLifecycleRows(
@@ -5238,18 +5401,7 @@ async function maybePurgeExpiredGames(
   database: D1Database,
   now: number,
 ): Promise<void> {
-  if (purgePromise) return purgePromise;
-  if (now - lastPurgeAt < PURGE_INTERVAL_MS) return;
-  lastPurgeAt = now;
-  purgePromise = purgeExpiredRows(database, now)
-    .catch((error) => {
-      lastPurgeAt = 0;
-      throw error;
-    })
-    .finally(() => {
-      purgePromise = null;
-    });
-  return purgePromise;
+  await purgeGate.run(now, () => purgeExpiredRows(database, now));
 }
 
 async function purgeExpiredRows(
@@ -5310,6 +5462,17 @@ async function purgeExpiredRows(
           WHERE message.expires_at <= ?
           ORDER BY message.expires_at, message.game_id,
                    message.created_at, message.id
+          LIMIT 128
+        )`,
+      )
+      .bind(now),
+    database
+      .prepare(
+        `DELETE FROM game_message_cursors WHERE rowid IN (
+          SELECT position.rowid FROM game_message_cursors position
+          JOIN games g ON g.id = position.game_id
+          WHERE g.expires_at <= ?
+          ORDER BY g.expires_at, position.game_id, position.sequence
           LIMIT 128
         )`,
       )
@@ -5386,6 +5549,10 @@ async function purgeExpiredRows(
             AND NOT EXISTS (
               SELECT 1 FROM game_messages message
               WHERE message.game_id = g.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM game_message_cursors position
+              WHERE position.game_id = g.id
             )
             AND NOT EXISTS (
               SELECT 1 FROM game_message_receipts receipt

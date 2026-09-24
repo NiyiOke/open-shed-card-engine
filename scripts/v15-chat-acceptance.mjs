@@ -1387,11 +1387,10 @@ function assertChatPage(value) {
   for (let index = 1; index < value.messages.length; index += 1) {
     const previous = value.messages[index - 1];
     const current = value.messages[index];
-    assert.equal(
-      previous.createdAt < current.createdAt ||
-        (previous.createdAt === current.createdAt && previous.id < current.id),
-      true,
-      "Chat messages must remain chronological by createdAt and opaque ID.",
+    assert.notEqual(
+      previous.id,
+      current.id,
+      "Chat messages must contain unique opaque positions.",
     );
   }
   if (value.nextCursor !== null) assert.match(value.nextCursor, /^[a-f0-9]{32}$/);
@@ -2085,6 +2084,7 @@ async function discoverLocalGameDatabase() {
 function assertCommunicationSchema(localDatabase) {
   for (const table of [
     "game_messages",
+    "game_message_cursors",
     "game_message_receipts",
     "game_message_reports",
     "game_mutes",

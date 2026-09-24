@@ -82,14 +82,18 @@ test("the true two-second cooldown is inside the receipt-first guarded batch", (
   );
 });
 
-test("feed scans are bounded, stable, current-member-only, and advance past hidden rows", () => {
+test("feed scans use commit-order cursors, load the latest window, and advance past hidden rows", () => {
   assert.match(
     STORE_SOURCE,
-    /JOIN game_members sender[\s\S]*sender\.status <> 'left'/u,
+    /JOIN game_message_cursors position[\s\S]*JOIN game_members sender[\s\S]*sender\.status <> 'left'/u,
   );
   assert.match(
     STORE_SOURCE,
-    /ORDER BY message\.created_at, message\.id[\s\S]*LIMIT \?/u,
+    /position\.sequence > \?[\s\S]*ORDER BY position\.sequence[\s\S]*LIMIT \?/u,
+  );
+  assert.match(
+    STORE_SOURCE,
+    /ORDER BY position\.sequence DESC[\s\S]*LIMIT \?[\s\S]*\[\.\.\.scanned\.results\]\.reverse\(\)/u,
   );
   assert.match(
     STORE_SOURCE,
@@ -97,7 +101,7 @@ test("feed scans are bounded, stable, current-member-only, and advance past hidd
   );
   assert.match(
     STORE_SOURCE,
-    /nextCursor: scanned\.results\.at\(-1\)\?\.id \?\? cursor/u,
+    /nextCursor: scannedRows\.at\(-1\)\?\.id \?\? \(cursorRow \? cursor : null\)/u,
   );
   assert.match(
     STORE_SOURCE,
@@ -108,7 +112,7 @@ test("feed scans are bounded, stable, current-member-only, and advance past hidd
 test("cursors and target player IDs are scoped back to the active room", () => {
   assert.match(
     STORE_SOURCE,
-    /FROM game_messages[\s\S]*WHERE game_id = \? AND id = \? LIMIT 1/u,
+    /FROM game_message_cursors[\s\S]*WHERE game_id = \? AND cursor_id = \? AND created_at > \? LIMIT 1/u,
   );
   assert.match(
     STORE_SOURCE,
@@ -117,6 +121,47 @@ test("cursors and target player IDs are scoped back to the active room", () => {
   assert.match(
     STORE_SOURCE,
     /viewer_member\.game_id = game\.id[\s\S]*viewer_member\.status <> 'left'[\s\S]*game\.id = message\.game_id/u,
+  );
+});
+
+test("message feeds and cursors cannot cross the viewer join boundary", () => {
+  assert.match(
+    STORE_SOURCE,
+    /message\.created_at > \?/u,
+  );
+  assert.match(
+    STORE_SOURCE,
+    /message\.created_at > recipient_member\.joined_at/u,
+  );
+  assert.match(
+    STORE_SOURCE,
+    /findCursor\(database, gameId, cursor, viewer\.joinedAt\)/u,
+  );
+});
+
+test("message writes allocate an AUTOINCREMENT position before the guarded row", () => {
+  assert.match(
+    SCHEMA_SOURCE,
+    /gameMessageCursors[\s\S]*sequence: integer\("sequence"\)\.primaryKey\(\{ autoIncrement: true \}\)/u,
+  );
+  assert.match(
+    STORE_SOURCE,
+    /INSERT INTO game_message_cursors[\s\S]*SELECT \?, \?, \?[\s\S]*INSERT INTO game_messages/u,
+  );
+  assert.match(
+    STORE_SOURCE,
+    /INSERT INTO game_messages[\s\S]*EXISTS \([\s\S]*FROM game_message_cursors position[\s\S]*position\.cursor_id = \?/u,
+  );
+});
+
+test("missing, expired, or cross-room cursors rebase without changing the JSON DTO", () => {
+  assert.match(
+    STORE_SOURCE,
+    /const cursorRebased = cursor !== null && cursorRow === null/u,
+  );
+  assert.match(
+    STORE_SOURCE,
+    /return \{[\s\S]*cursorRebased,[\s\S]*page: \{[\s\S]*messages,[\s\S]*nextCursor/u,
   );
 });
 
@@ -162,6 +207,7 @@ test("game purge removes ephemeral chat but never couples report evidence to gam
     /DELETE FROM game_message_reports[\s\S]*WHERE expires_at <= \?/u,
   );
   assert.match(GAME_STORE_SOURCE, /DELETE FROM game_messages/u);
+  assert.match(GAME_STORE_SOURCE, /DELETE FROM game_message_cursors/u);
   assert.match(GAME_STORE_SOURCE, /DELETE FROM game_message_receipts/u);
   assert.match(GAME_STORE_SOURCE, /DELETE FROM game_mutes/u);
   const deleteGame = GAME_STORE_SOURCE.slice(
@@ -169,6 +215,7 @@ test("game purge removes ephemeral chat but never couples report evidence to gam
     GAME_STORE_SOURCE.indexOf("DELETE FROM mutation_quotas"),
   );
   assert.match(deleteGame, /NOT EXISTS \([\s\S]*FROM game_messages/u);
+  assert.match(deleteGame, /NOT EXISTS \([\s\S]*FROM game_message_cursors/u);
   assert.match(deleteGame, /NOT EXISTS \([\s\S]*FROM game_message_receipts/u);
   assert.match(deleteGame, /NOT EXISTS \([\s\S]*FROM game_mutes/u);
   assert.doesNotMatch(deleteGame, /game_message_reports/u);
@@ -176,8 +223,11 @@ test("game purge removes ephemeral chat but never couples report evidence to gam
 
 test("request-path retention cleanup is best-effort and retries after failure", () => {
   const start = STORE_SOURCE.indexOf("async function maybeCleanupCommunication");
-  const slice = STORE_SOURCE.slice(start);
-  assert.match(slice, /cleanupExpiredCommunicationRows\(database, now\)/u);
-  assert.match(slice, /\.catch\(\(\) => \{[\s\S]*lastCleanupAt = 0/u);
-  assert.doesNotMatch(slice, /\.catch\(\(error\)[\s\S]*throw error/u);
+  const end = STORE_SOURCE.indexOf("async function hashText", start);
+  const slice = STORE_SOURCE.slice(start, end);
+  assert.match(
+    slice,
+    /try \{[\s\S]*await communicationCleanupGate\.run\(now, \(\) =>[\s\S]*cleanupExpiredCommunicationRows\(database, now\)[\s\S]*\} catch \{/u,
+  );
+  assert.doesNotMatch(slice, /throw/u);
 });

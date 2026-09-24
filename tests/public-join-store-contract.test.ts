@@ -142,7 +142,10 @@ test("all public join writes are receipt-gated in one ordered batch", () => {
     /UPDATE profiles|INSERT INTO profiles/u,
   );
   assert.match(join, /eventCommandId = `public-join:/u);
-  assert.match(join, /return getGame\(user, target\.id\)/u);
+  assert.match(
+    join,
+    /return publicJoinResult\(await getGame\(user, target\.id\), false\)/u,
+  );
 });
 
 test("successful profile and public membership mutations require the receipt", () => {
