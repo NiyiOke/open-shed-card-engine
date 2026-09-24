@@ -9,10 +9,29 @@ updates:
     labels:
       - dependencies
     groups:
-      safe-minor-and-patch:
+      runtime-and-framework:
+        applies-to: version-updates
+        patterns:
+          - "@types/react"
+          - "@types/react-dom"
+          - "livekit-*"
+          - "react"
+          - "react-dom"
+          - "react-server-dom-webpack"
+        update-types:
+          - minor
+          - patch
+      tooling-minor-and-patch:
         applies-to: version-updates
         patterns:
           - "*"
+        exclude-patterns:
+          - "@types/react"
+          - "@types/react-dom"
+          - "livekit-*"
+          - "react"
+          - "react-dom"
+          - "react-server-dom-webpack"
         update-types:
           - minor
           - patch
