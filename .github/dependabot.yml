@@ -5,15 +5,43 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels:
       - dependencies
+    groups:
+      safe-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+      # Later Vinext prereleases currently exceed the initial-JS budget; see #11.
+      - dependency-name: vinext
+        versions:
+          - ">=1.0.0-beta.7 <1.0.0"
 
   - package-ecosystem: npm
     directory: /realtime-worker
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels:
       - dependencies
+    groups:
+      safe-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
