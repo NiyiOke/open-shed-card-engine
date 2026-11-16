@@ -1,0 +1,13 @@
+{
+  "name": "open-shed-server-adapter-lab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "22.14.0" },
+  "scripts": {
+    "check:setup": "node scripts/check-setup.mjs",
+    "test": "node --import ./scripts/offline-guard.mjs --test test/*.test.mjs",
+    "test:practice": "node --import ./scripts/offline-guard.mjs --test practice/accept-answer.test.mjs",
+    "demo": "node --import ./scripts/offline-guard.mjs scripts/demo.mjs"
+  }
+}

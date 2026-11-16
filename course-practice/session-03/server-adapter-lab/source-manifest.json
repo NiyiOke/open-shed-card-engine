@@ -1,0 +1,24 @@
+{
+  "edition": "open-shed-session-03-server-adapter-v1",
+  "recordedAt": "2026-09-29",
+  "sourceKind": "content-hashed local Hub source snapshot; not a claim that uncommitted files belong to HEAD",
+  "hubHeadContext": "f408687204d6a7129e9282eb2117ff1616691170",
+  "gameSourceCommit": "f20a5c15bfb2b1aa943f61f8b17bcbd27f185c40",
+  "rulesVersion": "merciless-baseline-v1",
+  "sourceFiles": [
+    {"path":"training-project-hub/lib/server/coach-provider.ts","sha256":"940043a3e0de275036bdc21e264a991eb0fa150918e3e07e82bc243430e47552","use":"request builder, response contract, byte limits, fixed endpoint and one request"},
+    {"path":"training-project-hub/lib/course/coach-pilot.ts","sha256":"d76fed8416934989eb6ee1b106a064fd1a8cf15738ba169b3bb82880cb50d311","use":"public synthetic scenarios and pinned rule excerpts"},
+    {"path":"training-project-hub/lib/server/live-coach.ts","sha256":"63cbdad36ea6146a148eb73f5ab4c72fbf67e825921212a1fa463cb3725b55c0","use":"read-only provenance for hosted owner/budget/dispatch/finish boundary; not copied into runtime"}
+  ],
+  "adaptations": [
+    "TypeScript/server-only framework imports replaced by Node ESM and frozen public scenario IDs.",
+    "Transport must be explicitly injected; no default global fetch, environment key reader, HTTP server or live CLI.",
+    "Deadline can only be lowered from 20000ms; Promise.race also bounds non-cooperative scripted transport and abort cancels body readers.",
+    "Unexpected extra output items are rejected rather than ignored.",
+    "Scripted-only correction exercise has a separate fixed two-attempt limit; hosted route remains one dispatch without automatic retry."
+  ],
+  "officialReference": "https://developers.openai.com/api/docs/guides/structured-outputs",
+  "officialReferenceReadAt": "2026-09-29",
+  "providerRequestsMadeForPackage": 0,
+  "includesCredentials": false
+}

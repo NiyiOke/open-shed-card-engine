@@ -1,0 +1,5 @@
+local-data/
+output/
+node_modules/
+.env
+.env.*
