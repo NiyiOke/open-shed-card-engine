@@ -1,0 +1,19 @@
+{
+  "evidenceKind": "pending_real_hosted_observation",
+  "observedAt": null,
+  "observerRole": null,
+  "personallyObserved": null,
+  "approvedHostedOrigin": null,
+  "scenarioId": null,
+  "requestId": null,
+  "rulesVersion": null,
+  "sourceCommit": null,
+  "resultStatus": null,
+  "observedExplanation": null,
+  "sourceReview": null,
+  "budgetBeforePence": null,
+  "budgetAfterPence": null,
+  "displayedInputTokens": null,
+  "displayedOutputTokens": null,
+  "limitations": null
+}
